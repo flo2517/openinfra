@@ -131,6 +131,84 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0@sha256:2f92c6e85a1199b3403c99d7439695898a162c69689b11130450ffadb352f0a0
+    environment:
+      CONTAINERS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      PING: "1"
+      POST: "1"
+      VERSION: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-executor
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:2375/_ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+    tmpfs:
+      - /run:size=4m,noexec,nosuid
+      - /tmp:size=4m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+
+  provider-agent:
+    build:
+      context: ..
+      dockerfile: provider-agent/Dockerfile
+    environment:
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      OPENINFRA_AGENT_ADVERTISED_ENDPOINT: https://provider-agent:50052
+      OPENINFRA_CONTROL_PLANE_ENDPOINT: https://control-plane:50051
+      OPENINFRA_AGENT_MAX_WORKLOADS: ${PROVIDER_AGENT_MAX_WORKLOADS:-8}
+      OPENINFRA_AGENT_MAX_CPU_CORES: ${PROVIDER_AGENT_MAX_CPU_CORES:-8.0}
+      OPENINFRA_AGENT_MAX_MEMORY_MB: ${PROVIDER_AGENT_MAX_MEMORY_MB:-16384}
+      OPENINFRA_AGENT_PIDS_LIMIT: ${PROVIDER_AGENT_PIDS_LIMIT:-128}
+      TLS_CERT_FILE: /run/openinfra-tls/client.crt
+      TLS_KEY_FILE: /run/openinfra-tls/client.key
+      TLS_CA_FILE: /run/openinfra-tls/ca.crt
+      TLS_SERVER_NAME: control-plane
+      AGENT_TLS_CERT_FILE: /run/openinfra-tls/agent-server.crt
+      AGENT_TLS_KEY_FILE: /run/openinfra-tls/agent-server.key
+      AGENT_TLS_CLIENT_CA_FILE: /run/openinfra-tls/ca.crt
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "127.0.0.1:${PROVIDER_AGENT_PORT:-50052}:50052"
+    volumes:
+      - ./local/agent:/var/lib/openinfra-agent
+      - ./local/certs:/run/openinfra-tls:ro
+    networks:
+      - default
+      - docker-executor
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/openinfra-agent-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  docker-executor:
+    internal: true
+
 volumes:
   postgres-data:
   redis-data:
