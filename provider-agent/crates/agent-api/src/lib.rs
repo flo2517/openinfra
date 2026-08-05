@@ -19,7 +19,7 @@ pub mod openinfra {
 pub use openinfra::agent::v1 as proto;
 
 use crate::proto::*;
-use agent_core::{identity::IdentityManager, AgentConfig};
+use agent_core::{identity::IdentityManager, local_state::LocalStateError, AgentConfig};
 use agent_inventory::InventoryManager;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -28,6 +28,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
+
+fn executor_status_error(error: anyhow::Error) -> Status {
+    if matches!(
+        error.downcast_ref::<LocalStateError>(),
+        Some(LocalStateError::WorkloadNotFound(_))
+    ) {
+        return Status::not_found(error.to_string());
+    }
+    Status::internal(format!("Executor error: {error:?}"))
+}
 
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -213,7 +223,7 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
             .executor
             .get_status(&req.workload_id)
             .await
-            .map_err(|e| Status::internal(format!("Executor error: {:?}", e)))?;
+            .map_err(executor_status_error)?;
 
         Ok(Response::new(GetWorkloadStatusResponse {
             workload_id: req.workload_id,
@@ -228,5 +238,27 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
         _: Request<StreamMetricsRequest>,
     ) -> Result<Response<Self::StreamMetricsStream>, Status> {
         Err(Status::unimplemented("StreamMetrics not yet implemented"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_workload_maps_to_grpc_not_found() {
+        let status = executor_status_error(
+            LocalStateError::WorkloadNotFound("missing-workload".to_string()).into(),
+        );
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(status.message().contains("missing-workload"));
+    }
+
+    #[test]
+    fn other_executor_errors_remain_internal() {
+        let status = executor_status_error(anyhow::anyhow!("Docker unavailable"));
+
+        assert_eq!(status.code(), tonic::Code::Internal);
     }
 }

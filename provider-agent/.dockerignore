@@ -1,0 +1,7 @@
+target/
+.openinfra-state/
+config.yaml
+*.key
+*.crt
+*.pem
+docs/

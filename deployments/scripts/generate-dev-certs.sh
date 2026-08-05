@@ -4,10 +4,13 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cert_dir="$repo_root/deployments/local/certs"
 chain_dir="$repo_root/deployments/local/chain"
+agent_dir="$repo_root/deployments/local/agent"
 mkdir -p "$cert_dir"
 mkdir -p "$chain_dir"
+mkdir -p "$agent_dir"
 chmod 700 "$cert_dir"
 chmod 755 "$chain_dir"
+chmod 700 "$agent_dir"
 
 if [[ ! -f "$cert_dir/bridge-key.pem" || ! -f "$cert_dir/bridge-public.hex" ]]; then
   openssl genpkey -algorithm ED25519 -out "$cert_dir/bridge-key.pem"
