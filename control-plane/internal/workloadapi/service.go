@@ -31,6 +31,10 @@ type Workload struct {
 	Definition                                  []byte
 	ProviderID, LeaseID, ContainerID, ErrorCode string
 	CreatedAt, UpdatedAt                        time.Time
+	WorkerID                                    string
+	WorkerLeaseUntil                            time.Time
+	Version                                     int64
+	AttemptCount                                int
 }
 
 type Repository interface {

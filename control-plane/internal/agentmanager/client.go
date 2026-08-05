@@ -15,12 +15,43 @@ import (
 
 	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 type Client struct {
 	tlsConfig   *tls.Config
 	dialTimeout time.Duration
+}
+
+// GetRunningWorkload reconciles an ambiguous Deploy result against the
+// authoritative Agent before the idempotent Deploy request is replayed.
+func (c *Client) GetRunningWorkload(ctx context.Context, provider RegisteredProvider, workloadID string) (bool, error) {
+	connection, client, err := c.ConnectVerified(ctx, provider)
+	if err != nil {
+		return false, err
+	}
+	defer connection.Close()
+	statusCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	response, err := client.GetWorkloadStatus(statusCtx, &agentv1.GetWorkloadStatusRequest{WorkloadId: workloadID})
+	if status.Code(err) == codes.NotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reconcile workload status: %w", err)
+	}
+	switch response.State {
+	case agentv1.GetWorkloadStatusResponse_STATE_RUNNING:
+		return true, nil
+	case agentv1.GetWorkloadStatusResponse_STATE_CREATED,
+		agentv1.GetWorkloadStatusResponse_STATE_PENDING,
+		agentv1.GetWorkloadStatusResponse_STATE_DEPLOYING:
+		return false, nil
+	default:
+		return false, fmt.Errorf("Agent workload cannot be reconciled from state %s", response.State.String())
+	}
 }
 
 func NewMTLSClient(certFile, keyFile, caFile string) (*Client, error) {
