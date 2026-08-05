@@ -1,0 +1,120 @@
+syntax = "proto3";
+
+package openinfra.shared.v1;
+
+option go_package = "github.com/openinfra/network/protocol/generated/go/shared/v1;sharedv1";
+
+import "google/protobuf/timestamp.proto";
+
+// --- Node Identity ---
+message NodeIdentity {
+  string node_id = 1;
+  string public_key = 2;
+  string protocol_version = 3;
+  string agent_version = 4;
+  ResourceCapability capabilities = 5;
+  NodeStatus status = 6;
+}
+
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_STATUS_PENDING = 1;
+  NODE_STATUS_ACTIVE = 2;
+  NODE_STATUS_OFFLINE = 3;
+  NODE_STATUS_DRAINING = 4;
+  NODE_STATUS_MAINTENANCE = 5;
+}
+
+// --- Resource Capability ---
+message ResourceCapability {
+  float cpu_total = 1;
+  float cpu_available = 2;
+  int64 ram_total_mb = 3;
+  int64 ram_available_mb = 4;
+  int64 storage_total_gb = 5;
+  int64 storage_available_gb = 6;
+  GPUCapability gpu = 7;
+  Bandwidth bandwidth = 8;
+}
+
+message GPUCapability {
+  string model = 1;
+  int64 vram_total_mb = 2;
+  int64 vram_available_mb = 3;
+  int32 count = 4;
+}
+
+message Bandwidth {
+  int32 ingress_mbps = 1;
+  int32 egress_mbps = 2;
+}
+
+// --- Reputation Vector ---
+message ReputationVector {
+  float compute = 1;
+  float storage = 2;
+  float network = 3;
+  float availability = 4;
+  float reliability = 5;
+  float global = 6;
+}
+
+// --- Workload Definition ---
+message WorkloadDefinition {
+  string workload_id = 1;
+  WorkloadProfile profile = 2;
+  ResourceRequirements requirements = 3;
+  WorkloadConstraints constraints = 4;
+  int32 duration_seconds = 5;
+}
+
+enum WorkloadProfile {
+  WORKLOAD_PROFILE_UNSPECIFIED = 0;
+  WORKLOAD_PROFILE_COMPUTE_INTENSIVE = 1;
+  WORKLOAD_PROFILE_MEMORY_INTENSIVE = 2;
+  WORKLOAD_PROFILE_STORAGE_INTENSIVE = 3;
+  WORKLOAD_PROFILE_LATENCY_SENSITIVE = 4;
+}
+
+message ResourceRequirements {
+  float cpu = 1;
+  int64 ram_mb = 2;
+  int64 storage_gb = 3;
+  int32 gpu_count = 4;
+}
+
+message WorkloadConstraints {
+  int32 max_latency_ms = 1;
+  float min_reputation = 2;
+  float max_price = 3;
+}
+
+// --- Lease Object ---
+message Lease {
+  string lease_id = 1;
+  string provider_id = 2;
+  string consumer_id = 3;
+  string workload_id = 4;
+  google.protobuf.Timestamp start = 5;
+  google.protobuf.Timestamp end = 6;
+  LeaseState state = 7;
+}
+
+enum LeaseState {
+  LEASE_STATE_UNSPECIFIED = 0;
+  LEASE_STATE_PENDING = 1;
+  LEASE_STATE_ACTIVE = 2;
+  LEASE_STATE_COMPLETED = 3;
+  LEASE_STATE_FAILED = 4;
+  LEASE_STATE_EXPIRED = 5;
+}
+
+// --- Event Envelope ---
+message EventEnvelope {
+  string event_id = 1;
+  string event_type = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  string source = 4;
+  bytes payload = 5; // Serialized specific event model
+  string signature = 6;
+}

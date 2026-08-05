@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OpenInfra Network</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><div><span class="eyebrow">OPENINFRA NETWORK</span><h1>Network operations</h1></div><div id="sample" class="sample">Connexion…</div></header>
+  <main>
+    <section class="cards">
+      <article><span>Agents connectés</span><strong id="fresh">—</strong><small id="total">— enregistrés</small></article>
+      <article><span>CPU disponible</span><strong id="cpu">—</strong><small>cœurs annoncés actifs</small></article>
+      <article><span>Mémoire disponible</span><strong id="memory">—</strong><small>sur heartbeats frais</small></article>
+      <article><span>Blockchain</span><strong id="block">—</strong><small id="chain">tête finalisée</small></article>
+      <article><span>Workloads</span><strong id="workload-count">—</strong><small>persistés dans PostgreSQL</small></article>
+    </section>
+    <section class="panel"><div class="panel-head"><div><span class="eyebrow">WORKLOADS</span><h2>Orchestration durable</h2></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Workload</th><th>État</th><th>Provider</th><th>Lease</th><th>Créé</th></tr></thead><tbody id="workloads"></tbody></table></div>
+    </section>
+    <section class="panel"><div class="panel-head"><div><span class="eyebrow">PROVIDERS</span><h2>État du réseau</h2></div><button id="refresh" type="button">Actualiser</button></div>
+      <div id="warning" class="warning" hidden></div>
+      <div class="table-wrap"><table><thead><tr><th>Provider</th><th>État durable</th><th>Connexion</th><th>Agent</th><th>CPU</th><th>RAM</th><th>On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>
+    </section>
+  </main>
+  <script src="app.js" defer></script>
+</body>
+</html>

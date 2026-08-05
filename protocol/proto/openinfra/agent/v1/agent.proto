@@ -1,0 +1,109 @@
+syntax = "proto3";
+package openinfra.agent.v1;
+
+option go_package = "github.com/openinfra/network/protocol/generated/go/agent/v1;agentv1";
+
+service ProviderAgentService {
+  rpc GetAgentInfo(GetAgentInfoRequest) returns (GetAgentInfoResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetInventory(GetInventoryRequest) returns (GetInventoryResponse);
+  rpc SolveChallenge(SolveChallengeRequest) returns (SolveChallengeResponse);
+  rpc Deploy(DeployRequest) returns (DeployResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+  rpc GetWorkloadStatus(GetWorkloadStatusRequest) returns (GetWorkloadStatusResponse);
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream StreamMetricsResponse);
+}
+
+message GetAgentInfoResponse {
+  string version = 1;
+  string node_id = 2;
+  string public_key = 3;
+  string protocol_version = 4;
+  repeated string capabilities = 5;
+  uint64 uptime_seconds = 6;
+}
+
+message SolveChallengeRequest {
+  string challenge_id = 1;
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_COMPUTE = 1;
+    TYPE_STORAGE = 2;
+    TYPE_AVAILABILITY = 3;
+  }
+  Type type = 2;
+  bytes payload = 3;
+}
+
+message SolveChallengeResponse {
+  string challenge_id = 1;
+  string resource_type = 2;
+  bytes result = 3;
+  uint32 duration_ms = 4;
+  bytes signature = 5;
+}
+
+message DeployRequest {
+  string workload_id = 1;
+  string lease_id = 2;
+  string image = 3;
+  ResourceLimits limits = 4;
+}
+
+message ResourceLimits {
+  float cpu_cores = 1;
+  int64 memory_mb = 2;
+}
+
+message DeployResponse {
+  bool success = 1;
+  string container_id = 2;
+  string error = 3;
+}
+
+message StopRequest {
+  string workload_id = 1;
+}
+
+message StopResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message GetWorkloadStatusRequest {
+  string workload_id = 1;
+}
+
+message GetWorkloadStatusResponse {
+  string workload_id = 1;
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_CREATED = 1;
+    STATE_PENDING = 2;
+    STATE_DEPLOYING = 3;
+    STATE_RUNNING = 4;
+    STATE_STOPPING = 5;
+    STATE_COMPLETED = 6;
+    STATE_FAILED = 7;
+  }
+  State state = 2;
+  string details = 3;
+}
+
+message GetInventoryRequest {}
+message GetInventoryResponse {
+  float cpu_cores = 1;
+  int64 total_memory_mb = 2;
+  int64 available_memory_mb = 3;
+}
+
+message StreamMetricsRequest {}
+message StreamMetricsResponse {
+  string metric_name = 1;
+  double value = 2;
+  int64 timestamp = 3;
+}
+
+message HealthCheckRequest {}
+message HealthCheckResponse { bool healthy = 1; string status = 2; }
+message GetAgentInfoRequest {}

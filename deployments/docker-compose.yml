@@ -1,0 +1,137 @@
+name: openinfra
+
+services:
+  postgres:
+    image: postgres:17.6-alpine3.22@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:8.2.1-alpine3.22@sha256:987c376c727652f99625c7d205a1cba3cb2c53b92b0b62aade2bd48ee1593232
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  blockchain-node:
+    build:
+      context: ../blockchain
+      dockerfile: Dockerfile
+    command:
+      - --chain=openinfra-dev
+      - --base-path=/var/lib/openinfra/data
+      - --consensus=manual-seal-3000
+      - --rpc-external
+      - --rpc-port=9944
+      - --rpc-methods=safe
+      - --rpc-cors=all
+      - --prometheus-external
+    environment:
+      OPENINFRA_DEV_SUDO_PUBLIC_KEY_FILE: /run/openinfra-chain/bridge-public.hex
+    ports:
+      - "127.0.0.1:9944:9944"
+      - "127.0.0.1:30333:30333"
+    volumes:
+      - substrate-data:/var/lib/openinfra
+      - ./local/chain:/run/openinfra-chain:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          -H 'content-type: application/json'
+          --data '{"jsonrpc":"2.0","id":1,"method":"system_health","params":[]}'
+          http://127.0.0.1:9944/ | grep -q '"result"'
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: control-plane/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      SUBSTRATE_RPC_URL: http://blockchain-node:9944
+      SUBSTRATE_SIGNER_KEY_FILE: /run/openinfra-tls/bridge-key.pem
+      CONTROL_PLANE_GRPC_ADDR: 0.0.0.0:50051
+      CONTROL_PLANE_HTTP_ADDR: 0.0.0.0:8080
+      OPENINFRA_DEV_DASHBOARD_INSECURE: "true"
+      TLS_CERT_FILE: /run/openinfra-tls/server.crt
+      TLS_KEY_FILE: /run/openinfra-tls/server.key
+      TLS_CLIENT_CA_FILE: /run/openinfra-tls/ca.crt
+      AGENT_CLIENT_TLS_CERT_FILE: /run/openinfra-tls/client.crt
+      AGENT_CLIENT_TLS_KEY_FILE: /run/openinfra-tls/client.key
+      AGENT_CLIENT_TLS_CA_FILE: /run/openinfra-tls/ca.crt
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "127.0.0.1:50051:50051"
+      - "127.0.0.1:8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./local/certs:/run/openinfra-tls:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      blockchain-node:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/grpc-health-probe
+        - -addr=127.0.0.1:50051
+        - -tls
+        - -tls-ca-cert=/run/openinfra-tls/ca.crt
+        - -tls-client-cert=/run/openinfra-tls/client.crt
+        - -tls-client-key=/run/openinfra-tls/client.key
+        - -tls-server-name=control-plane
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres-data:
+  redis-data:
+  substrate-data:

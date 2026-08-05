@@ -1,0 +1,41 @@
+# Rust
+target/
+**/target/
+
+# Go
+bin/
+*.test
+coverage.out
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.p12
+config.yaml
+.openinfra-state/
+
+# Runtime and service data
+data/
+deployments/local/certs/
+deployments/local/chain/
+**/postgres-data/
+**/redis-data/
+**/chains/
+**/keystore/
+
+# Logs, temporary files, and editors
+node_modules/
+**/node_modules/
+*.log
+*.tmp
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Generated protocol output
+protocol/.tools/

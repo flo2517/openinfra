@@ -1,0 +1,20 @@
+[package]
+name = "agent-executor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bollard = "0.15"
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+agent-api = { path = "../agent-api" }
+agent-core = { path = "../agent-core" }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

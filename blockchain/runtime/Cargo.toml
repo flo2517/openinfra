@@ -1,0 +1,36 @@
+[package]
+name = "openinfra-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+codec = { workspace = true }
+polkadot-sdk = { version = "=2606.0.0", default-features = false, features = ["pallet-balances", "pallet-sudo", "pallet-timestamp", "runtime"] }
+pallet-availability = { path = "../pallets/availability", default-features = false }
+pallet-openinfra-lease = { path = "../pallets/lease", default-features = false }
+pallet-openinfra-rewards = { path = "../pallets/rewards", default-features = false }
+pallet-provider-registry = { path = "../pallets/provider-registry", default-features = false }
+pallet-reputation = { path = "../pallets/reputation", default-features = false }
+pallet-resource-market = { path = "../pallets/resource-market", default-features = false }
+scale-info = { workspace = true }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[build-dependencies]
+polkadot-sdk = { version = "=2606.0.0", optional = true, features = ["substrate-wasm-builder"] }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "polkadot-sdk/std",
+    "pallet-availability/std",
+    "pallet-openinfra-lease/std",
+    "pallet-openinfra-rewards/std",
+    "pallet-provider-registry/std",
+    "pallet-reputation/std",
+    "pallet-resource-market/std",
+    "scale-info/std",
+    "serde_json/std",
+]

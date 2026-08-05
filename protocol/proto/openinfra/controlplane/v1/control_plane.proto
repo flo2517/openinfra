@@ -1,0 +1,129 @@
+syntax = "proto3";
+
+package openinfra.controlplane.v1;
+
+option go_package = "github.com/openinfra/network/protocol/generated/go/controlplane/v1;controlplanev1";
+
+import "google/protobuf/timestamp.proto";
+import "openinfra/shared/v1/shared.proto";
+
+// ControlPlane receives provider-originated registration and liveness calls.
+// Every RPC requires mutually authenticated TLS in non-development environments.
+service ControlPlaneService {
+  // BeginJoin creates a short-lived, single-use challenge. Repeating request_id
+  // with the same payload must return the same live challenge.
+  rpc BeginJoin(BeginJoinRequest) returns (BeginJoinResponse);
+
+  // CompleteJoin verifies the domain-separated Ed25519 challenge signature.
+  // Success persists the provider before returning NODE_STATUS_ACTIVE.
+  rpc CompleteJoin(CompleteJoinRequest) returns (CompleteJoinResponse);
+
+  // ReportHeartbeat refreshes reconstructible liveness state. Sequence numbers
+  // must increase monotonically per provider identity.
+  rpc ReportHeartbeat(ReportHeartbeatRequest) returns (ReportHeartbeatResponse);
+
+  // SubmitWorkload durably accepts an idempotent workload request. Acceptance
+  // does not imply that scheduling, a lease, or deployment has succeeded.
+  rpc SubmitWorkload(SubmitWorkloadRequest) returns (SubmitWorkloadResponse);
+  rpc GetWorkload(GetWorkloadRequest) returns (GetWorkloadResponse);
+}
+
+message BeginJoinRequest {
+  // UUID generated once for idempotent retries of this operation.
+  string request_id = 1;
+  // Raw 32-byte Ed25519 verifying key.
+  bytes public_key = 2;
+  string protocol_version = 3;
+  string agent_version = 4;
+  // HTTPS endpoint where the Control Plane can reach ProviderAgentService.
+  // Dispatch still requires mTLS and a matching Agent identity.
+  string agent_endpoint = 5;
+}
+
+message BeginJoinResponse {
+  string challenge_id = 1;
+  // Cryptographically random, opaque bytes; valid for one successful response.
+  bytes challenge_nonce = 2;
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message CompleteJoinRequest {
+  // New UUID used to make completion retries idempotent.
+  string request_id = 1;
+  string challenge_id = 2;
+  // Ed25519 signature over "openinfra-join-v1\0" followed by the exact
+  // challenge_nonce returned by BeginJoin.
+  bytes challenge_signature = 3;
+  openinfra.shared.v1.ResourceCapability capabilities = 4;
+}
+
+message CompleteJoinResponse {
+  // Stable lowercase hexadecimal hash of the verified public key.
+  string provider_id = 1;
+  openinfra.shared.v1.NodeStatus status = 2;
+  google.protobuf.Timestamp registered_at = 3;
+  uint32 heartbeat_interval_seconds = 4;
+}
+
+message ReportHeartbeatRequest {
+  HeartbeatSigningPayload payload = 1;
+  // Ed25519 signature over "openinfra-heartbeat-v1\0" followed by the
+  // deterministic Protobuf serialization of payload.
+  bytes signature = 2;
+}
+
+message HeartbeatSigningPayload {
+  string request_id = 1;
+  string provider_id = 2;
+  // Strictly increasing counter persisted by the Agent across restarts.
+  uint64 sequence = 3;
+  google.protobuf.Timestamp observed_at = 4;
+  openinfra.shared.v1.ResourceCapability capabilities = 5;
+}
+
+message ReportHeartbeatResponse {
+  openinfra.shared.v1.NodeStatus status = 1;
+  google.protobuf.Timestamp accepted_at = 2;
+  uint32 next_heartbeat_seconds = 3;
+}
+
+enum WorkloadState {
+  WORKLOAD_STATE_UNSPECIFIED = 0;
+  WORKLOAD_STATE_REQUESTED = 1;
+  WORKLOAD_STATE_SCHEDULING = 2;
+  WORKLOAD_STATE_LEASE_PENDING = 3;
+  WORKLOAD_STATE_LEASED = 4;
+  WORKLOAD_STATE_DEPLOYING = 5;
+  WORKLOAD_STATE_RUNNING = 6;
+  WORKLOAD_STATE_COMPLETED = 7;
+  WORKLOAD_STATE_FAILED = 8;
+}
+
+message SubmitWorkloadRequest {
+  // UUID reused for safe retries of the exact same submission.
+  string request_id = 1;
+  openinfra.shared.v1.WorkloadDefinition definition = 2;
+  // Immutable OCI reference including an explicit sha256 digest.
+  string image = 3;
+}
+
+message SubmitWorkloadResponse {
+  string workload_id = 1;
+  WorkloadState state = 2;
+  google.protobuf.Timestamp created_at = 3;
+}
+
+message GetWorkloadRequest {
+  string workload_id = 1;
+}
+
+message GetWorkloadResponse {
+  string workload_id = 1;
+  WorkloadState state = 2;
+  string provider_id = 3;
+  string lease_id = 4;
+  string container_id = 5;
+  string error_code = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}

@@ -1,0 +1,14 @@
+.git
+.env
+**/.env
+**/target
+**/node_modules
+**/*.key
+**/*.pem
+**/*.p12
+**/config.yaml
+deployments/local/certs
+provider-agent/.opencode
+docs
+blockchain
+tests
