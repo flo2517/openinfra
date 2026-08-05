@@ -13,9 +13,12 @@ impl frame_system::Config for Test {
 parameter_types! { pub const MaxLifetime: u64 = 10; }
 impl crate::Config for Test {
     type ChallengeOrigin = frame_system::EnsureRoot<u64>;
+    type ProofOrigin = frame_system::EnsureRoot<u64>;
     type ProviderInspector = ();
     type MaxPendingChallenges = ConstU32<1>;
     type MaxChallengeLifetime = MaxLifetime;
+    type MaxProofAge = MaxLifetime;
+    type MaxProofSamples = ConstU32<100>;
     type WeightInfo = ();
 }
 
@@ -92,6 +95,57 @@ fn response_is_checked_for_owner_expiry_and_replay() {
         assert_noop!(
             Availability::submit_response(RuntimeOrigin::signed(1), 1, [9; 32]),
             crate::Error::<Test>::ChallengeTimeout
+        );
+    });
+}
+
+#[test]
+fn proof_is_bounded_fresh_monotonic_and_idempotent() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(5);
+        assert_ok!(Availability::submit_proof(
+            RuntimeOrigin::root(),
+            1,
+            1,
+            4,
+            9,
+            10,
+            [3; 32],
+            vec![7; 64]
+        ));
+        let summary = crate::LatestProof::<Test>::get(1).expect("summary");
+        assert_eq!(summary.availability_bps, 9_000);
+        assert_noop!(
+            Availability::submit_proof(RuntimeOrigin::root(), 1, 1, 5, 1, 1, [4; 32], vec![7]),
+            crate::Error::<Test>::ProofSequenceReplay
+        );
+        assert_noop!(
+            Availability::submit_proof(RuntimeOrigin::root(), 1, 2, 5, 2, 1, [4; 32], vec![7]),
+            crate::Error::<Test>::InvalidProofSamples
+        );
+        System::set_block_number(20);
+        assert_noop!(
+            Availability::submit_proof(RuntimeOrigin::root(), 1, 2, 1, 1, 1, [4; 32], vec![7]),
+            crate::Error::<Test>::ProofTooOld
+        );
+    });
+}
+
+#[test]
+fn proof_origin_and_signature_bounds_are_enforced() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            Availability::submit_proof(RuntimeOrigin::signed(2), 1, 1, 1, 1, 1, [1; 32], vec![1]),
+            DispatchError::BadOrigin
+        );
+        assert_noop!(
+            Availability::submit_proof(RuntimeOrigin::root(), 1, 1, 1, 1, 1, [1; 32], vec![]),
+            crate::Error::<Test>::InvalidProofSignature
+        );
+        assert_noop!(
+            Availability::submit_proof(RuntimeOrigin::root(), 1, 1, 1, 1, 1, [1; 32], vec![1; 97]),
+            crate::Error::<Test>::ProofSignatureTooLong
         );
     });
 }

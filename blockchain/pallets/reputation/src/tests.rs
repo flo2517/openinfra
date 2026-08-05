@@ -68,3 +68,37 @@ fn i32_min_is_rejected_without_panicking() {
         );
     });
 }
+
+#[test]
+fn availability_updates_integer_vector_and_global_score() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Reputation::record_availability(
+            RuntimeOrigin::root(),
+            2,
+            9_000,
+            10
+        ));
+        let vector = Reputation::vector(2).expect("vector");
+        assert_eq!(vector.availability, 900);
+        assert_eq!(vector.global, 580);
+        assert_eq!(crate::ReputationScores::<Test>::get(2), Some(900));
+    });
+}
+
+#[test]
+fn vector_rejects_unauthorized_and_out_of_range_values() {
+    new_test_ext().execute_with(|| {
+        assert_noop!(
+            Reputation::update_vector(RuntimeOrigin::signed(1), 2, 1, 1, 1, 1, 1),
+            DispatchError::BadOrigin
+        );
+        assert_noop!(
+            Reputation::update_vector(RuntimeOrigin::root(), 2, 1_001, 1, 1, 1, 1),
+            crate::Error::<Test>::VectorValueOutOfBounds
+        );
+        assert_noop!(
+            Reputation::record_availability(RuntimeOrigin::root(), 2, 10_001, 1),
+            crate::Error::<Test>::AvailabilityOutOfBounds
+        );
+    });
+}

@@ -1,9 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
 pub use pallet::*;
 
 use frame_support::{pallet_prelude::*, traits::Get, weights::Weight};
 use frame_system::pallet_prelude::*;
+use sp_runtime::traits::Saturating;
 
 pub trait ProviderInspector<AccountId> {
     fn is_registered(provider: &AccountId) -> bool;
@@ -19,6 +22,7 @@ pub trait WeightInfo {
     fn submit_heartbeat() -> Weight;
     fn issue_challenge() -> Weight;
     fn submit_response() -> Weight;
+    fn submit_proof() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -31,11 +35,15 @@ impl WeightInfo for () {
     fn submit_response() -> Weight {
         Weight::zero()
     }
+    fn submit_proof() -> Weight {
+        Weight::zero()
+    }
 }
 
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
+    use alloc::vec::Vec;
 
     #[derive(
         Clone, Encode, Decode, DecodeWithMemTracking, Eq, MaxEncodedLen, PartialEq, Debug, TypeInfo,
@@ -48,11 +56,19 @@ pub mod pallet {
     #[pallet::config]
     pub trait Config: frame_system::Config<RuntimeEvent: From<Event<Self>>> {
         type ChallengeOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+        /// Origin used by the validator set/control-plane bridge after it has
+        /// verified the provider's signature off-chain.  The runtime stores
+        /// only a bounded summary, never the raw metrics payload.
+        type ProofOrigin: EnsureOrigin<Self::RuntimeOrigin>;
         type ProviderInspector: ProviderInspector<Self::AccountId>;
         #[pallet::constant]
         type MaxPendingChallenges: Get<u32>;
         #[pallet::constant]
         type MaxChallengeLifetime: Get<BlockNumberFor<Self>>;
+        #[pallet::constant]
+        type MaxProofAge: Get<BlockNumberFor<Self>>;
+        #[pallet::constant]
+        type MaxProofSamples: Get<u32>;
         type WeightInfo: WeightInfo;
     }
 
@@ -87,6 +103,36 @@ pub mod pallet {
         ValueQuery,
     >;
 
+    /// Monotonic sequence accepted for each provider.  A sequence can never
+    /// be submitted twice, which makes relaying a proof idempotent and
+    /// prevents replay of an old availability observation.
+    #[pallet::storage]
+    pub type LastProofSequence<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, u64, ValueQuery>;
+
+    #[derive(
+        Clone, Encode, Decode, DecodeWithMemTracking, Eq, MaxEncodedLen, PartialEq, Debug, TypeInfo,
+    )]
+    pub struct AvailabilitySummary<BlockNumber> {
+        pub sequence: u64,
+        pub observed_at: BlockNumber,
+        pub successful_samples: u32,
+        pub total_samples: u32,
+        /// Availability in basis points (0..=10_000), not a float.
+        pub availability_bps: u16,
+        pub payload_hash: [u8; 32],
+        pub signature: BoundedVec<u8, ConstU32<96>>,
+    }
+
+    #[pallet::storage]
+    pub type LatestProof<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        AvailabilitySummary<BlockNumberFor<T>>,
+        OptionQuery,
+    >;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -103,6 +149,13 @@ pub mod pallet {
             provider: T::AccountId,
             challenge_id: u64,
         },
+        ProofAccepted {
+            provider: T::AccountId,
+            sequence: u64,
+            availability_bps: u16,
+            successful_samples: u32,
+            total_samples: u32,
+        },
     }
 
     #[pallet::error]
@@ -115,6 +168,12 @@ pub mod pallet {
         ChallengeNotFound,
         ChallengeTimeout,
         InvalidResponse,
+        ProofSequenceReplay,
+        ProofTooOld,
+        InvalidProofSamples,
+        InvalidProofSignature,
+        ProofSignatureTooLong,
+        ProofSequenceOverflow,
     }
 
     #[pallet::call]
@@ -207,6 +266,75 @@ pub mod pallet {
             Self::deposit_event(Event::ChallengeValidated {
                 provider,
                 challenge_id,
+            });
+            Ok(())
+        }
+
+        /// Commit a validator-verified, provider-signed availability summary.
+        /// Signature verification is deliberately performed by the validator
+        /// bridge before this authorized call; the runtime enforces bounds,
+        /// freshness and monotonic sequencing for deterministic replay safety.
+        #[pallet::call_index(3)]
+        #[pallet::weight(T::WeightInfo::submit_proof())]
+        pub fn submit_proof(
+            origin: OriginFor<T>,
+            provider: T::AccountId,
+            sequence: u64,
+            observed_at: BlockNumberFor<T>,
+            successful_samples: u32,
+            total_samples: u32,
+            payload_hash: [u8; 32],
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            T::ProofOrigin::ensure_origin(origin)?;
+            ensure!(
+                T::ProviderInspector::is_registered(&provider),
+                Error::<T>::ProviderNotRegistered
+            );
+            ensure!(
+                sequence > LastProofSequence::<T>::get(&provider),
+                Error::<T>::ProofSequenceReplay
+            );
+            ensure!(
+                total_samples > 0 && total_samples <= T::MaxProofSamples::get(),
+                Error::<T>::InvalidProofSamples
+            );
+            ensure!(
+                successful_samples <= total_samples,
+                Error::<T>::InvalidProofSamples
+            );
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(observed_at <= now, Error::<T>::ProofTooOld);
+            let age = now.saturating_sub(observed_at);
+            ensure!(age <= T::MaxProofAge::get(), Error::<T>::ProofTooOld);
+            let availability_bps = ((successful_samples as u64)
+                .checked_mul(10_000)
+                .ok_or(Error::<T>::InvalidProofSamples)?
+                / u64::from(total_samples)) as u16;
+            let signature: BoundedVec<u8, ConstU32<96>> = signature
+                .try_into()
+                .map_err(|_| Error::<T>::ProofSignatureTooLong)?;
+            ensure!(!signature.is_empty(), Error::<T>::InvalidProofSignature);
+            LastProofSequence::<T>::insert(&provider, sequence);
+            LatestProof::<T>::insert(
+                &provider,
+                AvailabilitySummary {
+                    sequence,
+                    observed_at,
+                    successful_samples,
+                    total_samples,
+                    availability_bps,
+                    payload_hash,
+                    signature,
+                },
+            );
+            LastHeartbeat::<T>::insert(&provider, observed_at);
+            Self::deposit_event(Event::ProofAccepted {
+                provider,
+                sequence,
+                availability_bps,
+                successful_samples,
+                total_samples,
             });
             Ok(())
         }

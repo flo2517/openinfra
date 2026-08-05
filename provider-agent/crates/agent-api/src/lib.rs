@@ -22,8 +22,10 @@ use crate::proto::*;
 use agent_core::{identity::IdentityManager, local_state::LocalStateError, AgentConfig};
 use agent_inventory::InventoryManager;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -38,6 +40,10 @@ fn executor_status_error(error: anyhow::Error) -> Status {
     }
     Status::internal(format!("Executor error: {error:?}"))
 }
+
+const CHALLENGE_DOMAIN: &[u8] = b"openinfra-availability-proof-v1\0";
+const MAX_CHALLENGE_ID: usize = 128;
+const MAX_CHALLENGE_PAYLOAD: usize = 4096;
 
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -172,9 +178,55 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
 
     async fn solve_challenge(
         &self,
-        _: Request<SolveChallengeRequest>,
+        request: Request<SolveChallengeRequest>,
     ) -> Result<Response<SolveChallengeResponse>, Status> {
-        Err(Status::unimplemented("SolveChallenge not yet implemented"))
+        let request = request.into_inner();
+        if request.challenge_id.is_empty() || request.challenge_id.len() > MAX_CHALLENGE_ID {
+            return Err(Status::invalid_argument(
+                "challenge_id is empty or too long",
+            ));
+        }
+        if request.payload.len() > MAX_CHALLENGE_PAYLOAD {
+            return Err(Status::resource_exhausted("challenge payload is too large"));
+        }
+        let challenge_type = solve_challenge_request::Type::try_from(request.r#type)
+            .map_err(|_| Status::invalid_argument("unknown challenge type"))?;
+        if challenge_type == solve_challenge_request::Type::Unspecified {
+            return Err(Status::invalid_argument("challenge type is required"));
+        }
+        let started = Instant::now();
+        // The validator supplies a bounded nonce/payload. Hashing it gives a
+        // deterministic proof of work without executing provider-controlled
+        // code in the Agent process.
+        let mut hasher = Sha256::new();
+        hasher.update(&request.payload);
+        let result = hasher.finalize().to_vec();
+        let mut signed = Vec::with_capacity(
+            CHALLENGE_DOMAIN.len() + request.challenge_id.len() + result.len() + 8,
+        );
+        signed.extend_from_slice(CHALLENGE_DOMAIN);
+        signed.extend_from_slice(&(request.challenge_id.len() as u32).to_be_bytes());
+        signed.extend_from_slice(request.challenge_id.as_bytes());
+        signed.extend_from_slice(&request.r#type.to_be_bytes());
+        signed.extend_from_slice(&result);
+        let signature = self
+            .identity_manager
+            .sign(&signed)
+            .await
+            .map_err(|error| Status::internal(format!("identity signing failed: {error}")))?;
+        let resource_type = match challenge_type {
+            solve_challenge_request::Type::Compute => "compute",
+            solve_challenge_request::Type::Storage => "storage",
+            solve_challenge_request::Type::Availability => "availability",
+            solve_challenge_request::Type::Unspecified => unreachable!(),
+        };
+        Ok(Response::new(SolveChallengeResponse {
+            challenge_id: request.challenge_id,
+            resource_type: resource_type.to_string(),
+            result,
+            duration_ms: started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
+            signature,
+        }))
     }
 
     async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {

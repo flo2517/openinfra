@@ -14,6 +14,7 @@ anyhow = "1.0"
 tracing = "0.1"
 async-trait = "0.1"
 tokio-stream = "0.1"
+sha2 = "0.10"
 
 [build-dependencies]
 tonic-build = "0.10"
