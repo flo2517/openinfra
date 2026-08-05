@@ -41,6 +41,27 @@ func (r *memoryRepository) Get(_ context.Context, id string) (Workload, error) {
 	}
 	return w, nil
 }
+func (r *memoryRepository) RequestStop(_ context.Context, workloadID, requestID string, now time.Time) (Workload, error) {
+	w, ok := r.byID[workloadID]
+	if !ok {
+		return Workload{}, ErrNotFound
+	}
+	if w.StopRequestID != "" && w.StopRequestID != requestID {
+		return Workload{}, ErrConflict
+	}
+	if w.StopRequestID == "" {
+		w.StopRequestID = requestID
+		switch w.State {
+		case "STOPPED", "COMPLETED", "FAILED":
+		default:
+			w.State = "STOPPING"
+		}
+		w.UpdatedAt = now
+		r.byID[workloadID] = w
+		r.byRequest[w.RequestID] = w
+	}
+	return w, nil
+}
 
 func validRequest() *controlplanev1.SubmitWorkloadRequest {
 	return &controlplanev1.SubmitWorkloadRequest{RequestId: uuid.NewString(), Image: "redis@sha256:987c376c727652f99625c7d205a1cba3cb2c53b92b0b62aade2bd48ee1593232", Definition: &sharedv1.WorkloadDefinition{WorkloadId: uuid.NewString(), Profile: sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, Requirements: &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256}, DurationSeconds: 300}}
@@ -100,5 +121,68 @@ func TestGetDoesNotInventRuntimeState(t *testing.T) {
 	}
 	if got.State != controlplanev1.WorkloadState_WORKLOAD_STATE_REQUESTED || got.ProviderId != "" || got.LeaseId != "" || got.ContainerId != "" {
 		t.Fatalf("unexpected state: %+v", got)
+	}
+}
+
+func TestStopWorkloadIsPersistentAndIdempotent(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	stopTime := time.Unix(1700000300, 0).UTC()
+	service.now = func() time.Time { return stopTime }
+	submit := validRequest()
+	if _, err := service.SubmitWorkload(context.Background(), submit); err != nil {
+		t.Fatal(err)
+	}
+	stop := &controlplanev1.StopWorkloadRequest{RequestId: uuid.NewString(), WorkloadId: submit.Definition.WorkloadId}
+	first, err := service.StopWorkload(context.Background(), stop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State != controlplanev1.WorkloadState_WORKLOAD_STATE_STOPPING || !first.UpdatedAt.AsTime().Equal(stopTime) {
+		t.Fatalf("unexpected stop response: %+v", first)
+	}
+	second, err := service.StopWorkload(context.Background(), stop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.State != first.State || !second.UpdatedAt.AsTime().Equal(stopTime) {
+		t.Fatalf("retry changed response: %+v", second)
+	}
+
+	_, err = service.StopWorkload(context.Background(), &controlplanev1.StopWorkloadRequest{RequestId: uuid.NewString(), WorkloadId: stop.WorkloadId})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("conflicting stop code=%s", status.Code(err))
+	}
+}
+
+func TestStopWorkloadValidatesInputAndPreservesTerminalState(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	_, err := service.StopWorkload(context.Background(), nil)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("nil request code=%s", status.Code(err))
+	}
+	_, err = service.StopWorkload(context.Background(), &controlplanev1.StopWorkloadRequest{RequestId: "invalid", WorkloadId: uuid.NewString()})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("invalid request ID code=%s", status.Code(err))
+	}
+	_, err = service.StopWorkload(context.Background(), &controlplanev1.StopWorkloadRequest{RequestId: uuid.NewString(), WorkloadId: uuid.NewString()})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("missing workload code=%s", status.Code(err))
+	}
+
+	submit := validRequest()
+	if _, err = service.SubmitWorkload(context.Background(), submit); err != nil {
+		t.Fatal(err)
+	}
+	w := repository.byID[submit.Definition.WorkloadId]
+	w.State = "COMPLETED"
+	repository.byID[w.WorkloadID] = w
+	response, err := service.StopWorkload(context.Background(), &controlplanev1.StopWorkloadRequest{RequestId: uuid.NewString(), WorkloadId: w.WorkloadID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.State != controlplanev1.WorkloadState_WORKLOAD_STATE_COMPLETED {
+		t.Fatalf("terminal state changed: %s", response.State)
 	}
 }

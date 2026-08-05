@@ -25,6 +25,7 @@ var (
 
 type Workload struct {
 	WorkloadID, RequestID, Image, State         string
+	StopRequestID                               string
 	RequestHash                                 [32]byte
 	ResourceHash                                [32]byte
 	Definition                                  []byte
@@ -35,6 +36,7 @@ type Workload struct {
 type Repository interface {
 	CreateOrGet(context.Context, Workload) (Workload, error)
 	Get(context.Context, string) (Workload, error)
+	RequestStop(context.Context, string, string, time.Time) (Workload, error)
 }
 
 type Service struct {
@@ -71,6 +73,27 @@ func (s *Service) GetWorkload(ctx context.Context, request *controlplanev1.GetWo
 		return nil, repositoryError(err)
 	}
 	return &controlplanev1.GetWorkloadResponse{WorkloadId: stored.WorkloadID, State: stateToProto(stored.State), ProviderId: stored.ProviderID, LeaseId: stored.LeaseID, ContainerId: stored.ContainerID, ErrorCode: stored.ErrorCode, CreatedAt: timestamppb.New(stored.CreatedAt), UpdatedAt: timestamppb.New(stored.UpdatedAt)}, nil
+}
+
+func (s *Service) StopWorkload(ctx context.Context, request *controlplanev1.StopWorkloadRequest) (*controlplanev1.StopWorkloadResponse, error) {
+	if request == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	if _, err := uuid.Parse(request.RequestId); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "request_id must be a UUID")
+	}
+	if _, err := uuid.Parse(request.WorkloadId); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "workload_id must be a UUID")
+	}
+	stored, err := s.repository.RequestStop(ctx, request.WorkloadId, request.RequestId, s.now().UTC())
+	if err != nil {
+		return nil, repositoryError(err)
+	}
+	return &controlplanev1.StopWorkloadResponse{
+		WorkloadId: stored.WorkloadID,
+		State:      stateToProto(stored.State),
+		UpdatedAt:  timestamppb.New(stored.UpdatedAt),
+	}, nil
 }
 
 func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, [32]byte, error) {
@@ -118,7 +141,7 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 }
 
 func stateToProto(state string) controlplanev1.WorkloadState {
-	values := map[string]controlplanev1.WorkloadState{"REQUESTED": controlplanev1.WorkloadState_WORKLOAD_STATE_REQUESTED, "SCHEDULING": controlplanev1.WorkloadState_WORKLOAD_STATE_SCHEDULING, "LEASE_PENDING": controlplanev1.WorkloadState_WORKLOAD_STATE_LEASE_PENDING, "LEASED": controlplanev1.WorkloadState_WORKLOAD_STATE_LEASED, "DEPLOYING": controlplanev1.WorkloadState_WORKLOAD_STATE_DEPLOYING, "RUNNING": controlplanev1.WorkloadState_WORKLOAD_STATE_RUNNING, "COMPLETED": controlplanev1.WorkloadState_WORKLOAD_STATE_COMPLETED, "FAILED": controlplanev1.WorkloadState_WORKLOAD_STATE_FAILED}
+	values := map[string]controlplanev1.WorkloadState{"REQUESTED": controlplanev1.WorkloadState_WORKLOAD_STATE_REQUESTED, "SCHEDULING": controlplanev1.WorkloadState_WORKLOAD_STATE_SCHEDULING, "LEASE_PENDING": controlplanev1.WorkloadState_WORKLOAD_STATE_LEASE_PENDING, "LEASED": controlplanev1.WorkloadState_WORKLOAD_STATE_LEASED, "DEPLOYING": controlplanev1.WorkloadState_WORKLOAD_STATE_DEPLOYING, "RUNNING": controlplanev1.WorkloadState_WORKLOAD_STATE_RUNNING, "STOPPING": controlplanev1.WorkloadState_WORKLOAD_STATE_STOPPING, "STOPPED": controlplanev1.WorkloadState_WORKLOAD_STATE_STOPPED, "COMPLETED": controlplanev1.WorkloadState_WORKLOAD_STATE_COMPLETED, "FAILED": controlplanev1.WorkloadState_WORKLOAD_STATE_FAILED}
 	return values[state]
 }
 

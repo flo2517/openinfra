@@ -40,6 +40,8 @@ The Control Plane calls `openinfra.agent.v1.ProviderAgentService` for inventory,
 
 `GetWorkload` returns the authoritative persisted state. `provider_id`, `lease_id`, and `container_id` remain empty until their corresponding scheduler, finalized blockchain, and Provider Agent confirmations have been committed. The dashboard displays this same projection.
 
+`StopWorkload` accepts a new idempotency UUID and a workload UUID. Only a running workload enters `STOPPING`. `STOPPED` is committed after the Agent confirms the exact Docker container is no longer running and the corresponding on-chain lease is `Completed` at a finalized head. Reusing the same request is safe; a competing request while stopping is rejected.
+
 ## Blockchain Bridge API
 
 ### GET /reputation/{node_id}

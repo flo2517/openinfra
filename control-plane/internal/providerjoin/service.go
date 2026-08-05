@@ -93,6 +93,7 @@ type HeartbeatStore interface {
 type WorkloadService interface {
 	SubmitWorkload(context.Context, *controlplanev1.SubmitWorkloadRequest) (*controlplanev1.SubmitWorkloadResponse, error)
 	GetWorkload(context.Context, *controlplanev1.GetWorkloadRequest) (*controlplanev1.GetWorkloadResponse, error)
+	StopWorkload(context.Context, *controlplanev1.StopWorkloadRequest) (*controlplanev1.StopWorkloadResponse, error)
 }
 
 type Service struct {
@@ -120,6 +121,13 @@ func (s *Service) GetWorkload(ctx context.Context, request *controlplanev1.GetWo
 		return nil, status.Error(codes.Unavailable, "workload service is unavailable")
 	}
 	return s.workloads.GetWorkload(ctx, request)
+}
+
+func (s *Service) StopWorkload(ctx context.Context, request *controlplanev1.StopWorkloadRequest) (*controlplanev1.StopWorkloadResponse, error) {
+	if s.workloads == nil {
+		return nil, status.Error(codes.Unavailable, "workload service is unavailable")
+	}
+	return s.workloads.StopWorkload(ctx, request)
 }
 
 func NewService(repository Repository, heartbeats HeartbeatStore, registrar ProviderRegistrar) *Service {

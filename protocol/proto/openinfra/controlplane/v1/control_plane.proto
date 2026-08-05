@@ -26,6 +26,7 @@ service ControlPlaneService {
   // does not imply that scheduling, a lease, or deployment has succeeded.
   rpc SubmitWorkload(SubmitWorkloadRequest) returns (SubmitWorkloadResponse);
   rpc GetWorkload(GetWorkloadRequest) returns (GetWorkloadResponse);
+  rpc StopWorkload(StopWorkloadRequest) returns (StopWorkloadResponse);
 }
 
 message BeginJoinRequest {
@@ -97,6 +98,8 @@ enum WorkloadState {
   WORKLOAD_STATE_RUNNING = 6;
   WORKLOAD_STATE_COMPLETED = 7;
   WORKLOAD_STATE_FAILED = 8;
+  WORKLOAD_STATE_STOPPING = 9;
+  WORKLOAD_STATE_STOPPED = 10;
 }
 
 message SubmitWorkloadRequest {
@@ -126,4 +129,15 @@ message GetWorkloadResponse {
   string error_code = 6;
   google.protobuf.Timestamp created_at = 7;
   google.protobuf.Timestamp updated_at = 8;
+}
+
+message StopWorkloadRequest {
+  string request_id = 1;
+  string workload_id = 2;
+}
+
+message StopWorkloadResponse {
+  string workload_id = 1;
+  WorkloadState state = 2;
+  google.protobuf.Timestamp updated_at = 3;
 }

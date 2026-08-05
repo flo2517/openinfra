@@ -31,6 +31,7 @@ const (
 	updateLeaseStateCallIndex   = 1
 	leaseStateCreated           = 0
 	leaseStateActive            = 1
+	leaseStateCompleted         = 2
 	statusRegistered            = 0
 	statusVerified              = 1
 	statusActive                = 2
@@ -53,6 +54,91 @@ type FinalizedLease struct {
 	State                byte
 	FinalizedBlockHash   []byte
 	FinalizedBlockNumber uint64
+}
+
+// EnsureLeaseCompleted returns only after the lease is Completed in finalized
+// storage. Repeating the call for an already completed lease is a no-op.
+func (r *Registrar) EnsureLeaseCompleted(ctx context.Context, leaseID uint64) (FinalizedLease, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	version, err := r.rpc.RuntimeVersion(ctx)
+	if err != nil {
+		return FinalizedLease{}, err
+	}
+	if version.SpecVersion != supportedSpecVersion || version.TransactionVersion != supportedTransactionVersion {
+		return FinalizedLease{}, fmt.Errorf("unsupported runtime version spec=%d transaction=%d", version.SpecVersion, version.TransactionVersion)
+	}
+
+	lease, found, err := r.finalizedLease(ctx, leaseID)
+	if err != nil {
+		return FinalizedLease{}, err
+	}
+	if !found {
+		return FinalizedLease{}, fmt.Errorf("lease %d does not exist in finalized storage", leaseID)
+	}
+	if lease.Consumer != r.account {
+		return FinalizedLease{}, fmt.Errorf("lease %d is not owned by the bridge account", leaseID)
+	}
+	if lease.State == leaseStateCompleted {
+		return lease, nil
+	}
+	if lease.State != leaseStateActive {
+		return FinalizedLease{}, fmt.Errorf("lease %d cannot transition from state %d to Completed", leaseID, lease.State)
+	}
+	expected := lease
+
+	genesisHex, err := r.rpc.BlockHash(ctx, 0)
+	if err != nil {
+		return FinalizedLease{}, err
+	}
+	genesis, err := fixedHash(genesisHex)
+	if err != nil {
+		return FinalizedLease{}, err
+	}
+	nonce, err := r.finalizedAccountNonce(ctx)
+	if err != nil {
+		return FinalizedLease{}, err
+	}
+	inner := []byte{leasePalletIndex, updateLeaseStateCallIndex}
+	inner = binary.LittleEndian.AppendUint64(inner, leaseID)
+	inner = append(inner, leaseStateCompleted)
+	if err := r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis); err != nil {
+		return FinalizedLease{}, err
+	}
+
+	for {
+		lease, found, err = r.finalizedLease(ctx, leaseID)
+		if err != nil {
+			return FinalizedLease{}, err
+		}
+		if !found {
+			return FinalizedLease{}, fmt.Errorf("lease %d disappeared from finalized storage", leaseID)
+		}
+		if !sameLeaseIdentity(lease, expected) {
+			return FinalizedLease{}, fmt.Errorf("lease %d finalized data changed while completing", leaseID)
+		}
+		if lease.State == leaseStateCompleted {
+			return lease, nil
+		}
+		if lease.State != leaseStateActive {
+			return FinalizedLease{}, fmt.Errorf("lease %d reached unexpected state %d while completing", leaseID, lease.State)
+		}
+		select {
+		case <-ctx.Done():
+			return FinalizedLease{}, ctx.Err()
+		case <-time.After(r.pollInterval):
+		}
+	}
+}
+
+func sameLeaseIdentity(actual, expected FinalizedLease) bool {
+	return actual.LeaseID == expected.LeaseID &&
+		actual.Provider == expected.Provider &&
+		actual.Consumer == expected.Consumer &&
+		actual.ResourceHash == expected.ResourceHash &&
+		actual.Start == expected.Start &&
+		actual.End == expected.End
 }
 
 // EnsureLeaseActive returns only after the exact lease is Active in finalized storage.

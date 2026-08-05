@@ -25,15 +25,18 @@ type PersistentStore interface {
 	RetryLater(context.Context, string, string, string, time.Duration) error
 	MarkDeploying(context.Context, string, uint64) error
 	MarkRunning(context.Context, string, string) error
+	MarkStopped(context.Context, string, uint64) error
 }
 type ProviderDirectory interface {
 	ListSchedulableProviders(context.Context) ([]agentmanager.SchedulableProvider, error)
 }
 type LeaseRegistrar interface {
 	EnsureLeaseActive(context.Context, uint64, [32]byte, [32]byte, uint32) (blockchainbridge.FinalizedLease, error)
+	EnsureLeaseCompleted(context.Context, uint64) (blockchainbridge.FinalizedLease, error)
 }
 type AgentDispatcher interface {
 	DeployAndConfirm(context.Context, agentmanager.RegisteredProvider, *agentv1.DeployRequest) (string, error)
+	StopAndConfirm(context.Context, agentmanager.RegisteredProvider, string) error
 }
 
 type Worker struct {
@@ -127,6 +130,26 @@ func (w *Worker) processOne(ctx context.Context) error {
 			return w.retry(ctx, item, "AGENT_DEPLOY_FAILED", err)
 		}
 		return w.store.MarkRunning(ctx, item.WorkloadID, containerID)
+	case "STOPPING":
+		leaseID, err := strconv.ParseUint(item.LeaseID, 10, 64)
+		if err != nil {
+			return err
+		}
+		provider, err := w.provider(ctx, item.ProviderID)
+		if err != nil {
+			return w.retry(ctx, item, "PROVIDER_UNAVAILABLE", err)
+		}
+		stopCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		if err := w.dispatcher.StopAndConfirm(stopCtx, provider.RegisteredProvider, item.WorkloadID); err != nil {
+			return w.retry(ctx, item, "AGENT_STOP_FAILED", err)
+		}
+		chainCtx, chainCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer chainCancel()
+		if _, err := w.leases.EnsureLeaseCompleted(chainCtx, leaseID); err != nil {
+			return w.retry(ctx, item, "LEASE_COMPLETION_NOT_FINALIZED", err)
+		}
+		return w.store.MarkStopped(ctx, item.WorkloadID, leaseID)
 	default:
 		return nil
 	}
