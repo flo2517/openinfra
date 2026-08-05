@@ -46,11 +46,20 @@ type DeploymentReconciler interface {
 	GetRunningWorkload(context.Context, agentmanager.RegisteredProvider, string) (bool, error)
 }
 
+// OverlayManager is invoked only after the chain lease has been finalized and
+// the Agent has confirmed the workload container. Implementations must make
+// Attach/Revoke idempotent and must not persist private key material.
+type OverlayManager interface {
+	Attach(context.Context, string, string, string, time.Time) error
+	Revoke(context.Context, string) error
+}
+
 type Worker struct {
 	store               PersistentStore
 	directory           ProviderDirectory
 	leases              LeaseRegistrar
 	dispatcher          AgentDispatcher
+	overlay             OverlayManager
 	interval, blockTime time.Duration
 	workerID            string
 	claimDuration       time.Duration
@@ -59,6 +68,11 @@ type Worker struct {
 func NewWorker(store PersistentStore, directory ProviderDirectory, leases LeaseRegistrar, dispatcher AgentDispatcher) *Worker {
 	return &Worker{store: store, directory: directory, leases: leases, dispatcher: dispatcher, interval: time.Second, blockTime: 3 * time.Second, workerID: uuid.NewString(), claimDuration: 2 * time.Minute}
 }
+
+// SetOverlay enables the optional WireGuard overlay. It is intentionally a
+// setter to keep existing worker tests and deployments that lack CAP_NET_ADMIN
+// fully functional; production deployments configure it explicitly.
+func (w *Worker) SetOverlay(overlay OverlayManager) { w.overlay = overlay }
 func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -149,6 +163,15 @@ func (w *Worker) processOne(ctx context.Context) error {
 		if err != nil {
 			return w.retry(ctx, item, "AGENT_DEPLOY_FAILED", err)
 		}
+		if w.overlay != nil {
+			definitionExpiry := time.Now().UTC().Add(time.Duration(definition.DurationSeconds) * time.Second)
+			if err := w.overlay.Attach(ctx, item.WorkloadID, item.LeaseID, containerID, definitionExpiry); err != nil {
+				// Do not expose a running workload with a partially attached
+				// network. Stop is best effort; the worker retries this state.
+				_ = w.dispatcher.StopAndConfirm(ctx, provider.RegisteredProvider, item.WorkloadID)
+				return w.retry(ctx, item, "OVERLAY_ATTACH_FAILED", err)
+			}
+		}
 		return w.store.MarkRunning(ctx, item, containerID)
 	case "STOPPING":
 		leaseID, err := strconv.ParseUint(item.LeaseID, 10, 64)
@@ -163,6 +186,11 @@ func (w *Worker) processOne(ctx context.Context) error {
 		defer cancel()
 		if err := w.dispatcher.StopAndConfirm(stopCtx, provider.RegisteredProvider, item.WorkloadID); err != nil {
 			return w.retry(ctx, item, "AGENT_STOP_FAILED", err)
+		}
+		if w.overlay != nil {
+			if err := w.overlay.Revoke(ctx, item.WorkloadID); err != nil {
+				return w.retry(ctx, item, "OVERLAY_REVOKE_FAILED", err)
+			}
 		}
 		chainCtx, chainCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer chainCancel()

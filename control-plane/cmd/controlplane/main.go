@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/openinfra/network/internal/dashboard"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/providerjoin"
+	"github.com/openinfra/network/internal/wireguard"
 	"github.com/openinfra/network/internal/workloadapi"
 	"github.com/openinfra/network/migrations"
 	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
@@ -126,6 +128,16 @@ func run() error {
 		return fmt.Errorf("configure Provider Agent client: %w", err)
 	}
 	worker := orchestrator.NewWorker(workloadRepository, directory, registrar, agentClient)
+	if interfaceName := os.Getenv("WIREGUARD_INTERFACE"); interfaceName != "" {
+		firstPort := envIntOrDefault("WIREGUARD_FIRST_PORT", 51820)
+		lastPort := envIntOrDefault("WIREGUARD_LAST_PORT", 51999)
+		overlay, overlayErr := wireguard.NewManager(wireguard.NewCommandBackend(interfaceName), firstPort, lastPort)
+		if overlayErr != nil {
+			return fmt.Errorf("configure WireGuard overlay: %w", overlayErr)
+		}
+		worker.SetOverlay(overlay)
+		slog.Info("WireGuard workload overlay enabled", "interface", interfaceName, "first_port", firstPort, "last_port", lastPort)
+	}
 	go worker.Run(ctx)
 	controlplanev1.RegisterControlPlaneServiceServer(server, service)
 	healthServer := health.NewServer()
@@ -231,4 +243,17 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envIntOrDefault(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		slog.Warn("invalid integer environment value; using default", "name", name, "error", err)
+		return fallback
+	}
+	return parsed
 }
