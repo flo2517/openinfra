@@ -24,6 +24,7 @@ const (
 	ControlPlaneService_ReportHeartbeat_FullMethodName = "/openinfra.controlplane.v1.ControlPlaneService/ReportHeartbeat"
 	ControlPlaneService_SubmitWorkload_FullMethodName  = "/openinfra.controlplane.v1.ControlPlaneService/SubmitWorkload"
 	ControlPlaneService_GetWorkload_FullMethodName     = "/openinfra.controlplane.v1.ControlPlaneService/GetWorkload"
+	ControlPlaneService_StopWorkload_FullMethodName    = "/openinfra.controlplane.v1.ControlPlaneService/StopWorkload"
 )
 
 // ControlPlaneServiceClient is the client API for ControlPlaneService service.
@@ -46,6 +47,7 @@ type ControlPlaneServiceClient interface {
 	// does not imply that scheduling, a lease, or deployment has succeeded.
 	SubmitWorkload(ctx context.Context, in *SubmitWorkloadRequest, opts ...grpc.CallOption) (*SubmitWorkloadResponse, error)
 	GetWorkload(ctx context.Context, in *GetWorkloadRequest, opts ...grpc.CallOption) (*GetWorkloadResponse, error)
+	StopWorkload(ctx context.Context, in *StopWorkloadRequest, opts ...grpc.CallOption) (*StopWorkloadResponse, error)
 }
 
 type controlPlaneServiceClient struct {
@@ -106,6 +108,16 @@ func (c *controlPlaneServiceClient) GetWorkload(ctx context.Context, in *GetWork
 	return out, nil
 }
 
+func (c *controlPlaneServiceClient) StopWorkload(ctx context.Context, in *StopWorkloadRequest, opts ...grpc.CallOption) (*StopWorkloadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StopWorkloadResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_StopWorkload_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlPlaneServiceServer is the server API for ControlPlaneService service.
 // All implementations must embed UnimplementedControlPlaneServiceServer
 // for forward compatibility.
@@ -126,6 +138,7 @@ type ControlPlaneServiceServer interface {
 	// does not imply that scheduling, a lease, or deployment has succeeded.
 	SubmitWorkload(context.Context, *SubmitWorkloadRequest) (*SubmitWorkloadResponse, error)
 	GetWorkload(context.Context, *GetWorkloadRequest) (*GetWorkloadResponse, error)
+	StopWorkload(context.Context, *StopWorkloadRequest) (*StopWorkloadResponse, error)
 	mustEmbedUnimplementedControlPlaneServiceServer()
 }
 
@@ -150,6 +163,9 @@ func (UnimplementedControlPlaneServiceServer) SubmitWorkload(context.Context, *S
 }
 func (UnimplementedControlPlaneServiceServer) GetWorkload(context.Context, *GetWorkloadRequest) (*GetWorkloadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetWorkload not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) StopWorkload(context.Context, *StopWorkloadRequest) (*StopWorkloadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StopWorkload not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) mustEmbedUnimplementedControlPlaneServiceServer() {}
 func (UnimplementedControlPlaneServiceServer) testEmbeddedByValue()                             {}
@@ -262,6 +278,24 @@ func _ControlPlaneService_GetWorkload_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlaneService_StopWorkload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopWorkloadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).StopWorkload(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_StopWorkload_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).StopWorkload(ctx, req.(*StopWorkloadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlPlaneService_ServiceDesc is the grpc.ServiceDesc for ControlPlaneService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -288,6 +322,10 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetWorkload",
 			Handler:    _ControlPlaneService_GetWorkload_Handler,
+		},
+		{
+			MethodName: "StopWorkload",
+			Handler:    _ControlPlaneService_StopWorkload_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

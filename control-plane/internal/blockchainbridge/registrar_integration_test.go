@@ -45,4 +45,18 @@ func TestRegistrarAgainstLocalNode(t *testing.T) {
 	if lease.State != leaseStateActive || lease.LeaseID != leaseID {
 		t.Fatalf("unexpected lease: %+v", lease)
 	}
+	completed, err := registrar.EnsureLeaseCompleted(ctx, leaseID)
+	if err != nil {
+		t.Fatalf("complete lease: %v", err)
+	}
+	if completed.State != leaseStateCompleted || completed.LeaseID != leaseID {
+		t.Fatalf("unexpected completed lease: %+v", completed)
+	}
+	idempotent, err := registrar.EnsureLeaseCompleted(ctx, leaseID)
+	if err != nil {
+		t.Fatalf("repeat completed lease: %v", err)
+	}
+	if idempotent.State != leaseStateCompleted || idempotent.LeaseID != leaseID {
+		t.Fatalf("unexpected repeated completion result: %+v", idempotent)
+	}
 }

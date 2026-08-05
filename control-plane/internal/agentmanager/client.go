@@ -102,3 +102,32 @@ func (c *Client) DeployAndConfirm(ctx context.Context, provider RegisteredProvid
 	}
 	return response.ContainerId, nil
 }
+
+// StopAndConfirm is idempotent at the Agent boundary and returns only after
+// inspection reports the exact persisted workload container as completed.
+func (c *Client) StopAndConfirm(ctx context.Context, provider RegisteredProvider, workloadID string) error {
+	connection, client, err := c.ConnectVerified(ctx, provider)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	stopCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	response, err := client.Stop(stopCtx, &agentv1.StopRequest{WorkloadId: workloadID})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("stop workload on Agent: %w", err)
+	}
+	if !response.Success {
+		return fmt.Errorf("Agent rejected stop: %s", response.Error)
+	}
+	statusCtx, statusCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer statusCancel()
+	workloadStatus, err := client.GetWorkloadStatus(statusCtx, &agentv1.GetWorkloadStatusRequest{WorkloadId: workloadID})
+	if err != nil {
+		return fmt.Errorf("confirm stopped workload status: %w", err)
+	}
+	if workloadStatus.State != agentv1.GetWorkloadStatusResponse_STATE_COMPLETED {
+		return fmt.Errorf("Agent workload state is %s, not COMPLETED", workloadStatus.State.String())
+	}
+	return nil
+}

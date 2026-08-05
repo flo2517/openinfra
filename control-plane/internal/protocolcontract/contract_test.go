@@ -16,7 +16,7 @@ func TestJoinAndHeartbeatBelongToControlPlane(t *testing.T) {
 	if controlPlane == nil {
 		t.Fatal("ControlPlaneService descriptor is missing")
 	}
-	for _, method := range []protoreflect.Name{"BeginJoin", "CompleteJoin", "ReportHeartbeat", "SubmitWorkload", "GetWorkload"} {
+	for _, method := range []protoreflect.Name{"BeginJoin", "CompleteJoin", "ReportHeartbeat", "SubmitWorkload", "GetWorkload", "StopWorkload"} {
 		if controlPlane.Methods().ByName(method) == nil {
 			t.Fatalf("ControlPlaneService.%s is missing", method)
 		}
