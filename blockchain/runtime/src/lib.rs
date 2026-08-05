@@ -19,7 +19,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     spec_name: alloc::borrow::Cow::Borrowed("openinfra-runtime"),
     impl_name: alloc::borrow::Cow::Borrowed("openinfra-runtime"),
     authoring_version: 1,
-    spec_version: 2,
+    spec_version: 3,
     impl_version: 1,
     apis: RUNTIME_API_VERSIONS,
     transaction_version: 1,
@@ -71,6 +71,10 @@ mod runtime {
     pub type Sudo = pallet_sudo::Pallet<Runtime>;
     #[runtime::pallet_index(3)]
     pub type Balances = pallet_balances::Pallet<Runtime>;
+    #[runtime::pallet_index(4)]
+    pub type Aura = pallet_aura::Pallet<Runtime>;
+    #[runtime::pallet_index(5)]
+    pub type Grandpa = pallet_grandpa::Pallet<Runtime>;
     #[runtime::pallet_index(10)]
     pub type ProviderRegistry = pallet_provider_registry::Pallet<Runtime>;
     #[runtime::pallet_index(11)]
@@ -106,7 +110,28 @@ impl frame_system::Config for Runtime {
 }
 
 #[derive_impl(pallet_timestamp::config_preludes::TestDefaultConfig)]
-impl pallet_timestamp::Config for Runtime {}
+impl pallet_timestamp::Config for Runtime {
+    type OnTimestampSet = Aura;
+    type MinimumPeriod = frame::traits::ConstU64<1_500>;
+}
+
+impl pallet_aura::Config for Runtime {
+    type AuthorityId = sp_consensus_aura::sr25519::AuthorityId;
+    type DisabledValidators = ();
+    type MaxAuthorities = frame::traits::ConstU32<16>;
+    type AllowMultipleBlocksPerSlot = frame::traits::ConstBool<false>;
+    type SlotDuration = pallet_aura::MinimumPeriodTimesTwo<Runtime>;
+}
+
+impl pallet_grandpa::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type WeightInfo = ();
+    type MaxAuthorities = frame::traits::ConstU32<16>;
+    type MaxNominators = frame::traits::ConstU32<0>;
+    type MaxSetIdSessionEntries = frame::traits::ConstU64<0>;
+    type KeyOwnerProof = sp_core::Void;
+    type EquivocationReportSystem = ();
+}
 
 #[derive_impl(pallet_sudo::config_preludes::TestDefaultConfig)]
 impl pallet_sudo::Config for Runtime {}
@@ -206,6 +231,33 @@ impl_runtime_apis! {
             RuntimeExecutive::validate_transaction(source, tx, block_hash)
         }
     }
+    impl sp_consensus_aura::AuraApi<Block, sp_consensus_aura::sr25519::AuthorityId> for Runtime {
+        fn slot_duration() -> sp_consensus_aura::SlotDuration {
+            sp_consensus_aura::SlotDuration::from_millis(Aura::slot_duration())
+        }
+        fn authorities() -> Vec<sp_consensus_aura::sr25519::AuthorityId> {
+            pallet_aura::Authorities::<Runtime>::get().into_inner()
+        }
+    }
+    impl sp_consensus_grandpa::GrandpaApi<Block> for Runtime {
+        fn grandpa_authorities() -> sp_consensus_grandpa::AuthorityList {
+            Grandpa::grandpa_authorities()
+        }
+        fn current_set_id() -> sp_consensus_grandpa::SetId {
+            Grandpa::current_set_id()
+        }
+        fn submit_report_equivocation_unsigned_extrinsic(
+            _equivocation_proof: sp_consensus_grandpa::EquivocationProof<
+                <Block as frame::traits::Block>::Hash,
+                frame::deps::sp_runtime::traits::NumberFor<Block>,
+            >,
+            _key_owner_proof: sp_consensus_grandpa::OpaqueKeyOwnershipProof,
+        ) -> Option<()> { None }
+        fn generate_key_ownership_proof(
+            _set_id: sp_consensus_grandpa::SetId,
+            _authority_id: sp_consensus_grandpa::AuthorityId,
+        ) -> Option<sp_consensus_grandpa::OpaqueKeyOwnershipProof> { None }
+    }
     impl apis::SessionKeys<Block> for Runtime {
         fn generate_session_keys(
             _owner: Vec<u8>,
@@ -237,6 +289,12 @@ pub mod genesis_config_presets {
 
     pub fn development_config_genesis() -> Value {
         frame_support::build_struct_json_patch!(RuntimeGenesisConfig {
+            aura: pallet_aura::GenesisConfig {
+                authorities: vec![sp_keyring::Sr25519Keyring::Alice.public().into()]
+            },
+            grandpa: pallet_grandpa::GenesisConfig {
+                authorities: vec![(sp_keyring::Ed25519Keyring::Alice.public().into(), 1)]
+            },
             sudo: SudoConfig {
                 key: Some(sp_keyring::Sr25519Keyring::Alice.to_account_id())
             },
@@ -279,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_call_indices_match_the_spec_version_two_encoder() {
+    fn bridge_call_indices_remain_stable_in_spec_version_three() {
         let provider = interface::AccountId::from([7_u8; 32]);
         let registration =
             RuntimeCall::ProviderRegistry(pallet_provider_registry::Call::register_provider_for {
