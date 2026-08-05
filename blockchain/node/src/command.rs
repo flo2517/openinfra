@@ -28,6 +28,7 @@ impl SubstrateCli for Cli {
     fn load_spec(&self, id: &str) -> Result<Box<dyn sc_service::ChainSpec>, String> {
         Ok(match id {
             "" | "dev" | "openinfra-dev" => Box::new(chain_spec::development_chain_spec()?),
+            "local" | "openinfra-local" => Box::new(chain_spec::local_testnet_chain_spec()?),
             path => Box::new(chain_spec::ChainSpec::from_json_file(path.into())?),
         })
     }
@@ -105,16 +106,15 @@ pub fn run() -> sc_cli::Result<()> {
             runner.sync_run(|config| cmd.run::<openinfra_runtime::interface::OpaqueBlock>(&config))
         }
         None => {
-            let consensus = cli.consensus.clone();
             let runner = cli.create_runner(&cli.run)?;
             runner.run_node_until_exit(|config| async move {
                 match config.network.network_backend {
                     sc_network::config::NetworkBackendType::Libp2p => {
-                        service::new_full::<sc_network::NetworkWorker<_, _>>(config, consensus)
+                        service::new_full::<sc_network::NetworkWorker<_, _>>(config)
                             .map_err(sc_cli::Error::Service)
                     }
                     sc_network::config::NetworkBackendType::Litep2p => {
-                        service::new_full::<sc_network::Litep2pNetworkBackend>(config, consensus)
+                        service::new_full::<sc_network::Litep2pNetworkBackend>(config)
                             .map_err(sc_cli::Error::Service)
                     }
                 }

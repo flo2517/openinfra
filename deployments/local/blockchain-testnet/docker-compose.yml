@@ -1,0 +1,101 @@
+name: openinfra-blockchain-testnet
+
+x-node: &node
+  image: openinfra-blockchain-testnet:local
+  build:
+    context: ../../../blockchain
+  restart: unless-stopped
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  environment:
+    OPENINFRA_DEV_SUDO_PUBLIC_KEY_FILE: /run/openinfra/bridge-public.hex
+  volumes:
+    - ../chain/bridge-public.hex:/run/openinfra/bridge-public.hex:ro
+  networks: [testnet]
+  healthcheck:
+    test: [CMD, curl, --fail, --silent, --header, "content-type: application/json", --data, '{"jsonrpc":"2.0","id":1,"method":"system_health","params":[]}', http://127.0.0.1:9944/]
+    interval: 5s
+    timeout: 3s
+    retries: 24
+    start_period: 15s
+
+services:
+  alice:
+    <<: *node
+    entrypoint: [/usr/local/bin/openinfra-authority-entrypoint]
+    environment:
+      OPENINFRA_DEV_SUDO_PUBLIC_KEY_FILE: /run/openinfra/bridge-public.hex
+      OPENINFRA_DEV_AUTHORITY_SEED: //Alice
+    command:
+      - --chain=openinfra-local
+      - --alice
+      - --name=openinfra-alice
+      - --base-path=/var/lib/openinfra
+      - --node-key=0000000000000000000000000000000000000000000000000000000000000001
+      - --rpc-external
+      - --rpc-methods=safe
+      - --rpc-cors=all
+      - --prometheus-external
+    ports:
+      - 127.0.0.1:9954:9944
+    volumes:
+      - ../chain/bridge-public.hex:/run/openinfra/bridge-public.hex:ro
+      - alice-data:/var/lib/openinfra
+
+  bob:
+    <<: *node
+    entrypoint: [/usr/local/bin/openinfra-authority-entrypoint]
+    environment:
+      OPENINFRA_DEV_SUDO_PUBLIC_KEY_FILE: /run/openinfra/bridge-public.hex
+      OPENINFRA_DEV_AUTHORITY_SEED: //Bob
+    depends_on:
+      alice:
+        condition: service_healthy
+    command:
+      - --chain=openinfra-local
+      - --bob
+      - --name=openinfra-bob
+      - --base-path=/var/lib/openinfra
+      - --node-key=0000000000000000000000000000000000000000000000000000000000000002
+      - --bootnodes=/dns4/alice/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp
+      - --rpc-external
+      - --rpc-methods=safe
+      - --rpc-cors=all
+      - --prometheus-external
+    ports:
+      - 127.0.0.1:9955:9944
+    volumes:
+      - ../chain/bridge-public.hex:/run/openinfra/bridge-public.hex:ro
+      - bob-data:/var/lib/openinfra
+
+  observer:
+    <<: *node
+    depends_on:
+      alice:
+        condition: service_healthy
+    command:
+      - --chain=openinfra-local
+      - --name=openinfra-observer
+      - --base-path=/var/lib/openinfra
+      - --bootnodes=/dns4/alice/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp
+      - --rpc-external
+      - --rpc-methods=safe
+      - --rpc-cors=all
+      - --prometheus-external
+    ports:
+      - 127.0.0.1:9956:9944
+    volumes:
+      - ../chain/bridge-public.hex:/run/openinfra/bridge-public.hex:ro
+      - observer-data:/var/lib/openinfra
+
+networks:
+  testnet:
+
+volumes:
+  alice-data:
+  bob-data:
+  observer-data:

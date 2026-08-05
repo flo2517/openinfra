@@ -20,6 +20,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home --home-dir /var/lib/openinfra openinfra
 COPY --from=builder /tmp/openinfra-node /usr/local/bin/openinfra-node
+COPY docker/authority-entrypoint.sh /usr/local/bin/openinfra-authority-entrypoint
+RUN chmod 0755 /usr/local/bin/openinfra-authority-entrypoint
 
 USER 10001:10001
 EXPOSE 9944 30333
