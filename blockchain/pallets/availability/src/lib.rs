@@ -276,6 +276,7 @@ pub mod pallet {
         /// freshness and monotonic sequencing for deterministic replay safety.
         #[pallet::call_index(3)]
         #[pallet::weight(T::WeightInfo::submit_proof())]
+        #[allow(clippy::too_many_arguments)]
         pub fn submit_proof(
             origin: OriginFor<T>,
             provider: T::AccountId,

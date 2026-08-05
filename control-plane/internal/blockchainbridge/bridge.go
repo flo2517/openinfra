@@ -2,6 +2,7 @@ package blockchainbridge
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"math"
 	"sync"
@@ -39,7 +40,7 @@ type AvailabilityProof struct {
 }
 
 func (p AvailabilityProof) Validate() error {
-	if p.Sequence == 0 || p.TotalSamples == 0 || p.TotalSamples > 10000 || p.SuccessfulSamples > p.TotalSamples {
+	if p.Sequence == 0 || p.ObservedBlock == 0 || p.TotalSamples == 0 || p.TotalSamples > 10000 || p.SuccessfulSamples > p.TotalSamples {
 		return fmt.Errorf("availability proof counters are invalid")
 	}
 	if len(p.Signature) == 0 || len(p.Signature) > 96 {
@@ -140,6 +141,23 @@ func (b *Bridge) SubmitProof(ctx context.Context, proof ExecutionProof) error {
 	b.mu.Unlock()
 
 	return nil
+}
+
+// SubmitVerifiedProof is the validator-facing entry point.  Signature
+// verification stays off-chain (the runtime receives only a bounded summary),
+// while the exact signed bytes are supplied by the protocol adapter so that
+// no alternate serialization can be accepted accidentally.
+func (b *Bridge) SubmitVerifiedProof(ctx context.Context, proof ExecutionProof, publicKey, signedPayload []byte) error {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("provider public key must be %d bytes", ed25519.PublicKeySize)
+	}
+	if proof.Availability == nil || len(proof.Availability.Signature) != ed25519.SignatureSize {
+		return fmt.Errorf("availability proof signature must be %d bytes", ed25519.SignatureSize)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(publicKey), signedPayload, proof.Availability.Signature) {
+		return fmt.Errorf("availability proof signature verification failed")
+	}
+	return b.SubmitProof(ctx, proof)
 }
 
 func finiteNonNegative(value float32) bool {

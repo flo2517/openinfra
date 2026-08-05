@@ -2,6 +2,8 @@ package blockchainbridge
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"testing"
 
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
@@ -53,5 +55,23 @@ func TestSubmitProofRejectsInvalidSummary(t *testing.T) {
 	proof.Metrics.AvailabilityRate = 2
 	if err := bridge.SubmitProof(context.Background(), proof); err == nil {
 		t.Fatal("expected bounded availability metric")
+	}
+}
+
+func TestSubmitVerifiedProofChecksProviderSignature(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("openinfra-availability-proof-v1")
+	proof := validProof()
+	proof.Availability.Signature = ed25519.Sign(privateKey, payload)
+	client := &proofClient{}
+	bridge := NewBridge(client)
+	if err := bridge.SubmitVerifiedProof(context.Background(), proof, publicKey, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.SubmitVerifiedProof(context.Background(), proof, publicKey, []byte("tampered")); err == nil {
+		t.Fatal("expected signature verification failure")
 	}
 }
