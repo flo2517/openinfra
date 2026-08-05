@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  control-plane:
+    name: Control Plane / Go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: control-plane/go.mod
+          cache-dependency-path: |
+            control-plane/go.sum
+            protocol/generated/go/go.sum
+      - name: Check formatting
+        working-directory: control-plane
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        working-directory: control-plane
+        run: go vet ./...
+      - name: Test
+        working-directory: control-plane
+        run: go test ./...
+
+  provider-agent:
+    name: Provider Agent / Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: provider-agent -> target
+      - name: Check formatting
+        working-directory: provider-agent
+        run: cargo fmt --all -- --check
+      - name: Lint
+        working-directory: provider-agent
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        working-directory: provider-agent
+        run: cargo test --workspace --locked
+
+  protocol:
+    name: Protocol / Protobuf
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          # Buf v1.72.0 requires at least Go 1.25.10.
+          go-version: 1.25.12
+          cache-dependency-path: protocol/generated/go/go.sum
+      - name: Install Buf
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          mkdir -p "${GOBIN}"
+          go install github.com/bufbuild/buf/cmd/buf@v1.72.0
+          echo "${GOBIN}" >> "${GITHUB_PATH}"
+      - name: Lint contracts
+        working-directory: protocol
+        run: buf lint
+      - name: Regenerate bindings
+        working-directory: protocol
+        run: buf generate
+      - name: Format generated Go
+        working-directory: protocol/generated/go
+        run: gofmt -w .
+      - name: Verify generated bindings are committed
+        run: git diff --exit-code -- protocol/generated
+      - name: Vet generated Go
+        working-directory: protocol/generated/go
+        run: go vet ./...
+      - name: Test generated Go
+        working-directory: protocol/generated/go
+        run: go test ./...
+
+  blockchain:
+    name: Blockchain / Substrate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang cmake libclang-dev llvm-dev libssl-dev pkg-config protobuf-compiler
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          components: rustfmt, rust-src
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: blockchain -> target
+      - name: Check formatting
+        working-directory: blockchain
+        run: cargo fmt --all -- --check
+      - name: Test pallets and runtime
+        working-directory: blockchain
+        run: cargo test --workspace --exclude openinfra-node --locked
+      - name: Check node compilation
+        working-directory: blockchain
+        run: cargo check -p openinfra-node --locked
