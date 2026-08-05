@@ -94,6 +94,7 @@ parameter_types! {
     pub const MaxReputationDelta: u32 = 250;
     pub const MaxPendingChallenges: u32 = 16;
     pub const MaxChallengeLifetime: u32 = 1_000;
+    pub const MaxProofAge: u32 = 1_000;
     pub const MaxRewardResourceUnits: u64 = 1_000_000_000;
     pub const MaxRewardDuration: u64 = 10_000_000;
 }
@@ -174,9 +175,12 @@ impl pallet_openinfra_rewards::Config for Runtime {
 
 impl pallet_availability::Config for Runtime {
     type ChallengeOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    type ProofOrigin = frame_system::EnsureRoot<Self::AccountId>;
     type ProviderInspector = RegisteredProviderInspector;
     type MaxPendingChallenges = MaxPendingChallenges;
     type MaxChallengeLifetime = MaxChallengeLifetime;
+    type MaxProofAge = MaxProofAge;
+    type MaxProofSamples = frame::traits::ConstU32<10_000>;
     type WeightInfo = ();
 }
 

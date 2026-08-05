@@ -2,7 +2,9 @@ package blockchainbridge
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
+	"math"
 	"sync"
 
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
@@ -16,12 +18,35 @@ type BlockchainClient interface {
 }
 
 type ExecutionProof struct {
-	LeaseID    string
-	NodeID     string
-	WorkloadID string
-	Success    bool
-	Metrics    MetricSummary
-	Signature  string
+	LeaseID      string
+	NodeID       string
+	WorkloadID   string
+	Success      bool
+	Metrics      MetricSummary
+	Signature    string
+	Availability *AvailabilityProof
+}
+
+// AvailabilityProof is the off-chain, bounded summary relayed by a validator.
+// Raw metrics remain off-chain; only its hash and integer counters cross the
+// bridge to the deterministic runtime.
+type AvailabilityProof struct {
+	Sequence          uint64
+	ObservedBlock     uint64
+	SuccessfulSamples uint32
+	TotalSamples      uint32
+	PayloadHash       [32]byte
+	Signature         []byte
+}
+
+func (p AvailabilityProof) Validate() error {
+	if p.Sequence == 0 || p.ObservedBlock == 0 || p.TotalSamples == 0 || p.TotalSamples > 10000 || p.SuccessfulSamples > p.TotalSamples {
+		return fmt.Errorf("availability proof counters are invalid")
+	}
+	if len(p.Signature) == 0 || len(p.Signature) > 96 {
+		return fmt.Errorf("availability proof signature length is invalid")
+	}
+	return nil
 }
 
 type MetricSummary struct {
@@ -32,15 +57,17 @@ type MetricSummary struct {
 }
 
 type Bridge struct {
-	mu       sync.RWMutex
-	bcClient BlockchainClient
-	repCache map[string]*sharedv1.ReputationVector
+	mu              sync.RWMutex
+	bcClient        BlockchainClient
+	repCache        map[string]*sharedv1.ReputationVector
+	submittedProofs map[string]struct{}
 }
 
 func NewBridge(client BlockchainClient) *Bridge {
 	return &Bridge{
-		bcClient: client,
-		repCache: make(map[string]*sharedv1.ReputationVector),
+		bcClient:        client,
+		repCache:        make(map[string]*sharedv1.ReputationVector),
+		submittedProofs: make(map[string]struct{}),
 	}
 }
 
@@ -77,10 +104,36 @@ func (b *Bridge) CreateLease(ctx context.Context, lease *sharedv1.Lease) (string
 
 // SubmitProof sends the final execution metrics to the blockchain for reputation updating
 func (b *Bridge) SubmitProof(ctx context.Context, proof ExecutionProof) error {
+	if proof.LeaseID == "" || proof.NodeID == "" {
+		return fmt.Errorf("execution proof requires lease and node identifiers")
+	}
+	if !finiteNonNegative(proof.Metrics.ActualCPUTime) || proof.Metrics.ActualCPUTime > 1e9 ||
+		proof.Metrics.ActualRAMUsage < 0 || proof.Metrics.RuntimeSeconds < 0 ||
+		!finiteNonNegative(proof.Metrics.AvailabilityRate) || proof.Metrics.AvailabilityRate > 1 {
+		return fmt.Errorf("execution metrics are outside bounded ranges")
+	}
+	if proof.Availability != nil {
+		if err := proof.Availability.Validate(); err != nil {
+			return err
+		}
+	}
+	key := proof.LeaseID + "\x00" + proof.NodeID
+	if proof.Availability != nil {
+		key = fmt.Sprintf("%s\x00%d", key, proof.Availability.Sequence)
+	}
+	b.mu.Lock()
+	if _, exists := b.submittedProofs[key]; exists {
+		b.mu.Unlock()
+		return nil
+	}
+	b.mu.Unlock()
 	err := b.bcClient.SubmitExecutionProof(ctx, proof)
 	if err != nil {
 		return fmt.Errorf("execution proof submission failed: %w", err)
 	}
+	b.mu.Lock()
+	b.submittedProofs[key] = struct{}{}
+	b.mu.Unlock()
 
 	// Invalidate cache for this node as reputation will change
 	b.mu.Lock()
@@ -88,4 +141,25 @@ func (b *Bridge) SubmitProof(ctx context.Context, proof ExecutionProof) error {
 	b.mu.Unlock()
 
 	return nil
+}
+
+// SubmitVerifiedProof is the validator-facing entry point.  Signature
+// verification stays off-chain (the runtime receives only a bounded summary),
+// while the exact signed bytes are supplied by the protocol adapter so that
+// no alternate serialization can be accepted accidentally.
+func (b *Bridge) SubmitVerifiedProof(ctx context.Context, proof ExecutionProof, publicKey, signedPayload []byte) error {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("provider public key must be %d bytes", ed25519.PublicKeySize)
+	}
+	if proof.Availability == nil || len(proof.Availability.Signature) != ed25519.SignatureSize {
+		return fmt.Errorf("availability proof signature must be %d bytes", ed25519.SignatureSize)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(publicKey), signedPayload, proof.Availability.Signature) {
+		return fmt.Errorf("availability proof signature verification failed")
+	}
+	return b.SubmitProof(ctx, proof)
+}
+
+func finiteNonNegative(value float32) bool {
+	return !math.IsNaN(float64(value)) && !math.IsInf(float64(value), 0) && value >= 0
 }
