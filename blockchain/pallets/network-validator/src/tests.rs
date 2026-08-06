@@ -37,6 +37,23 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// Current per-(provider, dimension) score, so the double acts like a
+// real reputation store and dispute rollbacks can be asserted.
+thread_local! {
+    static CURRENT: std::cell::RefCell<std::collections::BTreeMap<(u64, u8), u16>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+fn dimension_key(dimension: ScoreDimension) -> u8 {
+    match dimension {
+        ScoreDimension::Compute => 0,
+        ScoreDimension::Storage => 1,
+        ScoreDimension::Network => 2,
+        ScoreDimension::Availability => 3,
+        ScoreDimension::Reliability => 4,
+    }
+}
+
 pub struct RecordingUpdater;
 impl crate::ReputationUpdater<u64> for RecordingUpdater {
     fn record_dimension_score(
@@ -49,8 +66,27 @@ impl crate::ReputationUpdater<u64> for RecordingUpdater {
                 .borrow_mut()
                 .push((*provider, dimension, score_bps))
         });
+        CURRENT.with(|current| {
+            current
+                .borrow_mut()
+                .insert((*provider, dimension_key(dimension)), score_bps)
+        });
         Ok(())
     }
+
+    fn dimension_score(provider: &u64, dimension: ScoreDimension) -> u16 {
+        CURRENT.with(|current| {
+            current
+                .borrow()
+                .get(&(*provider, dimension_key(dimension)))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+}
+
+fn current_score(provider: u64, dimension: ScoreDimension) -> u16 {
+    <RecordingUpdater as crate::ReputationUpdater<u64>>::dimension_score(&provider, dimension)
 }
 
 fn recorded() -> Vec<(u64, ScoreDimension, u16)> {
@@ -59,6 +95,7 @@ fn recorded() -> Vec<(u64, ScoreDimension, u16)> {
 
 fn clear_recorded() {
     RECORDED.with(|recorded| recorded.borrow_mut().clear());
+    CURRENT.with(|current| current.borrow_mut().clear());
 }
 
 parameter_types! {
@@ -66,6 +103,7 @@ parameter_types! {
     pub const MinQuorum: u32 = 3;
     pub const TargetCommitteeSize: u32 = 5;
     pub const MaxValidators: u32 = 16;
+    pub const DisputeWindow: u64 = 20;
 }
 
 impl crate::Config for Test {
@@ -78,6 +116,7 @@ impl crate::Config for Test {
     type MinQuorum = MinQuorum;
     type TargetCommitteeSize = TargetCommitteeSize;
     type MaxValidators = MaxValidators;
+    type DisputeWindow = DisputeWindow;
     type WeightInfo = ();
 }
 
@@ -584,6 +623,264 @@ fn the_active_set_is_bounded() {
         assert_noop!(
             NetworkValidator::register_validator(RuntimeOrigin::signed(99), 100),
             crate::Error::<Test>::TooManyValidators
+        );
+    });
+}
+
+// --- Disputes (ADR-011 §5) ---
+
+/// Closes a round at `score`, returning the committee, so dispute tests
+/// start from a real Final round.
+fn close_round_at(dimension: ScoreDimension, score: u16) -> Vec<u64> {
+    let assigned = committee();
+    for member in assigned.iter().take(3) {
+        assert_ok!(submit(*member, dimension, score));
+    }
+    assert_ok!(NetworkValidator::close_round(
+        RuntimeOrigin::signed(assigned[0]),
+        PROVIDER,
+        ROUND,
+        dimension
+    ));
+    assigned
+}
+
+#[test]
+fn a_dispute_rolls_reputation_back_to_the_pre_round_value() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        // Establish a prior value via an earlier round -- using that
+        // round's own committee -- so the rollback target is a real score
+        // rather than the zero default.
+        let prior = NetworkValidator::committee(&PROVIDER, ROUND - 1);
+        for member in prior.iter().take(3) {
+            assert_ok!(NetworkValidator::submit_evidence(
+                RuntimeOrigin::signed(*member),
+                PROVIDER,
+                ROUND - 1,
+                ScoreDimension::Compute,
+                3_000,
+                10,
+                [1; 32]
+            ));
+        }
+        assert_ok!(NetworkValidator::close_round(
+            RuntimeOrigin::signed(prior[0]),
+            PROVIDER,
+            ROUND - 1,
+            ScoreDimension::Compute
+        ));
+        let before_disputed_round = current_score(PROVIDER, ScoreDimension::Compute);
+        assert_eq!(before_disputed_round, 3_000);
+
+        close_round_at(ScoreDimension::Compute, 9_000);
+        assert_eq!(current_score(PROVIDER, ScoreDimension::Compute), 9_000);
+
+        // The provider contests its own score.
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute
+        ));
+        assert_eq!(
+            current_score(PROVIDER, ScoreDimension::Compute),
+            before_disputed_round,
+            "a contested score must stop influencing reputation immediately"
+        );
+        let result =
+            crate::Rounds::<Test>::get((PROVIDER, ROUND, ScoreDimension::Compute)).expect("round");
+        assert_eq!(result.status, crate::RoundStatus::Disputed);
+    });
+}
+
+#[test]
+fn only_the_provider_or_a_committee_member_may_dispute() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        let validators = register_validators(8);
+        let assigned = close_round_at(ScoreDimension::Network, 5_000);
+        let outsider = validators
+            .iter()
+            .find(|candidate| !assigned.contains(candidate))
+            .copied()
+            .expect("some validators are unassigned");
+
+        assert_noop!(
+            NetworkValidator::dispute_round(
+                RuntimeOrigin::signed(outsider),
+                PROVIDER,
+                ROUND,
+                ScoreDimension::Network
+            ),
+            crate::Error::<Test>::NotEntitledToDispute
+        );
+        // A validator that sat on the committee may dispute.
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(assigned[1]),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Network
+        ));
+    });
+}
+
+#[test]
+fn a_dispute_must_land_inside_the_window() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        close_round_at(ScoreDimension::Storage, 5_000);
+        System::set_block_number(1 + DisputeWindow::get() + 1);
+        assert_noop!(
+            NetworkValidator::dispute_round(
+                RuntimeOrigin::signed(PROVIDER),
+                PROVIDER,
+                ROUND,
+                ScoreDimension::Storage
+            ),
+            crate::Error::<Test>::DisputeWindowClosed
+        );
+    });
+}
+
+#[test]
+fn a_round_cannot_be_disputed_twice() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        close_round_at(ScoreDimension::Reliability, 5_000);
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Reliability
+        ));
+        assert_noop!(
+            NetworkValidator::dispute_round(
+                RuntimeOrigin::signed(PROVIDER),
+                PROVIDER,
+                ROUND,
+                ScoreDimension::Reliability
+            ),
+            crate::Error::<Test>::AlreadyDisputed
+        );
+    });
+}
+
+#[test]
+fn disputing_an_unknown_round_fails() {
+    new_test_ext().execute_with(|| {
+        register_validators(6);
+        assert_noop!(
+            NetworkValidator::dispute_round(
+                RuntimeOrigin::signed(PROVIDER),
+                PROVIDER,
+                999,
+                ScoreDimension::Compute
+            ),
+            crate::Error::<Test>::RoundNotFound
+        );
+    });
+}
+
+#[test]
+fn upholding_a_dispute_keeps_the_rollback() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        close_round_at(ScoreDimension::Compute, 9_000);
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute
+        ));
+        assert_ok!(NetworkValidator::resolve_dispute(
+            RuntimeOrigin::root(),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute,
+            true
+        ));
+        let result =
+            crate::Rounds::<Test>::get((PROVIDER, ROUND, ScoreDimension::Compute)).expect("round");
+        assert_eq!(result.status, crate::RoundStatus::DisputeUpheld);
+        assert_eq!(
+            current_score(PROVIDER, ScoreDimension::Compute),
+            result.previous_score_bps
+        );
+    });
+}
+
+#[test]
+fn rejecting_a_dispute_reapplies_the_aggregate() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        close_round_at(ScoreDimension::Compute, 9_000);
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute
+        ));
+        assert_ne!(current_score(PROVIDER, ScoreDimension::Compute), 9_000);
+        assert_ok!(NetworkValidator::resolve_dispute(
+            RuntimeOrigin::root(),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute,
+            false
+        ));
+        let result =
+            crate::Rounds::<Test>::get((PROVIDER, ROUND, ScoreDimension::Compute)).expect("round");
+        assert_eq!(result.status, crate::RoundStatus::DisputeRejected);
+        assert_eq!(current_score(PROVIDER, ScoreDimension::Compute), 9_000);
+    });
+}
+
+#[test]
+fn resolving_requires_governance_and_an_actual_dispute() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        let assigned = close_round_at(ScoreDimension::Compute, 9_000);
+        // Not disputed yet.
+        assert_noop!(
+            NetworkValidator::resolve_dispute(
+                RuntimeOrigin::root(),
+                PROVIDER,
+                ROUND,
+                ScoreDimension::Compute,
+                true
+            ),
+            crate::Error::<Test>::NotDisputed
+        );
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute
+        ));
+        // A validator cannot settle its own dispute.
+        assert_noop!(
+            NetworkValidator::resolve_dispute(
+                RuntimeOrigin::signed(assigned[0]),
+                PROVIDER,
+                ROUND,
+                ScoreDimension::Compute,
+                true
+            ),
+            DispatchError::BadOrigin
         );
     });
 }

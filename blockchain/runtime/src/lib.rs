@@ -111,6 +111,8 @@ parameter_types! {
     pub const ValidatorMinQuorum: u32 = 3;
     pub const ValidatorTargetCommitteeSize: u32 = 5;
     pub const MaxNetworkValidators: u32 = 256;
+    // ~30 minutes at 6s blocks to contest a closed round.
+    pub const ValidatorDisputeWindow: u32 = 300;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -257,16 +259,37 @@ impl pallet_network_validator::ReputationUpdater<interface::AccountId>
         dimension: pallet_network_validator::ScoreDimension,
         score_bps: u16,
     ) -> frame::deps::sp_runtime::DispatchResult {
+        pallet_reputation::Pallet::<Runtime>::set_dimension_score(
+            provider,
+            Self::map_dimension(dimension),
+            score_bps,
+        )
+    }
+
+    fn dimension_score(
+        provider: &interface::AccountId,
+        dimension: pallet_network_validator::ScoreDimension,
+    ) -> u16 {
+        pallet_reputation::Pallet::<Runtime>::dimension_score_bps(
+            provider,
+            Self::map_dimension(dimension),
+        )
+    }
+}
+
+impl ScoringReputationUpdater {
+    fn map_dimension(
+        dimension: pallet_network_validator::ScoreDimension,
+    ) -> pallet_reputation::pallet::VectorDimension {
         use pallet_network_validator::ScoreDimension;
         use pallet_reputation::pallet::VectorDimension;
-        let mapped = match dimension {
+        match dimension {
             ScoreDimension::Compute => VectorDimension::Compute,
             ScoreDimension::Storage => VectorDimension::Storage,
             ScoreDimension::Network => VectorDimension::Network,
             ScoreDimension::Availability => VectorDimension::Availability,
             ScoreDimension::Reliability => VectorDimension::Reliability,
-        };
-        pallet_reputation::Pallet::<Runtime>::set_dimension_score(provider, mapped, score_bps)
+        }
     }
 }
 
@@ -283,6 +306,7 @@ impl pallet_network_validator::Config for Runtime {
     type MinQuorum = ValidatorMinQuorum;
     type TargetCommitteeSize = ValidatorTargetCommitteeSize;
     type MaxValidators = MaxNetworkValidators;
+    type DisputeWindow = ValidatorDisputeWindow;
     type WeightInfo = ();
 }
 
