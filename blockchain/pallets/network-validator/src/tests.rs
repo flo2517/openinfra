@@ -65,6 +65,7 @@ parameter_types! {
     pub const MaxSubmissionsPerRound: u32 = 8;
     pub const MinQuorum: u32 = 3;
     pub const TargetCommitteeSize: u32 = 5;
+    pub const MaxValidators: u32 = 16;
 }
 
 impl crate::Config for Test {
@@ -76,6 +77,7 @@ impl crate::Config for Test {
     type MaxSubmissionsPerRound = MaxSubmissionsPerRound;
     type MinQuorum = MinQuorum;
     type TargetCommitteeSize = TargetCommitteeSize;
+    type MaxValidators = MaxValidators;
     type WeightInfo = ();
 }
 
@@ -232,10 +234,13 @@ fn unregistered_account_is_never_active() {
     });
 }
 
-// --- Scoring: evidence submission and round aggregation (ADR-011 §3/§5) ---
+// --- Scoring: committee assignment, evidence, aggregation (ADR-011 §1/§3/§5) ---
 
-/// Registers `count` validators starting at account 10, all funded and
-/// active, so scoring tests start from a realistic committee.
+const PROVIDER: u64 = 1;
+const ROUND: u64 = 7;
+
+/// Registers `count` validators (accounts 10..10+count), all funded and
+/// active, so scoring tests start from a realistic validator set.
 fn register_validators(count: u64) -> Vec<u64> {
     (10..10 + count)
         .inspect(|&account| {
@@ -246,22 +251,124 @@ fn register_validators(count: u64) -> Vec<u64> {
         .collect()
 }
 
+/// The validators actually assigned to score PROVIDER in ROUND. Tests
+/// submit from these rather than from arbitrary accounts, because slots
+/// are assigned rather than self-selected.
+fn committee() -> Vec<u64> {
+    NetworkValidator::committee(&PROVIDER, ROUND)
+}
+
+fn submit(validator: u64, dimension: ScoreDimension, score: u16) -> sp_runtime::DispatchResult {
+    NetworkValidator::submit_evidence(
+        RuntimeOrigin::signed(validator),
+        PROVIDER,
+        ROUND,
+        dimension,
+        score,
+        10,
+        [1; 32],
+    )
+}
+
+#[test]
+fn committee_is_deterministic_bounded_and_excludes_the_provider() {
+    new_test_ext().execute_with(|| {
+        // Register the provider itself as a validator too, to prove it is
+        // filtered out of its own committee.
+        Balances::force_set_balance(RuntimeOrigin::root(), PROVIDER, 1_000).expect("fund");
+        assert_ok!(NetworkValidator::register_validator(
+            RuntimeOrigin::signed(PROVIDER),
+            100
+        ));
+        register_validators(8);
+
+        let first = committee();
+        assert_eq!(
+            first.len(),
+            TargetCommitteeSize::get() as usize,
+            "committee must be exactly the target size when enough validators exist"
+        );
+        assert!(
+            !first.contains(&PROVIDER),
+            "a provider must never be assigned to score itself"
+        );
+        let mut distinct = first.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), first.len(), "members must be distinct");
+        // Pure function of committed state: same inputs, same committee.
+        assert_eq!(first, committee());
+        // A different round yields a different draw (not a fixed set).
+        assert_ne!(first, NetworkValidator::committee(&PROVIDER, ROUND + 1));
+    });
+}
+
+#[test]
+fn committee_shrinks_gracefully_when_few_validators_exist() {
+    new_test_ext().execute_with(|| {
+        let validators = register_validators(2); // fewer than TargetCommitteeSize
+        let assigned = committee();
+        assert_eq!(assigned.len(), 2);
+        for member in &assigned {
+            assert!(validators.contains(member));
+        }
+    });
+}
+
+#[test]
+fn suspended_and_exiting_validators_leave_the_committee_pool() {
+    new_test_ext().execute_with(|| {
+        let validators = register_validators(6);
+        assert_eq!(crate::ActiveValidatorSet::<Test>::get().len(), 6);
+
+        assert_ok!(NetworkValidator::suspend(
+            RuntimeOrigin::root(),
+            validators[0]
+        ));
+        assert_ok!(NetworkValidator::request_exit(RuntimeOrigin::signed(
+            validators[1]
+        )));
+        let pool = crate::ActiveValidatorSet::<Test>::get();
+        assert_eq!(pool.len(), 4);
+        assert!(!pool.contains(&validators[0]));
+        assert!(!pool.contains(&validators[1]));
+        assert!(!committee().contains(&validators[0]));
+        assert!(!committee().contains(&validators[1]));
+
+        // Reinstatement puts a validator back in the pool.
+        assert_ok!(NetworkValidator::reinstate(
+            RuntimeOrigin::root(),
+            validators[0]
+        ));
+        assert!(crate::ActiveValidatorSet::<Test>::get().contains(&validators[0]));
+    });
+}
+
 #[test]
 fn evidence_requires_an_active_validator() {
     new_test_ext().execute_with(|| {
-        clear_recorded();
+        register_validators(6);
         // Account 2 is funded but never registered as a validator.
         assert_noop!(
-            NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(2),
-                1,
-                7,
-                ScoreDimension::Compute,
-                5_000,
-                10,
-                [1; 32]
-            ),
+            submit(2, ScoreDimension::Compute, 5_000),
             crate::Error::<Test>::NotAnActiveValidator
+        );
+    });
+}
+
+#[test]
+fn an_unassigned_validator_cannot_submit() {
+    new_test_ext().execute_with(|| {
+        let validators = register_validators(8);
+        let assigned = committee();
+        let outsider = validators
+            .iter()
+            .find(|candidate| !assigned.contains(candidate))
+            .copied()
+            .expect("with 8 validators and a committee of 5 some are unassigned");
+        assert_noop!(
+            submit(outsider, ScoreDimension::Compute, 5_000),
+            crate::Error::<Test>::NotAssignedToRound
         );
     });
 }
@@ -269,21 +376,11 @@ fn evidence_requires_an_active_validator() {
 #[test]
 fn a_suspended_validator_cannot_submit_evidence() {
     new_test_ext().execute_with(|| {
-        let validators = register_validators(1);
-        assert_ok!(NetworkValidator::suspend(
-            RuntimeOrigin::root(),
-            validators[0]
-        ));
+        register_validators(6);
+        let member = committee()[0];
+        assert_ok!(NetworkValidator::suspend(RuntimeOrigin::root(), member));
         assert_noop!(
-            NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(validators[0]),
-                1,
-                7,
-                ScoreDimension::Compute,
-                5_000,
-                10,
-                [1; 32]
-            ),
+            submit(member, ScoreDimension::Compute, 5_000),
             crate::Error::<Test>::NotAnActiveValidator
         );
     });
@@ -292,12 +389,13 @@ fn a_suspended_validator_cannot_submit_evidence() {
 #[test]
 fn a_validator_cannot_score_itself() {
     new_test_ext().execute_with(|| {
-        let validators = register_validators(1);
+        register_validators(6);
+        let member = committee()[0];
         assert_noop!(
             NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(validators[0]),
-                validators[0], // provider == validator
-                7,
+                RuntimeOrigin::signed(member),
+                member, // provider == validator
+                ROUND,
                 ScoreDimension::Compute,
                 10_000,
                 10,
@@ -311,25 +409,17 @@ fn a_validator_cannot_score_itself() {
 #[test]
 fn evidence_rejects_duplicate_replayed_and_out_of_range_submissions() {
     new_test_ext().execute_with(|| {
-        let validators = register_validators(1);
-        let validator = validators[0];
+        register_validators(6);
+        let member = committee()[0];
         assert_noop!(
-            NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(validator),
-                1,
-                7,
-                ScoreDimension::Compute,
-                10_001, // > 100.00%
-                10,
-                [1; 32]
-            ),
+            submit(member, ScoreDimension::Compute, 10_001), // > 100.00%
             crate::Error::<Test>::ScoreOutOfBounds
         );
         assert_noop!(
             NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(validator),
-                1,
-                7,
+                RuntimeOrigin::signed(member),
+                PROVIDER,
+                ROUND,
                 ScoreDimension::Compute,
                 5_000,
                 0, // no samples backing the claim
@@ -337,61 +427,32 @@ fn evidence_rejects_duplicate_replayed_and_out_of_range_submissions() {
             ),
             crate::Error::<Test>::InvalidSampleCount
         );
-        assert_ok!(NetworkValidator::submit_evidence(
-            RuntimeOrigin::signed(validator),
-            1,
-            7,
-            ScoreDimension::Compute,
-            5_000,
-            10,
-            [1; 32]
-        ));
+        assert_ok!(submit(member, ScoreDimension::Compute, 5_000));
         // Same validator, same (provider, round, dimension) -> replay.
         assert_noop!(
-            NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(validator),
-                1,
-                7,
-                ScoreDimension::Compute,
-                9_000,
-                10,
-                [2; 32]
-            ),
+            submit(member, ScoreDimension::Compute, 9_000),
             crate::Error::<Test>::DuplicateSubmission
         );
         // A different dimension in the same round is a separate slot.
-        assert_ok!(NetworkValidator::submit_evidence(
-            RuntimeOrigin::signed(validator),
-            1,
-            7,
-            ScoreDimension::Storage,
-            9_000,
-            10,
-            [2; 32]
-        ));
+        assert_ok!(submit(member, ScoreDimension::Storage, 9_000));
     });
 }
 
 #[test]
 fn a_round_cannot_close_below_quorum() {
     new_test_ext().execute_with(|| {
-        let validators = register_validators(2); // MinQuorum is 3
-        for validator in &validators {
-            assert_ok!(NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(*validator),
-                1,
-                7,
-                ScoreDimension::Compute,
-                5_000,
-                10,
-                [1; 32]
-            ));
+        clear_recorded();
+        register_validators(6);
+        let assigned = committee();
+        // Only two of the five assigned validators report; MinQuorum is 3.
+        for member in assigned.iter().take(2) {
+            assert_ok!(submit(*member, ScoreDimension::Compute, 5_000));
         }
         assert_noop!(
             NetworkValidator::close_round(
-                RuntimeOrigin::signed(validators[0]),
-                1,
-                7,
+                RuntimeOrigin::signed(assigned[0]),
+                PROVIDER,
+                ROUND,
                 ScoreDimension::Compute
             ),
             crate::Error::<Test>::QuorumNotReached
@@ -406,39 +467,33 @@ fn closing_a_round_trims_outliers_and_records_the_aggregate() {
     new_test_ext().execute_with(|| {
         clear_recorded();
         System::set_block_number(11);
-        let validators = register_validators(5);
+        register_validators(6);
+        let assigned = committee();
         // One low outlier (0), one high outlier (10_000), three honest
-        // observations around 60%. A plain mean would be 5_200; the
-        // trimmed mean drops both extremes and yields exactly 6_000.
-        let scores = [0u16, 6_000, 6_000, 6_000, 10_000];
-        for (validator, score) in validators.iter().zip(scores) {
-            assert_ok!(NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(*validator),
-                1,
-                7,
-                ScoreDimension::Compute,
-                score,
-                10,
-                [1; 32]
-            ));
+        // observations at 6_000. A plain mean would be 5_200; the trimmed
+        // mean drops both extremes and yields exactly 6_000.
+        for (member, score) in assigned.iter().zip([0u16, 6_000, 6_000, 6_000, 10_000]) {
+            assert_ok!(submit(*member, ScoreDimension::Compute, score));
         }
         assert_ok!(NetworkValidator::close_round(
-            RuntimeOrigin::signed(validators[0]),
-            1,
-            7,
+            RuntimeOrigin::signed(assigned[0]),
+            PROVIDER,
+            ROUND,
             ScoreDimension::Compute
         ));
 
-        let result = crate::Rounds::<Test>::get((1, 7, ScoreDimension::Compute))
+        let result = crate::Rounds::<Test>::get((PROVIDER, ROUND, ScoreDimension::Compute))
             .expect("round result is stored");
         assert_eq!(result.score_bps, 6_000, "outliers must be trimmed");
         assert_eq!(result.submissions, 5);
-        assert_eq!(result.committee_target, 5);
+        assert_eq!(result.committee_target, TargetCommitteeSize::get());
         assert_eq!(result.closed_at, 11);
         // The aggregate reached the reputation layer exactly once.
-        assert_eq!(recorded(), vec![(1, ScoreDimension::Compute, 6_000)]);
+        assert_eq!(recorded(), vec![(PROVIDER, ScoreDimension::Compute, 6_000)]);
         // Raw submissions are cleared once aggregated.
-        assert!(crate::Evidence::<Test>::get((1, 7, ScoreDimension::Compute)).is_empty());
+        assert!(
+            crate::Evidence::<Test>::get((PROVIDER, ROUND, ScoreDimension::Compute)).is_empty()
+        );
     });
 }
 
@@ -446,44 +501,30 @@ fn closing_a_round_trims_outliers_and_records_the_aggregate() {
 fn a_closed_round_rejects_new_evidence_and_cannot_close_twice() {
     new_test_ext().execute_with(|| {
         clear_recorded();
-        let validators = register_validators(4);
-        for validator in validators.iter().take(3) {
-            assert_ok!(NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(*validator),
-                1,
-                7,
-                ScoreDimension::Availability,
-                7_000,
-                10,
-                [1; 32]
-            ));
+        register_validators(6);
+        let assigned = committee();
+        for member in assigned.iter().take(3) {
+            assert_ok!(submit(*member, ScoreDimension::Availability, 7_000));
         }
         assert_ok!(NetworkValidator::close_round(
-            RuntimeOrigin::signed(validators[0]),
-            1,
-            7,
+            RuntimeOrigin::signed(assigned[0]),
+            PROVIDER,
+            ROUND,
             ScoreDimension::Availability
         ));
         assert_noop!(
             NetworkValidator::close_round(
-                RuntimeOrigin::signed(validators[0]),
-                1,
-                7,
+                RuntimeOrigin::signed(assigned[0]),
+                PROVIDER,
+                ROUND,
                 ScoreDimension::Availability
             ),
             crate::Error::<Test>::RoundAlreadyClosed
         );
-        // A late submitter cannot reopen or influence a final round.
+        // A late but legitimately assigned validator cannot reopen or
+        // influence a final round.
         assert_noop!(
-            NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(validators[3]),
-                1,
-                7,
-                ScoreDimension::Availability,
-                0,
-                10,
-                [9; 32]
-            ),
+            submit(assigned[4], ScoreDimension::Availability, 0),
             crate::Error::<Test>::RoundAlreadyClosed
         );
         // Exactly one reputation update, despite the repeated attempts.
@@ -494,52 +535,19 @@ fn a_closed_round_rejects_new_evidence_and_cannot_close_twice() {
 #[test]
 fn closing_requires_an_active_validator() {
     new_test_ext().execute_with(|| {
-        let validators = register_validators(3);
-        for validator in &validators {
-            assert_ok!(NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(*validator),
-                1,
-                7,
-                ScoreDimension::Network,
-                5_000,
-                10,
-                [1; 32]
-            ));
+        register_validators(6);
+        let assigned = committee();
+        for member in assigned.iter().take(3) {
+            assert_ok!(submit(*member, ScoreDimension::Network, 5_000));
         }
         assert_noop!(
-            NetworkValidator::close_round(RuntimeOrigin::signed(2), 1, 7, ScoreDimension::Network),
-            crate::Error::<Test>::NotAnActiveValidator
-        );
-    });
-}
-
-#[test]
-fn submissions_are_bounded_per_round() {
-    new_test_ext().execute_with(|| {
-        // MaxSubmissionsPerRound is 8; register one more than that.
-        let validators = register_validators(9);
-        for validator in validators.iter().take(8) {
-            assert_ok!(NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(*validator),
-                1,
-                7,
-                ScoreDimension::Reliability,
-                5_000,
-                10,
-                [1; 32]
-            ));
-        }
-        assert_noop!(
-            NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(validators[8]),
-                1,
-                7,
-                ScoreDimension::Reliability,
-                5_000,
-                10,
-                [1; 32]
+            NetworkValidator::close_round(
+                RuntimeOrigin::signed(2),
+                PROVIDER,
+                ROUND,
+                ScoreDimension::Network
             ),
-            crate::Error::<Test>::TooManySubmissions
+            crate::Error::<Test>::NotAnActiveValidator
         );
     });
 }
@@ -548,28 +556,34 @@ fn submissions_are_bounded_per_round() {
 fn exactly_quorum_sized_committee_trims_to_the_median() {
     new_test_ext().execute_with(|| {
         clear_recorded();
+        register_validators(6);
+        let assigned = committee();
         // With exactly MinQuorum (3) submissions the trim drops the lowest
         // and highest, leaving the median alone -- a deliberately strong
         // property: at minimum quorum a single dishonest validator cannot
         // shift the result at all.
-        let validators = register_validators(3);
-        for (validator, score) in validators.iter().zip([0u16, 4_200, 10_000]) {
-            assert_ok!(NetworkValidator::submit_evidence(
-                RuntimeOrigin::signed(*validator),
-                1,
-                7,
-                ScoreDimension::Storage,
-                score,
-                10,
-                [1; 32]
-            ));
+        for (member, score) in assigned.iter().take(3).zip([0u16, 4_200, 10_000]) {
+            assert_ok!(submit(*member, ScoreDimension::Storage, score));
         }
         assert_ok!(NetworkValidator::close_round(
-            RuntimeOrigin::signed(validators[0]),
-            1,
-            7,
+            RuntimeOrigin::signed(assigned[0]),
+            PROVIDER,
+            ROUND,
             ScoreDimension::Storage
         ));
-        assert_eq!(recorded(), vec![(1, ScoreDimension::Storage, 4_200)]);
+        assert_eq!(recorded(), vec![(PROVIDER, ScoreDimension::Storage, 4_200)]);
+    });
+}
+
+#[test]
+fn the_active_set_is_bounded() {
+    new_test_ext().execute_with(|| {
+        // MaxValidators is 16.
+        register_validators(16);
+        Balances::force_set_balance(RuntimeOrigin::root(), 99, 1_000).expect("fund");
+        assert_noop!(
+            NetworkValidator::register_validator(RuntimeOrigin::signed(99), 100),
+            crate::Error::<Test>::TooManyValidators
+        );
     });
 }
