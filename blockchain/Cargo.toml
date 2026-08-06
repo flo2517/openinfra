@@ -3,6 +3,7 @@ members = [
     "node",
     "pallets/availability",
     "pallets/lease",
+    "pallets/network-validator",
     "pallets/provider-registry",
     "pallets/reputation",
     "pallets/resource-market",
