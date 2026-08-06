@@ -1,13 +1,25 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-//! Network Validator identity, stake, and lifecycle registry (ADR-011).
+//! Network Validator identity, stake, lifecycle, and worker scoring
+//! (ADR-011).
 //!
-//! This pallet only answers "is this account a bonded, active Network
-//! Validator". It deliberately does not decide *who gets assigned to
-//! challenge which provider* (self-assignment exclusion, committee
-//! selection) or how evidence is aggregated into reputation -- those are
-//! separate, still-to-be-implemented pieces per ADR-011 that consume
-//! [`NetworkValidatorInspector`].
+//! Two responsibilities, deliberately in one pallet because ADR-011 §5
+//! places round aggregation here:
+//!
+//! 1. **Registry**: who is a bonded, active Network Validator
+//!    ([`NetworkValidatorInspector`], consumed by `pallet-availability`
+//!    and `pallet-reputation` to gate their submission origins).
+//! 2. **Scoring**: validators submit per-dimension integer evidence for a
+//!    provider/round; once a quorum is reached the round is closed with a
+//!    trimmed-mean aggregate that is pushed into `pallet-reputation`
+//!    through [`ReputationUpdater`].
+//!
+//! Committee *assignment* (deterministically selecting which validators
+//! are expected to challenge which provider in a round) is still open --
+//! today any active validator may submit, bounded by
+//! `MaxSubmissionsPerRound` and the self-scoring exclusion below.
+
+extern crate alloc;
 
 use frame_support::{
     pallet_prelude::*,
@@ -16,6 +28,46 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::*;
 pub use pallet::*;
+
+/// A component of a provider's reputation vector that validators score
+/// independently. Mapped by the runtime onto `pallet-reputation`'s own
+/// dimension enum, so neither pallet depends on the other's types.
+#[derive(
+    Clone,
+    Copy,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    MaxEncodedLen,
+    PartialEq,
+    Debug,
+    TypeInfo,
+)]
+pub enum ScoreDimension {
+    Compute,
+    Storage,
+    Network,
+    Availability,
+    Reliability,
+}
+
+/// Applies an aggregated round result to a provider's reputation.
+/// `pallet-reputation` stays the only writer of the reputation vector and
+/// keeps enforcing its own bounds (ADR-011 §5).
+pub trait ReputationUpdater<AccountId> {
+    fn record_dimension_score(
+        provider: &AccountId,
+        dimension: ScoreDimension,
+        score_bps: u16,
+    ) -> DispatchResult;
+}
+
+impl<AccountId> ReputationUpdater<AccountId> for () {
+    fn record_dimension_score(_: &AccountId, _: ScoreDimension, _: u16) -> DispatchResult {
+        Ok(())
+    }
+}
 
 /// Narrow interface for pallets that only need to know whether an account is
 /// currently an active, bonded Network Validator (e.g. an origin check on
@@ -36,6 +88,8 @@ pub trait WeightInfo {
     fn withdraw_unbonded() -> Weight;
     fn suspend() -> Weight;
     fn reinstate() -> Weight;
+    fn submit_evidence() -> Weight;
+    fn close_round() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -54,6 +108,12 @@ impl WeightInfo for () {
     fn reinstate() -> Weight {
         Weight::from_parts(10_000, 0)
     }
+    fn submit_evidence() -> Weight {
+        Weight::from_parts(10_000, 0)
+    }
+    fn close_round() -> Weight {
+        Weight::from_parts(10_000, 0)
+    }
 }
 
 #[frame_support::pallet]
@@ -70,10 +130,27 @@ pub mod pallet {
         /// `EnsureRoot` for the MVP; a validator committee/governance origin
         /// is future work (ADR-011 §5).
         type SuspensionOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+        /// Receives closed-round aggregates; the runtime wires this to
+        /// `pallet-reputation`.
+        type ReputationUpdater: ReputationUpdater<Self::AccountId>;
         #[pallet::constant]
         type MinStake: Get<BalanceOf<Self>>;
         #[pallet::constant]
         type UnbondingPeriod: Get<BlockNumberFor<Self>>;
+        /// Hard bound on stored submissions per (provider, round,
+        /// dimension) -- keeps the aggregation loop and storage item
+        /// bounded, as consensus state must be.
+        #[pallet::constant]
+        type MaxSubmissionsPerRound: Get<u32>;
+        /// Minimum independent submissions before a round may close. Below
+        /// this, the round is explicitly degraded rather than silently
+        /// accepted (ADR-011 §5).
+        #[pallet::constant]
+        type MinQuorum: Get<u32>;
+        /// Denominator for the reported confidence ratio: the committee
+        /// size a fully-attested round is expected to reach.
+        #[pallet::constant]
+        type TargetCommitteeSize: Get<u32>;
         type WeightInfo: WeightInfo;
     }
 
@@ -110,6 +187,62 @@ pub mod pallet {
         OptionQuery,
     >;
 
+    /// One validator's attributable, signed-by-extrinsic observation.
+    /// `payload_hash` addresses the full evidence off-chain; only this
+    /// bounded integer summary is ever kept in consensus state.
+    #[derive(
+        Clone, Encode, Decode, DecodeWithMemTracking, Eq, MaxEncodedLen, PartialEq, Debug, TypeInfo,
+    )]
+    pub struct Submission<AccountId> {
+        pub validator: AccountId,
+        /// 0..=10_000, never a float.
+        pub score_bps: u16,
+        pub sample_count: u32,
+        pub payload_hash: [u8; 32],
+    }
+
+    /// The aggregate committed when a round closes.
+    #[derive(
+        Clone, Encode, Decode, DecodeWithMemTracking, Eq, MaxEncodedLen, PartialEq, Debug, TypeInfo,
+    )]
+    pub struct RoundResult<BlockNumber> {
+        /// Trimmed-mean score in basis points.
+        pub score_bps: u16,
+        /// How many independent validators contributed.
+        pub submissions: u32,
+        /// `TargetCommitteeSize` at closing time, so a reader can compute
+        /// confidence without assuming today's configuration.
+        pub committee_target: u32,
+        pub closed_at: BlockNumber,
+    }
+
+    /// Open submissions, keyed by (provider, round, dimension).
+    #[pallet::storage]
+    pub type Evidence<T: Config> = StorageNMap<
+        _,
+        (
+            NMapKey<Blake2_128Concat, T::AccountId>,
+            NMapKey<Twox64Concat, u64>,
+            NMapKey<Twox64Concat, ScoreDimension>,
+        ),
+        BoundedVec<Submission<T::AccountId>, T::MaxSubmissionsPerRound>,
+        ValueQuery,
+    >;
+
+    /// Closed rounds, keyed identically. A present entry means the round
+    /// is final: further submissions are rejected and it cannot re-close.
+    #[pallet::storage]
+    pub type Rounds<T: Config> = StorageNMap<
+        _,
+        (
+            NMapKey<Blake2_128Concat, T::AccountId>,
+            NMapKey<Twox64Concat, u64>,
+            NMapKey<Twox64Concat, ScoreDimension>,
+        ),
+        RoundResult<BlockNumberFor<T>>,
+        OptionQuery,
+    >;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -131,6 +264,21 @@ pub mod pallet {
         ValidatorReinstated {
             validator: T::AccountId,
         },
+        EvidenceSubmitted {
+            provider: T::AccountId,
+            validator: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+            score_bps: u16,
+        },
+        RoundClosed {
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+            score_bps: u16,
+            submissions: u32,
+            committee_target: u32,
+        },
     }
 
     #[pallet::error]
@@ -145,6 +293,24 @@ pub mod pallet {
         UnbondingPeriodOverflow,
         NotActive,
         NotSuspended,
+        /// The submitting account is not an active Network Validator.
+        NotAnActiveValidator,
+        /// A validator may never score itself (ADR-011 §4).
+        SelfScoringForbidden,
+        /// This validator already submitted for this provider/round/dimension.
+        DuplicateSubmission,
+        /// `MaxSubmissionsPerRound` reached for this round.
+        TooManySubmissions,
+        /// Scores are basis points and must be 0..=10_000.
+        ScoreOutOfBounds,
+        /// A submission must be backed by at least one sample.
+        InvalidSampleCount,
+        /// The round is already closed; it can neither accept new evidence
+        /// nor be closed twice.
+        RoundAlreadyClosed,
+        /// Fewer than `MinQuorum` independent submissions -- closing would
+        /// report a score the network cannot stand behind.
+        QuorumNotReached,
     }
 
     #[pallet::call]
@@ -270,9 +436,146 @@ pub mod pallet {
             Self::deposit_event(Event::ValidatorReinstated { validator });
             Ok(())
         }
+
+        /// Submit one validator's integer observation for a provider in a
+        /// round. Attributable (the extrinsic signer is recorded), bounded,
+        /// replay-resistant, and never self-scoring.
+        #[pallet::call_index(5)]
+        #[pallet::weight(T::WeightInfo::submit_evidence())]
+        pub fn submit_evidence(
+            origin: OriginFor<T>,
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+            score_bps: u16,
+            sample_count: u32,
+            payload_hash: [u8; 32],
+        ) -> DispatchResult {
+            let validator = ensure_signed(origin)?;
+            ensure!(
+                Self::is_active(&validator),
+                Error::<T>::NotAnActiveValidator
+            );
+            // A validator scoring its own provider account is the cheapest
+            // possible self-dealing; reject it outright.
+            ensure!(validator != provider, Error::<T>::SelfScoringForbidden);
+            ensure!(score_bps <= 10_000, Error::<T>::ScoreOutOfBounds);
+            ensure!(sample_count > 0, Error::<T>::InvalidSampleCount);
+            ensure!(
+                Rounds::<T>::get((&provider, round, dimension)).is_none(),
+                Error::<T>::RoundAlreadyClosed
+            );
+
+            Evidence::<T>::try_mutate(
+                (&provider, round, dimension),
+                |submissions| -> DispatchResult {
+                    ensure!(
+                        !submissions.iter().any(|entry| entry.validator == validator),
+                        Error::<T>::DuplicateSubmission
+                    );
+                    submissions
+                        .try_push(Submission {
+                            validator: validator.clone(),
+                            score_bps,
+                            sample_count,
+                            payload_hash,
+                        })
+                        .map_err(|_| Error::<T>::TooManySubmissions)?;
+                    Ok(())
+                },
+            )?;
+
+            Self::deposit_event(Event::EvidenceSubmitted {
+                provider,
+                validator,
+                round,
+                dimension,
+                score_bps,
+            });
+            Ok(())
+        }
+
+        /// Close a round once `MinQuorum` independent submissions exist,
+        /// aggregate them with a trimmed mean, and push the result into
+        /// reputation. Callable by any active validator: closing is a
+        /// deterministic function of already-committed state, so it needs
+        /// no privileged origin -- only a bounded, quorum-gated trigger.
+        #[pallet::call_index(6)]
+        #[pallet::weight(T::WeightInfo::close_round())]
+        pub fn close_round(
+            origin: OriginFor<T>,
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+        ) -> DispatchResult {
+            let caller = ensure_signed(origin)?;
+            ensure!(Self::is_active(&caller), Error::<T>::NotAnActiveValidator);
+            ensure!(
+                Rounds::<T>::get((&provider, round, dimension)).is_none(),
+                Error::<T>::RoundAlreadyClosed
+            );
+
+            let submissions = Evidence::<T>::get((&provider, round, dimension));
+            let count = submissions.len() as u32;
+            ensure!(count >= T::MinQuorum::get(), Error::<T>::QuorumNotReached);
+
+            let score_bps = Self::trimmed_mean(&submissions);
+            let committee_target = T::TargetCommitteeSize::get();
+            let closed_at = frame_system::Pallet::<T>::block_number();
+
+            Rounds::<T>::insert(
+                (&provider, round, dimension),
+                RoundResult {
+                    score_bps,
+                    submissions: count,
+                    committee_target,
+                    closed_at,
+                },
+            );
+            // Raw submissions are no longer needed once the aggregate is
+            // committed; the off-chain evidence remains addressable by
+            // each submission's payload_hash in the emitted events.
+            Evidence::<T>::remove((&provider, round, dimension));
+
+            T::ReputationUpdater::record_dimension_score(&provider, dimension, score_bps)?;
+
+            Self::deposit_event(Event::RoundClosed {
+                provider,
+                round,
+                dimension,
+                score_bps,
+                submissions: count,
+                committee_target,
+            });
+            Ok(())
+        }
     }
 
     impl<T: Config> Pallet<T> {
+        /// Integer trimmed mean: with three or more submissions, drop one
+        /// lowest and one highest value before averaging, so a single
+        /// outlier (a colluding or malfunctioning validator) cannot move
+        /// the result. Deterministic and float-free, over a set bounded by
+        /// `MaxSubmissionsPerRound`.
+        fn trimmed_mean(submissions: &[Submission<T::AccountId>]) -> u16 {
+            if submissions.is_empty() {
+                return 0;
+            }
+            let mut scores: alloc::vec::Vec<u32> =
+                submissions.iter().map(|s| u32::from(s.score_bps)).collect();
+            scores.sort_unstable();
+            let considered: &[u32] = if scores.len() >= 3 {
+                &scores[1..scores.len() - 1]
+            } else {
+                &scores[..]
+            };
+            let total: u32 = considered
+                .iter()
+                .fold(0u32, |acc, v| acc.saturating_add(*v));
+            let mean = total / considered.len() as u32;
+            mean.min(10_000) as u16
+        }
+
         /// True only for a registered validator whose status is `Active`
         /// (not `Suspended`, not `Exiting`).
         pub fn is_active(validator: &T::AccountId) -> bool {
