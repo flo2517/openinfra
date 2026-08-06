@@ -3,6 +3,7 @@ package dashboard
 import (
 	"context"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"io/fs"
 	"math"
@@ -54,6 +55,11 @@ type Overview struct {
 	Errors         []string   `json:"errors,omitempty"`
 	Providers      []Provider `json:"providers"`
 	Workloads      []Workload `json:"workloads"`
+	// ValidatorsActive is -1 when the read failed, so a client can tell
+	// "no validators registered" (0) apart from "unavailable" (-1) --
+	// ADR-011 requires never reporting false success on a degraded read.
+	ValidatorsActive int      `json:"validators_active"`
+	Validators       []string `json:"validators,omitempty"`
 }
 
 type Workload struct {
@@ -118,7 +124,12 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
-	result := Overview{GeneratedAt: s.now().UTC().Format(time.RFC3339), Providers: []Provider{}, Workloads: []Workload{}}
+	result := Overview{
+		GeneratedAt:      s.now().UTC().Format(time.RFC3339),
+		Providers:        []Provider{},
+		Workloads:        []Workload{},
+		ValidatorsActive: -1,
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.provider_id, p.status, p.agent_version, p.registered_at,
 		       COALESCE(c.state, 'UNKNOWN')
@@ -233,6 +244,17 @@ func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
 	result.ChainSyncing = health.IsSyncing
 	result.BestBlock, _ = best.BlockNumber()
 	result.FinalizedBlock, _ = final.BlockNumber()
+
+	validators, err := s.chain.ActiveNetworkValidators(chainCtx, finalHash)
+	if err != nil {
+		result.Partial = true
+		appendError(&result, "validator set unavailable")
+		return result, nil
+	}
+	result.ValidatorsActive = len(validators)
+	for _, account := range validators {
+		result.Validators = append(result.Validators, abbreviate(hex.EncodeToString(account[:])))
+	}
 	return result, nil
 }
 
