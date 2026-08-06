@@ -14,6 +14,10 @@ OpenInfra Network is a decentralized provider-cloud prototype. The MVP must join
 
 Do not change a language, framework, database, or component boundary without an accepted ADR. Components must not take over another component’s responsibilities. The Provider Agent never talks directly to the blockchain in the MVP.
 
+## Staged Architecture
+
+The architecture above is frozen for the current stage, not forever. [ADR-012](docs/adr/012-decentralization-roadmap-and-trust-boundaries.md) defines the decentralization roadmap, the trust and threat model for every role, the per-class data classification, and the staged migration from today's single Control Plane to a decentralized network. Its §6 names the specific follow-up ADR that each later stage requires. A prohibition below is lifted only by accepting the ADR named there — never by an implementation deciding the change is small.
+
 ## Integration and Contract Rules
 
 Generated Go and Rust types must derive from Protobuf; do not add manual copies. Before changing a `.proto`, identify every consumer, preserve wire compatibility, run breaking-change checks, regenerate both languages, and update tests and docs. PostgreSQL is authoritative off-chain; Redis contains only reconstructible state. Never report `RUNNING`, a successful deployment, or an on-chain transition before receiving authoritative confirmation.
@@ -32,4 +36,8 @@ Use `make fmt`, `make lint`, `make test`, or component targets documented by `ma
 
 ## Prohibited Changes
 
-Do not introduce Kubernetes, another database, direct Agent-to-chain access, runtime orchestration, detailed on-chain metrics, hard-coded secrets, or contract changes without consumer analysis. Every production feature requires tests and every architecture change requires an ADR.
+Every production feature requires tests and every architecture change requires an ADR.
+
+**Permanent — no ADR lifts these.** Never hard-code secrets. Never change a contract without consumer analysis. Never put detailed metrics on-chain. Never put tenant payloads, logs, secrets, or any personal data on-chain: consensus state cannot be erased, so only hashes and commitments may cross that line (ADR-012 §3).
+
+**Prohibited until the ADR gate named in ADR-012 §6 is accepted.** Do not introduce another database (ADR-013, ADR-018), direct Agent-to-chain access (ADR-017), runtime orchestration (ADR-016), decentralized storage (ADR-018), a TEE trust root (ADR-019), or a replacement for `EnsureRoot` governance (ADR-020). Kubernetes remains prohibited under ADR-006, which fixes Docker as the runtime; adopting it needs its own accepted ADR.
