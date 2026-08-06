@@ -55,15 +55,27 @@ func newCapacityTestPool(t *testing.T) (context.Context, *pgxpool.Pool) {
 	return ctx, pool
 }
 
+// insertOwner seeds a minimal users row so workloads.owner_id's foreign key
+// can reference it, and returns its user_id.
+func insertOwner(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
+	userID := uuid.NewString()
+	if _, err := pool.Exec(ctx, `INSERT INTO users (user_id, display_name) VALUES ($1, 'capacity-test-owner')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	return userID
+}
+
 func insertSchedulingWorkload(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cpuMilli, ramMB, storageGB int64) workloadapi.Workload {
 	t.Helper()
 	workloadID, requestID := uuid.NewString(), uuid.NewString()
+	ownerID := insertOwner(t, ctx, pool)
 	image := "example.invalid/image@sha256:" + fmt.Sprintf("%064d", 0)
 	_, err := pool.Exec(ctx, `
-		INSERT INTO workloads (workload_id, request_id, request_hash, definition, image, state,
+		INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, state,
 		                        reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb)
-		VALUES ($1,$2,$3,$4,$5,'SCHEDULING',$6,$7,$8)`,
-		workloadID, requestID, make([]byte, 32), []byte{1}, image, cpuMilli, ramMB, storageGB)
+		VALUES ($1,$2,$3,$4,$5,$6,'SCHEDULING',$7,$8,$9)`,
+		workloadID, requestID, ownerID, make([]byte, 32), []byte{1}, image, cpuMilli, ramMB, storageGB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +139,7 @@ func TestAssignLeaseSucceedsWithinCapacityAndCommitsTheReservation(t *testing.T)
 	if leaseID == 0 {
 		t.Fatal("expected a non-zero lease id")
 	}
-	stored, err := repository.Get(ctx, item.WorkloadID)
+	stored, err := repository.Get(ctx, item.WorkloadID, item.OwnerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +165,7 @@ func TestAssignLeaseRejectsWhenProviderCapacityIsAlreadyClaimed(t *testing.T) {
 	// The rejected attempt must not have mutated the row: it is still
 	// SCHEDULING and unassigned, so a later retry (possibly against a
 	// different provider) can still claim and process it.
-	stored, err := repository.Get(ctx, item.WorkloadID)
+	stored, err := repository.Get(ctx, item.WorkloadID, item.OwnerID)
 	if err != nil {
 		t.Fatal(err)
 	}

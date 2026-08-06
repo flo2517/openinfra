@@ -22,8 +22,10 @@ import (
 	"github.com/openinfra/network/internal/dashboard"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/providerjoin"
+	"github.com/openinfra/network/internal/ratelimit"
 	"github.com/openinfra/network/internal/resourcemarket"
 	"github.com/openinfra/network/internal/scheduler"
+	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/wireguard"
 	"github.com/openinfra/network/internal/workloadapi"
 	"github.com/openinfra/network/migrations"
@@ -120,6 +122,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// issue #12: authenticate SubmitWorkload/GetWorkload/StopWorkload with
+	// a bearer API key and enforce a per-tenant rate limit, layered on top
+	// of the mTLS transport above (BeginJoin/CompleteJoin/ReportHeartbeat
+	// keep their own Ed25519 challenge auth and are untouched by this).
+	userRepository := userauth.NewPostgresRepository(pool)
+	rateLimit := envIntOrDefault("USER_API_RATE_LIMIT_PER_MINUTE", 120)
+	limiter := ratelimit.NewRedisLimiter(redisClient, rateLimit, 60)
+	options = append(options,
+		grpc.MaxRecvMsgSize(1<<20), // 1 MiB: bounds a WorkloadDefinition/image payload far above any legitimate size
+		grpc.ChainUnaryInterceptor(userauth.NewUnaryInterceptor(userRepository, limiter)),
+	)
 	server := grpc.NewServer(options...)
 	workloadRepository := workloadapi.NewPostgresRepository(pool)
 	providerRepository := providerjoin.NewPostgresRepository(pool)

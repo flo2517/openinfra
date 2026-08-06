@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openinfra/network/internal/userauth"
 	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"google.golang.org/grpc/codes"
@@ -30,7 +31,13 @@ var (
 )
 
 type Workload struct {
-	WorkloadID, RequestID, Image, State         string
+	WorkloadID, RequestID, Image, State string
+	// OwnerID is the authenticated tenant this workload belongs to (see
+	// internal/userauth). Empty for workloads created before migration
+	// 000009 -- those are permanently unreachable through the
+	// authenticated user API by design, not a bug; see that migration's
+	// comment.
+	OwnerID                                     string
 	StopRequestID                               string
 	RequestHash                                 [32]byte
 	ResourceHash                                [32]byte
@@ -68,8 +75,13 @@ func CPUCoresToMillicores(cores float32) int64 {
 
 type Repository interface {
 	CreateOrGet(context.Context, Workload) (Workload, error)
-	Get(context.Context, string) (Workload, error)
-	RequestStop(context.Context, string, string, time.Time) (Workload, error)
+	// Get and RequestStop both take ownerID and enforce it as part of the
+	// lookup itself (not a fetch-then-compare in the Service layer), so a
+	// non-owner's request is indistinguishable in every way -- including
+	// SQL-level row locking in RequestStop's implementation -- from the
+	// workload simply not existing. See postgres.go.
+	Get(ctx context.Context, workloadID, ownerID string) (Workload, error)
+	RequestStop(ctx context.Context, workloadID, requestID, ownerID string, now time.Time) (Workload, error)
 }
 
 type Service struct {
@@ -82,6 +94,10 @@ func NewService(repository Repository) *Service {
 }
 
 func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.SubmitWorkloadRequest) (*controlplanev1.SubmitWorkloadResponse, error) {
+	ownerID, err := requireOwner(ctx)
+	if err != nil {
+		return nil, err
+	}
 	definitionBytes, requestHash, err := validateSubmission(request)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -91,6 +107,7 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 	stored, err := s.repository.CreateOrGet(ctx, Workload{
 		WorkloadID:            request.Definition.WorkloadId,
 		RequestID:             request.RequestId,
+		OwnerID:               ownerID,
 		RequestHash:           requestHash,
 		Definition:            definitionBytes,
 		Image:                 request.Image,
@@ -108,13 +125,17 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 }
 
 func (s *Service) GetWorkload(ctx context.Context, request *controlplanev1.GetWorkloadRequest) (*controlplanev1.GetWorkloadResponse, error) {
+	ownerID, err := requireOwner(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if request == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
 	if _, err := uuid.Parse(request.WorkloadId); err != nil {
 		return nil, status.Error(codes.InvalidArgument, "workload_id must be a UUID")
 	}
-	stored, err := s.repository.Get(ctx, request.WorkloadId)
+	stored, err := s.repository.Get(ctx, request.WorkloadId, ownerID)
 	if err != nil {
 		return nil, repositoryError(err)
 	}
@@ -122,6 +143,10 @@ func (s *Service) GetWorkload(ctx context.Context, request *controlplanev1.GetWo
 }
 
 func (s *Service) StopWorkload(ctx context.Context, request *controlplanev1.StopWorkloadRequest) (*controlplanev1.StopWorkloadResponse, error) {
+	ownerID, err := requireOwner(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if request == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
@@ -131,7 +156,7 @@ func (s *Service) StopWorkload(ctx context.Context, request *controlplanev1.Stop
 	if _, err := uuid.Parse(request.WorkloadId); err != nil {
 		return nil, status.Error(codes.InvalidArgument, "workload_id must be a UUID")
 	}
-	stored, err := s.repository.RequestStop(ctx, request.WorkloadId, request.RequestId, s.now().UTC())
+	stored, err := s.repository.RequestStop(ctx, request.WorkloadId, request.RequestId, ownerID, s.now().UTC())
 	if err != nil {
 		return nil, repositoryError(err)
 	}
@@ -140,6 +165,19 @@ func (s *Service) StopWorkload(ctx context.Context, request *controlplanev1.Stop
 		State:      stateToProto(stored.State),
 		UpdatedAt:  timestamppb.New(stored.UpdatedAt),
 	}, nil
+}
+
+// requireOwner reads the authenticated caller injected by
+// userauth.NewUnaryInterceptor. Checking again here, rather than trusting
+// the interceptor unconditionally, means a future wiring mistake (a new
+// entry point that forgets the interceptor, a test that calls the Service
+// directly) fails closed instead of silently operating without tenancy.
+func requireOwner(ctx context.Context) (string, error) {
+	ownerID, ok := userauth.UserIDFromContext(ctx)
+	if !ok {
+		return "", status.Error(codes.Unauthenticated, "an authenticated caller is required")
+	}
+	return ownerID, nil
 }
 
 func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, [32]byte, error) {
