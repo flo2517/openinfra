@@ -1,5 +1,6 @@
 use crate as pallet_reputation;
-use frame_support::{assert_noop, assert_ok, derive_impl, parameter_types};
+use crate::{EnsureActiveValidator, NetworkValidatorInspector};
+use frame_support::{assert_noop, assert_ok, derive_impl, parameter_types, traits::EnsureOrigin};
 use sp_runtime::{BuildStorage, DispatchError};
 
 type Block = frame_system::mocking::MockBlock<Test>;
@@ -10,6 +11,15 @@ impl frame_system::Config for Test {
     type Block = Block;
 }
 
+/// Account 7 only -- just enough to distinguish an active validator from
+/// every other signed account in EnsureActiveValidator tests below.
+pub struct OnlyAccountSeven;
+impl NetworkValidatorInspector<u64> for OnlyAccountSeven {
+    fn is_active(validator: &u64) -> bool {
+        *validator == 7
+    }
+}
+
 parameter_types! {
     pub const DefaultScore: u32 = 500;
     pub const MaxScore: u32 = 1_000;
@@ -18,6 +28,7 @@ parameter_types! {
 impl crate::Config for Test {
     type UpdateOrigin = frame_system::EnsureRoot<u64>;
     type ProviderInspector = ();
+    type ValidatorInspector = OnlyAccountSeven;
     type DefaultScore = DefaultScore;
     type MaxScore = MaxScore;
     type MaxDelta = MaxDelta;
@@ -101,4 +112,28 @@ fn vector_rejects_unauthorized_and_out_of_range_values() {
             crate::Error::<Test>::AvailabilityOutOfBounds
         );
     });
+}
+
+#[test]
+fn ensure_active_validator_accepts_only_a_signed_active_validator() {
+    let result = EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::signed(7));
+    assert_eq!(
+        result.expect("account 7 is configured as the active validator"),
+        7
+    );
+}
+
+#[test]
+fn ensure_active_validator_rejects_a_signed_inactive_account() {
+    assert!(EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::signed(1)).is_err());
+}
+
+#[test]
+fn ensure_active_validator_rejects_root_even_though_it_outranks_everything_else() {
+    assert!(EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::root()).is_err());
+}
+
+#[test]
+fn ensure_active_validator_rejects_none_origin() {
+    assert!(EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::none()).is_err());
 }

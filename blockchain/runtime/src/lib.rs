@@ -171,6 +171,23 @@ impl pallet_reputation::ProviderInspector<interface::AccountId> for RegisteredPr
     }
 }
 
+/// Bridges `pallet-network-validator`'s registry into the narrow
+/// `NetworkValidatorInspector` traits `availability`/`reputation` each
+/// declare, mirroring `RegisteredProviderInspector` above (ADR-011).
+pub struct ActiveValidatorLookup;
+impl pallet_availability::NetworkValidatorInspector<interface::AccountId>
+    for ActiveValidatorLookup
+{
+    fn is_active(validator: &interface::AccountId) -> bool {
+        NetworkValidator::is_active(validator)
+    }
+}
+impl pallet_reputation::NetworkValidatorInspector<interface::AccountId> for ActiveValidatorLookup {
+    fn is_active(validator: &interface::AccountId) -> bool {
+        NetworkValidator::is_active(validator)
+    }
+}
+
 pub struct ActiveProviderLookup;
 impl pallet_openinfra_lease::ProviderLookup<interface::AccountId> for ActiveProviderLookup {
     fn is_lease_eligible(provider: &interface::AccountId) -> bool {
@@ -186,8 +203,13 @@ impl pallet_openinfra_lease::Config for Runtime {
 }
 
 impl pallet_reputation::Config for Runtime {
-    type UpdateOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    // Was EnsureRoot (the Control Plane bridge acting alone); ADR-011
+    // moves routine scoring to signed, registry-checked Network Validator
+    // accounts. EnsureRoot is kept only on pallet-network-validator's own
+    // SuspensionOrigin, for emergency admin overrides.
+    type UpdateOrigin = pallet_reputation::EnsureActiveValidator<Runtime>;
     type ProviderInspector = RegisteredProviderInspector;
+    type ValidatorInspector = ActiveValidatorLookup;
     type DefaultScore = DefaultReputation;
     type MaxScore = MaxReputation;
     type MaxDelta = MaxReputationDelta;
@@ -203,9 +225,13 @@ impl pallet_openinfra_rewards::Config for Runtime {
 }
 
 impl pallet_availability::Config for Runtime {
+    // Unchanged: the Control Plane still issues on-chain challenges.
     type ChallengeOrigin = frame_system::EnsureRoot<Self::AccountId>;
-    type ProofOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    // Was EnsureRoot; ADR-011 moves proof submission to signed,
+    // registry-checked Network Validator accounts.
+    type ProofOrigin = pallet_availability::EnsureActiveValidator<Runtime>;
     type ProviderInspector = RegisteredProviderInspector;
+    type ValidatorInspector = ActiveValidatorLookup;
     type MaxPendingChallenges = MaxPendingChallenges;
     type MaxChallengeLifetime = MaxChallengeLifetime;
     type MaxProofAge = MaxProofAge;

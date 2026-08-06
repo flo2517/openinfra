@@ -17,6 +17,7 @@ sp-io = { version = "48.0.0" }
 
 [features]
 default = ["std"]
+runtime-benchmarks = []
 std = [
     "codec/std",
     "scale-info/std",
