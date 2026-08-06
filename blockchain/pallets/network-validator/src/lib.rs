@@ -9,20 +9,23 @@
 //! 1. **Registry**: who is a bonded, active Network Validator
 //!    ([`NetworkValidatorInspector`], consumed by `pallet-availability`
 //!    and `pallet-reputation` to gate their submission origins).
-//! 2. **Scoring**: validators submit per-dimension integer evidence for a
-//!    provider/round; once a quorum is reached the round is closed with a
-//!    trimmed-mean aggregate that is pushed into `pallet-reputation`
-//!    through [`ReputationUpdater`].
+//! 2. **Scoring**: a deterministic committee is assigned per
+//!    (provider, round); its members submit per-dimension integer
+//!    evidence; once a quorum is reached the round closes with a
+//!    trimmed-mean aggregate pushed into `pallet-reputation` through
+//!    [`ReputationUpdater`]. Closed rounds can be contested within a
+//!    bounded window, which rolls the dimension back pending governance
+//!    resolution.
 //!
-//! Committee *assignment* (deterministically selecting which validators
-//! are expected to challenge which provider in a round) is still open --
-//! today any active validator may submit, bounded by
-//! `MaxSubmissionsPerRound` and the self-scoring exclusion below.
+//! Still open per ADR-011: validator reward/penalty accrual, and
+//! unpredictable (VRF-backed) committee entropy -- see
+//! [`Pallet::committee`] for why assignment is currently predictable.
 
 extern crate alloc;
 
 use frame_support::{
     pallet_prelude::*,
+    sp_runtime::traits::Saturating,
     traits::{Currency, EnsureOrigin, Get, ReservableCurrency},
     weights::Weight,
     Hashable,
@@ -62,11 +65,18 @@ pub trait ReputationUpdater<AccountId> {
         dimension: ScoreDimension,
         score_bps: u16,
     ) -> DispatchResult;
+
+    /// The dimension's current value, in basis points. Captured before a
+    /// round is applied so an upheld dispute can restore it (ADR-011 §5).
+    fn dimension_score(provider: &AccountId, dimension: ScoreDimension) -> u16;
 }
 
 impl<AccountId> ReputationUpdater<AccountId> for () {
     fn record_dimension_score(_: &AccountId, _: ScoreDimension, _: u16) -> DispatchResult {
         Ok(())
+    }
+    fn dimension_score(_: &AccountId, _: ScoreDimension) -> u16 {
+        0
     }
 }
 
@@ -91,6 +101,8 @@ pub trait WeightInfo {
     fn reinstate() -> Weight;
     fn submit_evidence() -> Weight;
     fn close_round() -> Weight;
+    fn dispute_round() -> Weight;
+    fn resolve_dispute() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -113,6 +125,12 @@ impl WeightInfo for () {
         Weight::from_parts(10_000, 0)
     }
     fn close_round() -> Weight {
+        Weight::from_parts(10_000, 0)
+    }
+    fn dispute_round() -> Weight {
+        Weight::from_parts(10_000, 0)
+    }
+    fn resolve_dispute() -> Weight {
         Weight::from_parts(10_000, 0)
     }
 }
@@ -157,6 +175,9 @@ pub mod pallet {
         /// selection iterates it, so it must stay bounded.
         #[pallet::constant]
         type MaxValidators: Get<u32>;
+        /// How long after a round closes it may still be disputed.
+        #[pallet::constant]
+        type DisputeWindow: Get<BlockNumberFor<Self>>;
         type WeightInfo: WeightInfo;
     }
 
@@ -215,6 +236,31 @@ pub mod pallet {
         pub payload_hash: [u8; 32],
     }
 
+    /// Lifecycle of a closed round (ADR-011 §5).
+    #[derive(
+        Clone,
+        Copy,
+        Encode,
+        Decode,
+        DecodeWithMemTracking,
+        Eq,
+        MaxEncodedLen,
+        PartialEq,
+        Debug,
+        TypeInfo,
+    )]
+    pub enum RoundStatus {
+        /// Closed and applied to reputation.
+        Final,
+        /// Contested within the dispute window; the dimension has been
+        /// rolled back to `previous_score_bps` pending resolution.
+        Disputed,
+        /// Governance agreed with the disputer; the rollback stands.
+        DisputeUpheld,
+        /// Governance rejected the dispute; the aggregate was re-applied.
+        DisputeRejected,
+    }
+
     /// The aggregate committed when a round closes.
     #[derive(
         Clone, Encode, Decode, DecodeWithMemTracking, Eq, MaxEncodedLen, PartialEq, Debug, TypeInfo,
@@ -222,12 +268,16 @@ pub mod pallet {
     pub struct RoundResult<BlockNumber> {
         /// Trimmed-mean score in basis points.
         pub score_bps: u16,
+        /// The dimension's value immediately before this round applied, so
+        /// an upheld dispute can restore it exactly.
+        pub previous_score_bps: u16,
         /// How many independent validators contributed.
         pub submissions: u32,
         /// `TargetCommitteeSize` at closing time, so a reader can compute
         /// confidence without assuming today's configuration.
         pub committee_target: u32,
         pub closed_at: BlockNumber,
+        pub status: RoundStatus,
     }
 
     /// Open submissions, keyed by (provider, round, dimension).
@@ -293,6 +343,21 @@ pub mod pallet {
             submissions: u32,
             committee_target: u32,
         },
+        RoundDisputed {
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+            disputed_by: T::AccountId,
+            /// The value reputation was rolled back to.
+            restored_score_bps: u16,
+        },
+        DisputeResolved {
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+            upheld: bool,
+            effective_score_bps: u16,
+        },
     }
 
     #[pallet::error]
@@ -330,6 +395,17 @@ pub mod pallet {
         NotAssignedToRound,
         /// `MaxValidators` reached; the active set cannot grow.
         TooManyValidators,
+        /// No closed round exists for this (provider, round, dimension).
+        RoundNotFound,
+        /// The `DisputeWindow` after closing has elapsed.
+        DisputeWindowClosed,
+        /// Only the scored provider or a validator that was on the
+        /// round's committee may dispute it.
+        NotEntitledToDispute,
+        /// The round is already under dispute or already resolved.
+        AlreadyDisputed,
+        /// The round is not under dispute, so there is nothing to resolve.
+        NotDisputed,
     }
 
     #[pallet::call]
@@ -558,14 +634,19 @@ pub mod pallet {
             let score_bps = Self::trimmed_mean(&submissions);
             let committee_target = T::TargetCommitteeSize::get();
             let closed_at = frame_system::Pallet::<T>::block_number();
+            // Captured before applying, so an upheld dispute restores the
+            // exact prior value rather than guessing at it.
+            let previous_score_bps = T::ReputationUpdater::dimension_score(&provider, dimension);
 
             Rounds::<T>::insert(
                 (&provider, round, dimension),
                 RoundResult {
                     score_bps,
+                    previous_score_bps,
                     submissions: count,
                     committee_target,
                     closed_at,
+                    status: RoundStatus::Final,
                 },
             );
             // Raw submissions are no longer needed once the aggregate is
@@ -582,6 +663,100 @@ pub mod pallet {
                 score_bps,
                 submissions: count,
                 committee_target,
+            });
+            Ok(())
+        }
+
+        /// Contest a closed round within `DisputeWindow` blocks. Callable
+        /// by the scored provider or by any validator that sat on the
+        /// round's committee. The dimension is immediately rolled back to
+        /// the value it held before the round applied -- a contested score
+        /// must not keep influencing scheduling while it is unresolved --
+        /// pending `resolve_dispute`.
+        #[pallet::call_index(7)]
+        #[pallet::weight(T::WeightInfo::dispute_round())]
+        pub fn dispute_round(
+            origin: OriginFor<T>,
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let mut result =
+                Rounds::<T>::get((&provider, round, dimension)).ok_or(Error::<T>::RoundNotFound)?;
+            ensure!(
+                matches!(result.status, RoundStatus::Final),
+                Error::<T>::AlreadyDisputed
+            );
+            let now = frame_system::Pallet::<T>::block_number();
+            let deadline = result.closed_at.saturating_add(T::DisputeWindow::get());
+            ensure!(now <= deadline, Error::<T>::DisputeWindowClosed);
+            ensure!(
+                who == provider || Self::is_assigned(&provider, round, &who),
+                Error::<T>::NotEntitledToDispute
+            );
+
+            T::ReputationUpdater::record_dimension_score(
+                &provider,
+                dimension,
+                result.previous_score_bps,
+            )?;
+            let restored_score_bps = result.previous_score_bps;
+            result.status = RoundStatus::Disputed;
+            Rounds::<T>::insert((&provider, round, dimension), result);
+
+            Self::deposit_event(Event::RoundDisputed {
+                provider,
+                round,
+                dimension,
+                disputed_by: who,
+                restored_score_bps,
+            });
+            Ok(())
+        }
+
+        /// Settle a dispute. `SuspensionOrigin`-gated: full on-chain
+        /// adjudication is deferred (ADR-011 §5), so for the MVP a
+        /// governance origin decides. Upholding keeps the rollback;
+        /// rejecting re-applies the round's aggregate.
+        #[pallet::call_index(8)]
+        #[pallet::weight(T::WeightInfo::resolve_dispute())]
+        pub fn resolve_dispute(
+            origin: OriginFor<T>,
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+            uphold: bool,
+        ) -> DispatchResult {
+            T::SuspensionOrigin::ensure_origin(origin)?;
+            let mut result =
+                Rounds::<T>::get((&provider, round, dimension)).ok_or(Error::<T>::RoundNotFound)?;
+            ensure!(
+                matches!(result.status, RoundStatus::Disputed),
+                Error::<T>::NotDisputed
+            );
+
+            let effective_score_bps = if uphold {
+                result.status = RoundStatus::DisputeUpheld;
+                // Already rolled back by dispute_round; nothing to re-apply.
+                result.previous_score_bps
+            } else {
+                result.status = RoundStatus::DisputeRejected;
+                T::ReputationUpdater::record_dimension_score(
+                    &provider,
+                    dimension,
+                    result.score_bps,
+                )?;
+                result.score_bps
+            };
+            Rounds::<T>::insert((&provider, round, dimension), result);
+
+            Self::deposit_event(Event::DisputeResolved {
+                provider,
+                round,
+                dimension,
+                upheld: uphold,
+                effective_score_bps,
             });
             Ok(())
         }

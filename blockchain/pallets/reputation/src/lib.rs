@@ -339,6 +339,29 @@ pub mod pallet {
             Ok(())
         }
 
+        /// Read one dimension back as basis points, inverting
+        /// [`Self::set_dimension_score`]'s scaling.
+        ///
+        /// The round trip is exact whenever `MaxScore` divides 10_000
+        /// evenly (it is 1_000 in the runtime, giving a step of 10 bps);
+        /// otherwise it is deterministically truncating, never lossy in a
+        /// way that differs between nodes.
+        pub fn dimension_score_bps(provider: &T::AccountId, dimension: VectorDimension) -> u16 {
+            let max_score = T::MaxScore::get();
+            if max_score == 0 {
+                return 0;
+            }
+            let vector = ReputationVectors::<T>::get(provider).unwrap_or_else(Self::default_vector);
+            let score = match dimension {
+                VectorDimension::Compute => vector.compute,
+                VectorDimension::Storage => vector.storage,
+                VectorDimension::Network => vector.network,
+                VectorDimension::Availability => vector.availability,
+                VectorDimension::Reliability => vector.reliability,
+            };
+            (u64::from(score).saturating_mul(10_000) / u64::from(max_score)).min(10_000) as u16
+        }
+
         fn default_vector() -> ReputationVector {
             let score = T::DefaultScore::get();
             ReputationVector {
