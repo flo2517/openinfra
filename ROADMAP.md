@@ -27,7 +27,7 @@ The detailed entry conditions, exit criteria, and failure rules are documented i
 
 Add bounded Proof of Availability, heartbeat expiry, vector reputation updates, metrics summaries, failure handling, and integration tests across Agent, Control Plane, and chain.
 
-## v0.3 — Leases and Rewards End-to-End
+## v0.3 — Leases and Rewards E2E
 
 Complete authorized lease transitions, controlled reward arithmetic, event correlation, idempotent orchestration, recovery from partial failures, and multi-component observability.
 
