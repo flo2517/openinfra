@@ -68,6 +68,12 @@ pub mod pallet {
             provider: T::AccountId,
             points: RewardPoints,
         },
+        /// Points credited to a Network Validator whose submission
+        /// survived a round's outlier trimming (ADR-011 §5).
+        ValidatorRewardAccrued {
+            validator: T::AccountId,
+            points: RewardPoints,
+        },
     }
 
     #[pallet::error]
@@ -144,6 +150,9 @@ pub mod pallet {
             Ok(())
         }
 
+        /// Claim the caller's accrued Reward Points. Providers and Network
+        /// Validators share this path -- both accrue into
+        /// [`RewardBalances`] keyed by their own account.
         #[pallet::call_index(1)]
         #[pallet::weight(T::WeightInfo::claim_reward())]
         pub fn claim_reward(origin: OriginFor<T>) -> DispatchResult {
@@ -153,6 +162,34 @@ pub mod pallet {
             RewardBalances::<T>::remove(&who);
             Self::deposit_event(Event::RewardClaimed {
                 provider: who,
+                points,
+            });
+            Ok(())
+        }
+    }
+
+    impl<T: Config> Pallet<T> {
+        /// Credit Reward Points without an extrinsic.
+        ///
+        /// Used by the validator scoring pallet to reward submissions that
+        /// survived a round's outlier trimming, so this pallet stays the
+        /// only writer of [`RewardBalances`] and keeps its own overflow
+        /// checking regardless of the caller (ADR-011 §5).
+        ///
+        /// Crediting is one-way: an upheld dispute does **not** currently
+        /// claw back points already accrued for that round. Clawback is
+        /// tied to slashing economics, which ADR-011 leaves out of scope.
+        pub fn accrue_points(account: &T::AccountId, points: RewardPoints) -> DispatchResult {
+            if points == 0 {
+                return Ok(());
+            }
+            let balance = RewardBalances::<T>::get(account);
+            let new_balance = balance
+                .checked_add(points)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            RewardBalances::<T>::insert(account, new_balance);
+            Self::deposit_event(Event::ValidatorRewardAccrued {
+                validator: account.clone(),
                 points,
             });
             Ok(())
