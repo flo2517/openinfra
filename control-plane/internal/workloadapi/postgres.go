@@ -18,7 +18,7 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 }
 
 func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload) (Workload, error) {
-	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, request_hash, definition, image, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB)
+	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.OwnerID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB)
 	if err != nil {
 		return Workload{}, err
 	}
@@ -32,24 +32,33 @@ func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload
 	if err != nil {
 		return Workload{}, err
 	}
-	if stored.RequestHash != candidate.RequestHash || stored.WorkloadID != candidate.WorkloadID || !bytes.Equal(stored.Definition, candidate.Definition) || stored.Image != candidate.Image {
+	// The owner_id comparison matters as much as the others: request_id is
+	// globally unique, not per-tenant, so without it a second tenant who
+	// happens to reuse (or guess) another tenant's request_id would be
+	// handed back that tenant's workload_id/definition/image as if it were
+	// an idempotent replay of their own call.
+	if stored.RequestHash != candidate.RequestHash || stored.WorkloadID != candidate.WorkloadID || stored.OwnerID != candidate.OwnerID || !bytes.Equal(stored.Definition, candidate.Definition) || stored.Image != candidate.Image {
 		return Workload{}, ErrConflict
 	}
 	return stored, nil
 }
 
-func (r *PostgresRepository) Get(ctx context.Context, workloadID string) (Workload, error) {
-	return scanWorkload(r.pool.QueryRow(ctx, selectWorkload+` WHERE workload_id=$1`, workloadID))
+func (r *PostgresRepository) Get(ctx context.Context, workloadID, ownerID string) (Workload, error) {
+	return scanWorkload(r.pool.QueryRow(ctx, selectWorkload+` WHERE workload_id=$1 AND owner_id=$2`, workloadID, ownerID))
 }
 
-func (r *PostgresRepository) RequestStop(ctx context.Context, workloadID, requestID string, now time.Time) (Workload, error) {
+func (r *PostgresRepository) RequestStop(ctx context.Context, workloadID, requestID, ownerID string, now time.Time) (Workload, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return Workload{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	stored, err := scanWorkload(tx.QueryRow(ctx, selectWorkload+` WHERE workload_id=$1 FOR UPDATE`, workloadID))
+	// Filtering by owner_id here, not just workload_id, means a non-owner
+	// never takes the FOR UPDATE row lock on someone else's workload
+	// either -- a fetch-then-compare in Go would still briefly lock a row
+	// the caller has no right to touch.
+	stored, err := scanWorkload(tx.QueryRow(ctx, selectWorkload+` WHERE workload_id=$1 AND owner_id=$2 FOR UPDATE`, workloadID, ownerID))
 	if err != nil {
 		return Workload{}, err
 	}
@@ -190,6 +199,9 @@ func (r *PostgresRepository) AssignLease(ctx context.Context, item Workload, pro
 		WHERE provider_id = $1 AND state IN ('LEASE_PENDING', 'LEASED', 'DEPLOYING', 'RUNNING')`,
 		providerID,
 	).Scan(&reservedCPU, &reservedRAM, &reservedStorage)
+	if isSerializationFailure(err) {
+		return 0, ErrConflict
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -207,20 +219,30 @@ func (r *PostgresRepository) AssignLease(ctx context.Context, item Workload, pro
 		RETURNING lease_id`,
 		item.WorkloadID, providerID, resourceHash[:], item.Version, item.WorkerID,
 	).Scan(&leaseID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isSerializationFailure(err) {
 		return 0, ErrConflict
 	}
 	if err != nil {
 		return 0, err
 	}
 	if err = tx.Commit(ctx); err != nil {
-		var postgresError *pgconn.PgError
-		if errors.As(err, &postgresError) && postgresError.Code == "40001" { // serialization_failure
+		if isSerializationFailure(err) {
 			return 0, ErrConflict
 		}
 		return 0, err
 	}
 	return leaseID, nil
+}
+
+// isSerializationFailure reports whether err is Postgres SQLSTATE 40001, the
+// error a Serializable transaction can surface on *any* statement -- not
+// only at COMMIT -- once it detects a read/write conflict with a concurrent
+// transaction. AssignLease checks this at every statement so a losing racer
+// always surfaces as ErrConflict (retryable) rather than an opaque internal
+// error the caller doesn't know how to handle.
+func isSerializationFailure(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) && postgresError.Code == "40001"
 }
 
 func (r *PostgresRepository) MarkLeased(ctx context.Context, item Workload, leaseID uint64) error {
@@ -248,9 +270,9 @@ func (r *PostgresRepository) RetryLater(ctx context.Context, item Workload, code
 	return nil
 }
 
-const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb`
+const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,'')`
 const selectWorkload = `SELECT ` + workloadColumns + ` FROM workloads`
-const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb`
+const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,'')`
 
 type scanner interface{ Scan(...any) error }
 
@@ -258,7 +280,7 @@ func scanWorkload(row scanner) (Workload, error) {
 	var w Workload
 	var hash, resourceHash []byte
 	var workerLeaseUntil *time.Time
-	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB)
+	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Workload{}, ErrNotFound
 	}
