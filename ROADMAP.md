@@ -58,7 +58,7 @@ Progressively remove centralized frontend, database, scheduler, and operational 
 | #36 — decentralized identity, governance, validator operations | ADR-020 |
 | #50 — orchestration in smart contracts | ADR-016 |
 | #51 — streaming payments | #19 (v1.1), no new ADR |
-| #52 — slashing for availability guarantees | ADR-015 |
+| #52 — slashing for availability guarantees | ADR-015 (accepted); also depends on #36, and requires provider bonding first |
 
 ## v4.0 — P2P Mesh & Global Fabric
 
