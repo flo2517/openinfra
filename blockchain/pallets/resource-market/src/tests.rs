@@ -28,6 +28,7 @@ frame_support::parameter_types! { pub const MaxCapabilitiesLen: u32 = 4; }
 
 impl crate::Config for Test {
     type ProviderRegistry = ProviderRegistry;
+    type AnnounceOrigin = frame_system::EnsureRoot<u64>;
     type MaxCapabilitiesLen = MaxCapabilitiesLen;
     type WeightInfo = ();
 }
@@ -109,5 +110,113 @@ fn capabilities_are_bounded_and_owner_can_remove_offer() {
             Error::<Test>::OfferNotFound
         );
         assert_ok!(ResourceMarket::remove_offer(RuntimeOrigin::signed(1)));
+    });
+}
+
+#[test]
+fn announce_offer_for_requires_the_announce_origin() {
+    new_test_ext().execute_with(|| {
+        activate(1);
+        let capabilities = BoundedVec::try_from(vec![1]).unwrap();
+        assert_noop!(
+            ResourceMarket::announce_offer_for(
+                RuntimeOrigin::signed(2),
+                1,
+                2,
+                1024,
+                4096,
+                capabilities.clone()
+            ),
+            sp_runtime::DispatchError::BadOrigin
+        );
+        assert_ok!(ResourceMarket::announce_offer_for(
+            RuntimeOrigin::root(),
+            1,
+            2,
+            1024,
+            4096,
+            capabilities
+        ));
+        assert_eq!(ResourceMarket::offers(1).unwrap().cpu, 2);
+    });
+}
+
+#[test]
+fn announce_offer_for_still_requires_an_active_provider_and_valid_resources() {
+    new_test_ext().execute_with(|| {
+        let capabilities = BoundedVec::try_from(vec![1]).unwrap();
+        // Never registered, let alone active.
+        assert_noop!(
+            ResourceMarket::announce_offer_for(
+                RuntimeOrigin::root(),
+                1,
+                2,
+                1024,
+                4096,
+                capabilities.clone()
+            ),
+            Error::<Test>::ProviderNotActive
+        );
+        activate(1);
+        assert_noop!(
+            ResourceMarket::announce_offer_for(
+                RuntimeOrigin::root(),
+                1,
+                0,
+                1024,
+                4096,
+                capabilities
+            ),
+            Error::<Test>::InvalidResources
+        );
+    });
+}
+
+#[test]
+fn remove_offer_for_requires_the_announce_origin_and_an_existing_offer() {
+    new_test_ext().execute_with(|| {
+        activate(1);
+        assert_ok!(ResourceMarket::announce_offer_for(
+            RuntimeOrigin::root(),
+            1,
+            2,
+            1024,
+            4096,
+            BoundedVec::try_from(vec![1]).unwrap()
+        ));
+        assert_noop!(
+            ResourceMarket::remove_offer_for(RuntimeOrigin::signed(2), 1),
+            sp_runtime::DispatchError::BadOrigin
+        );
+        assert_noop!(
+            ResourceMarket::remove_offer_for(RuntimeOrigin::root(), 99),
+            Error::<Test>::OfferNotFound
+        );
+        assert_ok!(ResourceMarket::remove_offer_for(RuntimeOrigin::root(), 1));
+        assert!(ResourceMarket::offers(1).is_none());
+    });
+}
+
+#[test]
+fn self_service_and_delegated_calls_share_the_same_offer_slot() {
+    new_test_ext().execute_with(|| {
+        activate(1);
+        assert_ok!(ResourceMarket::announce_offer(
+            RuntimeOrigin::signed(1),
+            1,
+            1,
+            1,
+            BoundedVec::try_from(vec![1]).unwrap()
+        ));
+        // The delegated path replaces the same offer, not a separate one.
+        assert_ok!(ResourceMarket::announce_offer_for(
+            RuntimeOrigin::root(),
+            1,
+            9,
+            9,
+            9,
+            BoundedVec::try_from(vec![2]).unwrap()
+        ));
+        assert_eq!(ResourceMarket::offers(1).unwrap().cpu, 9);
     });
 }
