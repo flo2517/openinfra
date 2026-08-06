@@ -113,6 +113,7 @@ parameter_types! {
     pub const MaxNetworkValidators: u32 = 256;
     // ~30 minutes at 6s blocks to contest a closed round.
     pub const ValidatorDisputeWindow: u32 = 300;
+    pub const ValidatorPointsPerAcceptedSubmission: u64 = 10;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -293,9 +294,22 @@ impl ScoringReputationUpdater {
     }
 }
 
+/// Credits validator Reward Points through `pallet-rewards`, which stays
+/// the only writer of reward balances (ADR-011 §5).
+pub struct ValidatorRewardsBridge;
+impl pallet_network_validator::ValidatorRewards<interface::AccountId> for ValidatorRewardsBridge {
+    fn accrue(
+        validator: &interface::AccountId,
+        points: u64,
+    ) -> frame::deps::sp_runtime::DispatchResult {
+        pallet_openinfra_rewards::Pallet::<Runtime>::accrue_points(validator, points)
+    }
+}
+
 impl pallet_network_validator::Config for Runtime {
     type Currency = Balances;
     type ReputationUpdater = ScoringReputationUpdater;
+    type ValidatorRewards = ValidatorRewardsBridge;
     // Suspend/reinstate is root-gated for the MVP; a validator
     // committee/governance origin is ADR-011 §5 follow-up work, not decided
     // by this pallet yet.
@@ -307,6 +321,7 @@ impl pallet_network_validator::Config for Runtime {
     type TargetCommitteeSize = ValidatorTargetCommitteeSize;
     type MaxValidators = MaxNetworkValidators;
     type DisputeWindow = ValidatorDisputeWindow;
+    type PointsPerAcceptedSubmission = ValidatorPointsPerAcceptedSubmission;
     type WeightInfo = ();
 }
 

@@ -13,12 +13,13 @@
 //!    (provider, round); its members submit per-dimension integer
 //!    evidence; once a quorum is reached the round closes with a
 //!    trimmed-mean aggregate pushed into `pallet-reputation` through
-//!    [`ReputationUpdater`]. Closed rounds can be contested within a
-//!    bounded window, which rolls the dimension back pending governance
-//!    resolution.
+//!    [`ReputationUpdater`], and submitters that survived trimming accrue
+//!    Reward Points through [`ValidatorRewards`]. Closed rounds can be
+//!    contested within a bounded window, which rolls the dimension back
+//!    pending governance resolution.
 //!
-//! Still open per ADR-011: validator reward/penalty accrual, and
-//! unpredictable (VRF-backed) committee entropy -- see
+//! Still open per ADR-011: slashing (penalties beyond earning nothing for
+//! a round), and unpredictable (VRF-backed) committee entropy -- see
 //! [`Pallet::committee`] for why assignment is currently predictable.
 
 extern crate alloc;
@@ -77,6 +78,19 @@ impl<AccountId> ReputationUpdater<AccountId> for () {
     }
     fn dimension_score(_: &AccountId, _: ScoreDimension) -> u16 {
         0
+    }
+}
+
+/// Credits Reward Points to validators whose submission survived a
+/// round's outlier trimming. `pallet-rewards` stays the only writer of
+/// reward balances (ADR-011 §5).
+pub trait ValidatorRewards<AccountId> {
+    fn accrue(validator: &AccountId, points: u64) -> DispatchResult;
+}
+
+impl<AccountId> ValidatorRewards<AccountId> for () {
+    fn accrue(_: &AccountId, _: u64) -> DispatchResult {
+        Ok(())
     }
 }
 
@@ -152,6 +166,9 @@ pub mod pallet {
         /// Receives closed-round aggregates; the runtime wires this to
         /// `pallet-reputation`.
         type ReputationUpdater: ReputationUpdater<Self::AccountId>;
+        /// Credits Reward Points to non-outlier submitters; the runtime
+        /// wires this to `pallet-rewards`.
+        type ValidatorRewards: ValidatorRewards<Self::AccountId>;
         #[pallet::constant]
         type MinStake: Get<BalanceOf<Self>>;
         #[pallet::constant]
@@ -178,6 +195,9 @@ pub mod pallet {
         /// How long after a round closes it may still be disputed.
         #[pallet::constant]
         type DisputeWindow: Get<BlockNumberFor<Self>>;
+        /// Reward Points credited per submission that survived trimming.
+        #[pallet::constant]
+        type PointsPerAcceptedSubmission: Get<u64>;
         type WeightInfo: WeightInfo;
     }
 
@@ -342,6 +362,8 @@ pub mod pallet {
             score_bps: u16,
             submissions: u32,
             committee_target: u32,
+            /// How many submitters survived trimming and were rewarded.
+            rewarded: u32,
         },
         RoundDisputed {
             provider: T::AccountId,
@@ -631,7 +653,7 @@ pub mod pallet {
             let count = submissions.len() as u32;
             ensure!(count >= T::MinQuorum::get(), Error::<T>::QuorumNotReached);
 
-            let score_bps = Self::trimmed_mean(&submissions);
+            let (accepted, score_bps) = Self::trimmed(&submissions);
             let committee_target = T::TargetCommitteeSize::get();
             let closed_at = frame_system::Pallet::<T>::block_number();
             // Captured before applying, so an upheld dispute restores the
@@ -656,6 +678,14 @@ pub mod pallet {
 
             T::ReputationUpdater::record_dimension_score(&provider, dimension, score_bps)?;
 
+            // Reward only the submissions that survived trimming: an
+            // outlier -- whether colluding or merely malfunctioning --
+            // earns nothing for that round.
+            let points = T::PointsPerAcceptedSubmission::get();
+            for entry in &accepted {
+                T::ValidatorRewards::accrue(&entry.validator, points)?;
+            }
+
             Self::deposit_event(Event::RoundClosed {
                 provider,
                 round,
@@ -663,6 +693,7 @@ pub mod pallet {
                 score_bps,
                 submissions: count,
                 committee_target,
+                rewarded: accepted.len() as u32,
             });
             Ok(())
         }
@@ -831,23 +862,35 @@ pub mod pallet {
         /// outlier (a colluding or malfunctioning validator) cannot move
         /// the result. Deterministic and float-free, over a set bounded by
         /// `MaxSubmissionsPerRound`.
-        fn trimmed_mean(submissions: &[Submission<T::AccountId>]) -> u16 {
+        /// Returns the surviving submissions (sorted) alongside their mean,
+        /// so callers can both commit the aggregate and reward exactly the
+        /// validators whose observation counted.
+        ///
+        /// Sorting is by `(score_bps, validator)` rather than score alone:
+        /// with tied scores that makes the choice of which entry gets
+        /// trimmed total-ordered and therefore identical on every node.
+        fn trimmed(
+            submissions: &[Submission<T::AccountId>],
+        ) -> (alloc::vec::Vec<Submission<T::AccountId>>, u16) {
             if submissions.is_empty() {
-                return 0;
+                return (alloc::vec::Vec::new(), 0);
             }
-            let mut scores: alloc::vec::Vec<u32> =
-                submissions.iter().map(|s| u32::from(s.score_bps)).collect();
-            scores.sort_unstable();
-            let considered: &[u32] = if scores.len() >= 3 {
-                &scores[1..scores.len() - 1]
+            let mut sorted = submissions.to_vec();
+            sorted.sort_by(|left, right| {
+                left.score_bps
+                    .cmp(&right.score_bps)
+                    .then_with(|| left.validator.cmp(&right.validator))
+            });
+            let considered: alloc::vec::Vec<Submission<T::AccountId>> = if sorted.len() >= 3 {
+                sorted[1..sorted.len() - 1].to_vec()
             } else {
-                &scores[..]
+                sorted
             };
-            let total: u32 = considered
-                .iter()
-                .fold(0u32, |acc, v| acc.saturating_add(*v));
-            let mean = total / considered.len() as u32;
-            mean.min(10_000) as u16
+            let total: u32 = considered.iter().fold(0u32, |acc, entry| {
+                acc.saturating_add(u32::from(entry.score_bps))
+            });
+            let mean = (total / considered.len() as u32).min(10_000) as u16;
+            (considered, mean)
         }
 
         /// True only for a registered validator whose status is `Active`

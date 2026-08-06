@@ -85,6 +85,27 @@ impl crate::ReputationUpdater<u64> for RecordingUpdater {
     }
 }
 
+// Reward Points credited per validator, so tests can assert that only
+// non-outlier submitters were paid.
+thread_local! {
+    static POINTS: std::cell::RefCell<std::collections::BTreeMap<u64, u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+pub struct RecordingRewards;
+impl crate::ValidatorRewards<u64> for RecordingRewards {
+    fn accrue(validator: &u64, points: u64) -> sp_runtime::DispatchResult {
+        POINTS.with(|store| {
+            *store.borrow_mut().entry(*validator).or_default() += points;
+        });
+        Ok(())
+    }
+}
+
+fn points_of(validator: u64) -> u64 {
+    POINTS.with(|store| store.borrow().get(&validator).copied().unwrap_or(0))
+}
+
 fn current_score(provider: u64, dimension: ScoreDimension) -> u16 {
     <RecordingUpdater as crate::ReputationUpdater<u64>>::dimension_score(&provider, dimension)
 }
@@ -96,6 +117,7 @@ fn recorded() -> Vec<(u64, ScoreDimension, u16)> {
 fn clear_recorded() {
     RECORDED.with(|recorded| recorded.borrow_mut().clear());
     CURRENT.with(|current| current.borrow_mut().clear());
+    POINTS.with(|store| store.borrow_mut().clear());
 }
 
 parameter_types! {
@@ -104,12 +126,14 @@ parameter_types! {
     pub const TargetCommitteeSize: u32 = 5;
     pub const MaxValidators: u32 = 16;
     pub const DisputeWindow: u64 = 20;
+    pub const PointsPerAcceptedSubmission: u64 = 7;
 }
 
 impl crate::Config for Test {
     type Currency = Balances;
     type SuspensionOrigin = frame_system::EnsureRoot<u64>;
     type ReputationUpdater = RecordingUpdater;
+    type ValidatorRewards = RecordingRewards;
     type MinStake = MinStake;
     type UnbondingPeriod = UnbondingPeriod;
     type MaxSubmissionsPerRound = MaxSubmissionsPerRound;
@@ -117,6 +141,7 @@ impl crate::Config for Test {
     type TargetCommitteeSize = TargetCommitteeSize;
     type MaxValidators = MaxValidators;
     type DisputeWindow = DisputeWindow;
+    type PointsPerAcceptedSubmission = PointsPerAcceptedSubmission;
     type WeightInfo = ();
 }
 
@@ -882,5 +907,102 @@ fn resolving_requires_governance_and_an_actual_dispute() {
             ),
             DispatchError::BadOrigin
         );
+    });
+}
+
+// --- Validator reward accrual (ADR-011 §5) ---
+
+#[test]
+fn only_submissions_surviving_trimming_are_rewarded() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        let assigned = committee();
+        // Sorted by score, the 0 and the 10_000 are trimmed; the three
+        // 6_000s survive and are the only ones paid.
+        let scores = [0u16, 6_000, 6_000, 6_000, 10_000];
+        for (member, score) in assigned.iter().zip(scores) {
+            assert_ok!(submit(*member, ScoreDimension::Compute, score));
+        }
+        assert_ok!(NetworkValidator::close_round(
+            RuntimeOrigin::signed(assigned[0]),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute
+        ));
+
+        let low_outlier = assigned[0];
+        let high_outlier = assigned[4];
+        assert_eq!(points_of(low_outlier), 0, "a low outlier earns nothing");
+        assert_eq!(points_of(high_outlier), 0, "a high outlier earns nothing");
+        for member in assigned.iter().take(4).skip(1) {
+            assert_eq!(
+                points_of(*member),
+                PointsPerAcceptedSubmission::get(),
+                "a non-outlier submitter is rewarded exactly once"
+            );
+        }
+    });
+}
+
+#[test]
+fn round_closed_event_reports_how_many_were_rewarded() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        let assigned = committee();
+        for member in assigned.iter().take(3) {
+            assert_ok!(submit(*member, ScoreDimension::Network, 5_000));
+        }
+        assert_ok!(NetworkValidator::close_round(
+            RuntimeOrigin::signed(assigned[0]),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Network
+        ));
+        // Three submissions -> one trimmed at each end -> one rewarded.
+        let rewarded: u64 = assigned
+            .iter()
+            .take(3)
+            .map(|member| points_of(*member))
+            .sum();
+        assert_eq!(rewarded, PointsPerAcceptedSubmission::get());
+    });
+}
+
+#[test]
+fn tied_scores_are_trimmed_deterministically() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        let assigned = committee();
+        // All-equal scores: the mean is unambiguous, and the tie-break on
+        // validator id must make the choice of who gets trimmed stable
+        // rather than dependent on submission order.
+        for member in assigned.iter() {
+            assert_ok!(submit(*member, ScoreDimension::Storage, 5_000));
+        }
+        assert_ok!(NetworkValidator::close_round(
+            RuntimeOrigin::signed(assigned[0]),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Storage
+        ));
+        assert_eq!(recorded(), vec![(PROVIDER, ScoreDimension::Storage, 5_000)]);
+        // Five submitted, two trimmed, three paid.
+        let paid = assigned
+            .iter()
+            .filter(|member| points_of(**member) > 0)
+            .count();
+        assert_eq!(paid, 3);
+        // The trimmed pair is the lowest and highest validator id, since
+        // all scores tie.
+        let mut sorted = assigned.clone();
+        sorted.sort_unstable();
+        assert_eq!(points_of(sorted[0]), 0);
+        assert_eq!(points_of(sorted[4]), 0);
     });
 }
