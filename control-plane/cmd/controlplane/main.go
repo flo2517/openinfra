@@ -22,6 +22,7 @@ import (
 	"github.com/openinfra/network/internal/dashboard"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/providerjoin"
+	"github.com/openinfra/network/internal/resourcemarket"
 	"github.com/openinfra/network/internal/scheduler"
 	"github.com/openinfra/network/internal/wireguard"
 	"github.com/openinfra/network/internal/workloadapi"
@@ -134,6 +135,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Provider Agent client: %w", err)
 	}
+	// Keeps pallet-resource-market's on-chain Offers in sync with each
+	// schedulable provider's declared total capacity (issue #15).
+	marketReconciler := resourcemarket.NewReconciler(directory, marketBridge{registrar: registrar, chain: chainClient}, resourcemarket.DefaultReconcilerConfig())
+	go marketReconciler.Run(ctx)
 	ranker := scheduler.NewRanker(scheduler.DefaultMaxReputationScore, scheduler.DefaultDefaultReputationScore)
 	worker := orchestrator.NewWorker(workloadRepository, directory, registrar, agentClient, ranker)
 	worker.SetReputationSource(chainClient)
@@ -245,6 +250,29 @@ func serverOptions(address string) ([]grpc.ServerOption, error) {
 		ClientCAs:    pool,
 	}
 	return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(configuration))}, nil
+}
+
+// marketBridge combines *blockchainbridge.Registrar's write methods with
+// *blockchainbridge.RPCClient's read methods into the single
+// resourcemarket.Market surface -- they are genuinely two different
+// receiver types in blockchainbridge (signing/submitting vs. querying
+// storage), not an arbitrary split introduced here.
+type marketBridge struct {
+	registrar *blockchainbridge.Registrar
+	chain     *blockchainbridge.RPCClient
+}
+
+func (b marketBridge) AnnounceOfferFor(ctx context.Context, provider [32]byte, offer blockchainbridge.ResourceOffer) error {
+	return b.registrar.AnnounceOfferFor(ctx, provider, offer)
+}
+func (b marketBridge) RemoveOfferFor(ctx context.Context, provider [32]byte) error {
+	return b.registrar.RemoveOfferFor(ctx, provider)
+}
+func (b marketBridge) FinalizedOffer(ctx context.Context, provider [32]byte, blockHash string) (blockchainbridge.ResourceOffer, bool, error) {
+	return b.chain.FinalizedOffer(ctx, provider, blockHash)
+}
+func (b marketBridge) FinalizedHead(ctx context.Context) (string, error) {
+	return b.chain.FinalizedHead(ctx)
 }
 
 func envOrDefault(name, fallback string) string {
