@@ -25,6 +25,7 @@ use frame_support::{
     pallet_prelude::*,
     traits::{Currency, EnsureOrigin, Get, ReservableCurrency},
     weights::Weight,
+    Hashable,
 };
 use frame_system::pallet_prelude::*;
 pub use pallet::*;
@@ -147,10 +148,15 @@ pub mod pallet {
         /// accepted (ADR-011 §5).
         #[pallet::constant]
         type MinQuorum: Get<u32>;
-        /// Denominator for the reported confidence ratio: the committee
-        /// size a fully-attested round is expected to reach.
+        /// Committee size a fully-attested round is expected to reach.
+        /// Doubles as the confidence denominator: a round closed with
+        /// fewer submissions than this is visibly under-attested.
         #[pallet::constant]
         type TargetCommitteeSize: Get<u32>;
+        /// Hard bound on the enumerable active-validator set. Committee
+        /// selection iterates it, so it must stay bounded.
+        #[pallet::constant]
+        type MaxValidators: Get<u32>;
         type WeightInfo: WeightInfo;
     }
 
@@ -186,6 +192,14 @@ pub mod pallet {
         ValidatorRecord<BalanceOf<T>, BlockNumberFor<T>>,
         OptionQuery,
     >;
+
+    /// Enumerable set of currently-`Active` validators, kept in step with
+    /// [`Validators`] on every status transition. `Validators` is a
+    /// StorageMap and cannot be iterated within a bounded weight, so
+    /// committee selection reads this instead.
+    #[pallet::storage]
+    pub type ActiveValidatorSet<T: Config> =
+        StorageValue<_, BoundedVec<T::AccountId, T::MaxValidators>, ValueQuery>;
 
     /// One validator's attributable, signed-by-extrinsic observation.
     /// `payload_hash` addresses the full evidence off-chain; only this
@@ -311,6 +325,11 @@ pub mod pallet {
         /// Fewer than `MinQuorum` independent submissions -- closing would
         /// report a score the network cannot stand behind.
         QuorumNotReached,
+        /// This validator is not in the committee selected for this
+        /// provider/round -- slots are assigned, not self-selected.
+        NotAssignedToRound,
+        /// `MaxValidators` reached; the active set cannot grow.
+        TooManyValidators,
     }
 
     #[pallet::call]
@@ -328,6 +347,7 @@ pub mod pallet {
                 Error::<T>::AlreadyRegistered
             );
             ensure!(stake >= T::MinStake::get(), Error::<T>::InsufficientStake);
+            Self::join_active_set(&who)?;
             T::Currency::reserve(&who, stake).map_err(|_| Error::<T>::InsufficientFreeBalance)?;
             let now = frame_system::Pallet::<T>::block_number();
             Validators::<T>::insert(
@@ -369,6 +389,8 @@ pub mod pallet {
                     Ok(available_at)
                 },
             )?;
+            // An exiting validator takes no new committee assignments.
+            Self::leave_active_set(&who);
             Self::deposit_event(Event::ValidatorExitRequested {
                 validator: who,
                 available_at,
@@ -392,6 +414,9 @@ pub mod pallet {
             }
             T::Currency::unreserve(&who, record.stake);
             Validators::<T>::remove(&who);
+            // Defensive: request_exit already removed it, but keep the two
+            // stores consistent even if that ever changes.
+            Self::leave_active_set(&who);
             Self::deposit_event(Event::ValidatorExited {
                 validator: who,
                 stake: record.stake,
@@ -414,6 +439,7 @@ pub mod pallet {
                 record.status = ValidatorStatus::Suspended;
                 Ok(())
             })?;
+            Self::leave_active_set(&validator);
             Self::deposit_event(Event::ValidatorSuspended { validator });
             Ok(())
         }
@@ -433,6 +459,7 @@ pub mod pallet {
                 record.status = ValidatorStatus::Active;
                 Ok(())
             })?;
+            Self::join_active_set(&validator)?;
             Self::deposit_event(Event::ValidatorReinstated { validator });
             Ok(())
         }
@@ -457,8 +484,17 @@ pub mod pallet {
                 Error::<T>::NotAnActiveValidator
             );
             // A validator scoring its own provider account is the cheapest
-            // possible self-dealing; reject it outright.
+            // possible self-dealing; reject it outright. Checked before
+            // assignment so the error stays specific (committee selection
+            // already excludes the provider, but this keeps the guarantee
+            // explicit rather than emergent).
             ensure!(validator != provider, Error::<T>::SelfScoringForbidden);
+            // Slots are assigned, not self-selected: a Sybil cluster cannot
+            // fill a round by submitting first (ADR-011 §1).
+            ensure!(
+                Self::is_assigned(&provider, round, &validator),
+                Error::<T>::NotAssignedToRound
+            );
             ensure!(score_bps <= 10_000, Error::<T>::ScoreOutOfBounds);
             ensure!(sample_count > 0, Error::<T>::InvalidSampleCount);
             ensure!(
@@ -552,6 +588,69 @@ pub mod pallet {
     }
 
     impl<T: Config> Pallet<T> {
+        fn join_active_set(who: &T::AccountId) -> DispatchResult {
+            ActiveValidatorSet::<T>::try_mutate(|set| -> DispatchResult {
+                if !set.contains(who) {
+                    set.try_push(who.clone())
+                        .map_err(|_| Error::<T>::TooManyValidators)?;
+                }
+                Ok(())
+            })
+        }
+
+        fn leave_active_set(who: &T::AccountId) {
+            ActiveValidatorSet::<T>::mutate(|set| {
+                if let Some(index) = set.iter().position(|entry| entry == who) {
+                    // Order-preserving: committee selection indexes into
+                    // this set, so a swap_remove would silently reshuffle
+                    // assignments for unrelated providers.
+                    set.remove(index);
+                }
+            });
+        }
+
+        /// The committee expected to score `provider` in `round`:
+        /// `TargetCommitteeSize` distinct active validators, drawn
+        /// deterministically from [`ActiveValidatorSet`] and never
+        /// including the provider itself.
+        ///
+        /// Selection is `blake2_256((provider, round, nth))` reduced modulo
+        /// the remaining candidates, drawing without replacement. It is a
+        /// pure function of committed state, so every node derives the same
+        /// committee without extra storage.
+        ///
+        /// **Known limitation (ADR-011 §1):** the dev chain runs Aura, which
+        /// offers no VRF, so this assignment is publicly computable ahead of
+        /// time -- a validator can predict which providers it will score.
+        /// Security therefore rests on quorum, outlier trimming, and bonded
+        /// stake rather than on assignment secrecy. Moving to unpredictable
+        /// per-round entropy is tracked as follow-up work.
+        pub fn committee(provider: &T::AccountId, round: u64) -> alloc::vec::Vec<T::AccountId> {
+            let mut candidates: alloc::vec::Vec<T::AccountId> = ActiveValidatorSet::<T>::get()
+                .into_iter()
+                .filter(|candidate| candidate != provider)
+                .collect();
+            let wanted = (T::TargetCommitteeSize::get() as usize).min(candidates.len());
+            let mut committee = alloc::vec::Vec::with_capacity(wanted);
+            for nth in 0..wanted {
+                let seed = (provider.clone(), round, nth as u32).blake2_256();
+                // Fold the first 8 bytes into an index over what's left;
+                // drawing without replacement keeps members distinct.
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(&seed[..8]);
+                let index = (u64::from_le_bytes(raw) % candidates.len() as u64) as usize;
+                committee.push(candidates.remove(index));
+            }
+            committee
+        }
+
+        /// Whether `validator` holds a slot for `provider` in `round`.
+        pub fn is_assigned(provider: &T::AccountId, round: u64, validator: &T::AccountId) -> bool {
+            Self::committee(provider, round)
+                .iter()
+                .any(|member| member == validator)
+        }
+
         /// Integer trimmed mean: with three or more submissions, drop one
         /// lowest and one highest value before averaging, so a single
         /// outlier (a colluding or malfunctioning validator) cannot move

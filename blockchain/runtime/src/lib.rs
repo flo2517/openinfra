@@ -110,6 +110,7 @@ parameter_types! {
     // trimmed mean can discard an outlier at both ends (ADR-011 §5).
     pub const ValidatorMinQuorum: u32 = 3;
     pub const ValidatorTargetCommitteeSize: u32 = 5;
+    pub const MaxNetworkValidators: u32 = 256;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -281,6 +282,7 @@ impl pallet_network_validator::Config for Runtime {
     type MaxSubmissionsPerRound = MaxValidatorSubmissionsPerRound;
     type MinQuorum = ValidatorMinQuorum;
     type TargetCommitteeSize = ValidatorTargetCommitteeSize;
+    type MaxValidators = MaxNetworkValidators;
     type WeightInfo = ();
 }
 
