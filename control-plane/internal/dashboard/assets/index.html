@@ -15,9 +15,14 @@
       <article><span>Mémoire disponible</span><strong id="memory">—</strong><small>sur heartbeats frais</small></article>
       <article><span>Blockchain</span><strong id="block">—</strong><small id="chain">tête finalisée</small></article>
       <article><span>Workloads</span><strong id="workload-count">—</strong><small>persistés dans PostgreSQL</small></article>
+      <article><span>Network Validators</span><strong id="validator-count">—</strong><small>actifs on-chain</small></article>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">WORKLOADS</span><h2>Orchestration durable</h2></div></div>
       <div class="table-wrap"><table><thead><tr><th>Workload</th><th>État</th><th>Provider</th><th>Lease</th><th>Créé</th></tr></thead><tbody id="workloads"></tbody></table></div>
+    </section>
+    <section class="panel"><div class="panel-head"><div><span class="eyebrow">VALIDATORS</span><h2>Scoring décentralisé</h2></div></div>
+      <div id="validators-warning" class="warning" hidden>Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.</div>
+      <div class="table-wrap"><table><thead><tr><th>Validator</th></tr></thead><tbody id="validators"></tbody></table></div>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">PROVIDERS</span><h2>État du réseau</h2></div><button id="refresh" type="button">Actualiser</button></div>
       <div id="warning" class="warning" hidden></div>
