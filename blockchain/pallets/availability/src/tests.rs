@@ -1,5 +1,9 @@
 use crate as pallet_availability;
-use frame_support::{assert_noop, assert_ok, derive_impl, parameter_types, traits::ConstU32};
+use crate::{EnsureActiveValidator, NetworkValidatorInspector};
+use frame_support::{
+    assert_noop, assert_ok, derive_impl, parameter_types,
+    traits::{ConstU32, EnsureOrigin},
+};
 use sp_runtime::{BuildStorage, DispatchError};
 
 type Block = frame_system::mocking::MockBlock<Test>;
@@ -10,11 +14,22 @@ impl frame_system::Config for Test {
     type Block = Block;
 }
 
+/// Account 7 only, mirroring how other tests in this crate pick an
+/// arbitrary fixed id -- just enough to distinguish an active validator
+/// from every other signed account in EnsureActiveValidator tests below.
+pub struct OnlyAccountSeven;
+impl NetworkValidatorInspector<u64> for OnlyAccountSeven {
+    fn is_active(validator: &u64) -> bool {
+        *validator == 7
+    }
+}
+
 parameter_types! { pub const MaxLifetime: u64 = 10; }
 impl crate::Config for Test {
     type ChallengeOrigin = frame_system::EnsureRoot<u64>;
     type ProofOrigin = frame_system::EnsureRoot<u64>;
     type ProviderInspector = ();
+    type ValidatorInspector = OnlyAccountSeven;
     type MaxPendingChallenges = ConstU32<1>;
     type MaxChallengeLifetime = MaxLifetime;
     type MaxProofAge = MaxLifetime;
@@ -148,4 +163,30 @@ fn proof_origin_and_signature_bounds_are_enforced() {
             crate::Error::<Test>::ProofSignatureTooLong
         );
     });
+}
+
+#[test]
+fn ensure_active_validator_accepts_only_a_signed_active_validator() {
+    let result = EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::signed(7));
+    assert_eq!(
+        result.expect("account 7 is configured as the active validator"),
+        7
+    );
+}
+
+#[test]
+fn ensure_active_validator_rejects_a_signed_inactive_account() {
+    assert!(EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::signed(1)).is_err());
+}
+
+#[test]
+fn ensure_active_validator_rejects_root_even_though_it_outranks_everything_else() {
+    // Root is deliberately not a shortcut here: only a real, signed,
+    // registered validator account may submit availability proofs.
+    assert!(EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::root()).is_err());
+}
+
+#[test]
+fn ensure_active_validator_rejects_none_origin() {
+    assert!(EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::none()).is_err());
 }

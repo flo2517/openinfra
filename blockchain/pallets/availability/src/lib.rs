@@ -4,8 +4,12 @@ extern crate alloc;
 
 pub use pallet::*;
 
-use frame_support::{pallet_prelude::*, traits::Get, weights::Weight};
-use frame_system::pallet_prelude::*;
+use frame_support::{
+    pallet_prelude::*,
+    traits::{EnsureOrigin, Get, OriginTrait},
+    weights::Weight,
+};
+use frame_system::{pallet_prelude::*, RawOrigin};
 use sp_runtime::traits::Saturating;
 
 pub trait ProviderInspector<AccountId> {
@@ -15,6 +19,53 @@ pub trait ProviderInspector<AccountId> {
 impl<AccountId> ProviderInspector<AccountId> for () {
     fn is_registered(_: &AccountId) -> bool {
         true
+    }
+}
+
+/// Narrow interface for checking whether an account is currently a bonded,
+/// active Network Validator (ADR-011). Deliberately redeclared per
+/// consuming pallet -- same pattern as [`ProviderInspector`] -- rather than
+/// depending on `pallet-network-validator` directly, so this pallet has no
+/// hard dependency on it; the runtime glues the two together.
+pub trait NetworkValidatorInspector<AccountId> {
+    fn is_active(validator: &AccountId) -> bool;
+}
+
+impl<AccountId> NetworkValidatorInspector<AccountId> for () {
+    fn is_active(_: &AccountId) -> bool {
+        false
+    }
+}
+
+/// An [`EnsureOrigin`] that succeeds only for a signed origin whose account
+/// is currently an active Network Validator per `T::ValidatorInspector`.
+/// Modeled on `frame_system::EnsureSignedBy`, with a dynamic membership
+/// check in place of a static [`SortedMembers`] set.
+pub struct EnsureActiveValidator<T>(core::marker::PhantomData<T>);
+
+impl<T, O> EnsureOrigin<O> for EnsureActiveValidator<T>
+where
+    T: pallet::Config,
+    O: OriginTrait<AccountId = T::AccountId> + From<RawOrigin<T::AccountId>>,
+{
+    type Success = T::AccountId;
+
+    fn try_origin(o: O) -> Result<Self::Success, O> {
+        match o.as_system_ref() {
+            Some(RawOrigin::Signed(who)) if T::ValidatorInspector::is_active(who) => {
+                Ok(who.clone())
+            }
+            _ => Err(o),
+        }
+    }
+
+    #[cfg(feature = "runtime-benchmarks")]
+    fn try_successful_origin() -> Result<O, ()> {
+        // There is no generic way to conjure a *registered, active*
+        // validator account without real pallet-network-validator state;
+        // benchmarking this origin requires a dedicated setup, not a
+        // generic fallback.
+        Err(())
     }
 }
 
@@ -61,6 +112,9 @@ pub mod pallet {
         /// only a bounded summary, never the raw metrics payload.
         type ProofOrigin: EnsureOrigin<Self::RuntimeOrigin>;
         type ProviderInspector: ProviderInspector<Self::AccountId>;
+        /// Backs [`EnsureActiveValidator`]; the runtime wires this to
+        /// `pallet-network-validator`'s registry (ADR-011).
+        type ValidatorInspector: NetworkValidatorInspector<Self::AccountId>;
         #[pallet::constant]
         type MaxPendingChallenges: Get<u32>;
         #[pallet::constant]
