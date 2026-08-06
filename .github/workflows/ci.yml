@@ -128,6 +128,16 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Test pallets and runtime
         working-directory: blockchain
+        # This step never runs the compiled node, so the real WASM runtime
+        # blob (a second, cross-compiled build of the whole runtime +
+        # pallet graph, plus a wasm-opt pass) is pure overhead: WASM_BINARY
+        # is only read at runtime in chain_spec.rs, and no test here
+        # touches it. Scoped to this step only -- `openinfra-node`'s own
+        # dependency graph pulls in unrelated polkadot-sdk WASM/PolkaVM
+        # test-fixture crates that do not tolerate SKIP_WASM_BUILD, so it
+        # must not be set for "Check node compilation" below.
+        env:
+          SKIP_WASM_BUILD: "1"
         run: cargo test --workspace --exclude openinfra-node --locked
       - name: Check node compilation
         working-directory: blockchain
