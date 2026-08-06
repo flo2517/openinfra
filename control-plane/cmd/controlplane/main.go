@@ -22,6 +22,7 @@ import (
 	"github.com/openinfra/network/internal/dashboard"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/providerjoin"
+	"github.com/openinfra/network/internal/scheduler"
 	"github.com/openinfra/network/internal/wireguard"
 	"github.com/openinfra/network/internal/workloadapi"
 	"github.com/openinfra/network/migrations"
@@ -133,7 +134,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Provider Agent client: %w", err)
 	}
-	worker := orchestrator.NewWorker(workloadRepository, directory, registrar, agentClient)
+	ranker := scheduler.NewRanker(scheduler.DefaultMaxReputationScore, scheduler.DefaultDefaultReputationScore)
+	worker := orchestrator.NewWorker(workloadRepository, directory, registrar, agentClient, ranker)
+	worker.SetReputationSource(chainClient)
 	if interfaceName := os.Getenv("WIREGUARD_INTERFACE"); interfaceName != "" {
 		firstPort := envIntOrDefault("WIREGUARD_FIRST_PORT", 51820)
 		lastPort := envIntOrDefault("WIREGUARD_LAST_PORT", 51999)

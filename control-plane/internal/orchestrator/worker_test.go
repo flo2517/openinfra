@@ -7,24 +7,37 @@ import (
 
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/scheduler"
 	"github.com/openinfra/network/internal/workloadapi"
 	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"google.golang.org/protobuf/proto"
 )
 
-func TestSelectProviderRequiresEndpointAndCapacity(t *testing.T) {
+func testRanker() *scheduler.Ranker {
+	return scheduler.NewRanker(scheduler.DefaultMaxReputationScore, scheduler.DefaultDefaultReputationScore)
+}
+
+func TestRankableCandidatesExcludesMissingEndpointAndSelectsBestFit(t *testing.T) {
 	providers := []agentmanager.SchedulableProvider{
 		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "no-endpoint"}, Capabilities: &sharedv1.ResourceCapability{CpuAvailable: 8, RamAvailableMb: 8192}},
 		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "small", AgentEndpoint: "https://small:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuAvailable: 1, RamAvailableMb: 128}},
-		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "selected", AgentEndpoint: "https://selected:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuAvailable: 4, RamAvailableMb: 4096}},
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "selected", AgentEndpoint: "https://selected:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuAvailable: 4, RamAvailableMb: 4096, CpuTotal: 4, RamTotalMb: 4096}},
 	}
-	selected, err := selectProvider(providers, &sharedv1.ResourceRequirements{Cpu: 2, RamMb: 1024})
-	if err != nil {
-		t.Fatal(err)
+	worker := NewWorker(nil, nil, nil, nil, testRanker())
+	candidates, capacities := worker.rankableCandidates(context.Background(), providers)
+	decision := worker.ranker.Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, &sharedv1.ResourceRequirements{Cpu: 2, RamMb: 1024}, nil, candidates)
+	if decision.Selected == nil {
+		t.Fatal("expected a winning candidate")
 	}
-	if selected.ProviderID != "selected" {
-		t.Fatalf("selected %q", selected.ProviderID)
+	if decision.Selected.ProviderID != "selected" {
+		t.Fatalf("selected %q, want %q", decision.Selected.ProviderID, "selected")
+	}
+	if len(decision.Excluded) != 2 {
+		t.Fatalf("expected both no-endpoint and small excluded, got %+v", decision.Excluded)
+	}
+	if capacities["selected"].TotalCPUMillicores != 4000 || capacities["selected"].TotalRAMMB != 4096 {
+		t.Fatalf("unexpected capacity for selected provider: %+v", capacities["selected"])
 	}
 }
 
@@ -64,7 +77,7 @@ func TestWorkerRecoversEveryPersistedBoundary(t *testing.T) {
 		t.Run(test.state, func(t *testing.T) {
 			item := workloadapi.Workload{WorkloadID: "workload", State: test.state, Definition: definition, Image: "image@sha256:digest", ProviderID: "provider", LeaseID: "42", Version: 7}
 			store := &recordingStore{item: item}
-			worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, successfulDispatcher{})
+			worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, successfulDispatcher{}, testRanker())
 			worker.workerID = "worker-under-test"
 			if err := worker.processOne(context.Background()); err != nil {
 				t.Fatal(err)
@@ -82,7 +95,7 @@ func TestWorkerRecoversEveryPersistedBoundary(t *testing.T) {
 func TestWorkerReleasesClaimThroughCASRetry(t *testing.T) {
 	item := workloadapi.Workload{WorkloadID: "workload", State: "SCHEDULING", Definition: []byte("invalid"), Version: 11}
 	store := &recordingStore{item: item}
-	worker := NewWorker(store, staticDirectory{}, successfulLeases{}, successfulDispatcher{})
+	worker := NewWorker(store, staticDirectory{}, successfulLeases{}, successfulDispatcher{}, testRanker())
 	worker.workerID = "recovery-worker"
 	if err := worker.processOne(context.Background()); err == nil {
 		t.Fatal("invalid definition must fail")
@@ -101,7 +114,7 @@ func TestDeployRetryReconcilesStatusBeforeIdempotentReplay(t *testing.T) {
 	store := &recordingStore{item: item}
 	dispatcher := &reconcilingDispatcher{}
 	provider := agentmanager.SchedulableProvider{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "provider", AgentEndpoint: "https://agent:50052"}}
-	worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, dispatcher)
+	worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, dispatcher, testRanker())
 	if err := worker.processOne(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +141,7 @@ func (s *recordingStore) BeginScheduling(_ context.Context, item workloadapi.Wor
 	s.record("begin-scheduling", item)
 	return nil
 }
-func (s *recordingStore) AssignLease(_ context.Context, item workloadapi.Workload, _ string, _ [32]byte) (uint64, error) {
+func (s *recordingStore) AssignLease(_ context.Context, item workloadapi.Workload, _ string, _ [32]byte, _ workloadapi.ProviderCapacity) (uint64, error) {
 	s.record("assign-lease", item)
 	return 42, nil
 }
