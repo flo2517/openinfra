@@ -120,8 +120,14 @@ func run() error {
 	}
 	server := grpc.NewServer(options...)
 	workloadRepository := workloadapi.NewPostgresRepository(pool)
-	service := providerjoin.NewService(providerjoin.NewPostgresRepository(pool), providerjoin.NewRedisHeartbeatStore(redisClient), registrar)
+	providerRepository := providerjoin.NewPostgresRepository(pool)
+	service := providerjoin.NewService(providerRepository, providerjoin.NewRedisHeartbeatStore(redisClient), registrar)
 	service.SetWorkloadService(workloadapi.NewService(workloadRepository))
+	// Independently drives provider_chain_registrations rows left in
+	// READY/RETRY (e.g. after a Control Plane or chain restart) to
+	// FINALIZED, without depending on the Agent retrying CompleteJoin.
+	reconciler := providerjoin.NewReconciler(providerRepository, providerRepository, registrar, providerjoin.DefaultReconcilerConfig())
+	go reconciler.Run(ctx)
 	directory := agentmanager.NewDirectory(agentmanager.NewPostgresRegistry(pool), agentmanager.NewRedisLivenessStore(redisClient))
 	agentClient, err := agentmanager.NewMTLSClient(os.Getenv("AGENT_CLIENT_TLS_CERT_FILE"), os.Getenv("AGENT_CLIENT_TLS_KEY_FILE"), os.Getenv("AGENT_CLIENT_TLS_CA_FILE"))
 	if err != nil {

@@ -227,6 +227,59 @@ func (r *PostgresRepository) ActivateProvider(ctx context.Context, providerID st
 	return result, nil
 }
 
+// DueChainRegistrations implements ChainRegistrationStore for the
+// Reconciler: providers whose outbox row is READY or RETRY and due (no
+// backoff scheduled, or the backoff has elapsed), oldest first so a
+// persistently failing registration cannot starve others out of the batch.
+func (r *PostgresRepository) DueChainRegistrations(ctx context.Context, limit int) ([]PendingChainRegistration, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT cr.provider_id, p.public_key, cr.attempt_count
+		FROM provider_chain_registrations cr
+		JOIN providers p ON p.provider_id = cr.provider_id
+		WHERE cr.state IN ('READY', 'RETRY')
+		  AND (cr.next_attempt_at IS NULL OR cr.next_attempt_at <= now())
+		ORDER BY cr.created_at
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var due []PendingChainRegistration
+	for rows.Next() {
+		var pending PendingChainRegistration
+		if err := rows.Scan(&pending.ProviderID, &pending.PublicKey, &pending.AttemptCount); err != nil {
+			return nil, err
+		}
+		due = append(due, pending)
+	}
+	return due, rows.Err()
+}
+
+// RecordChainRegistrationFailure implements ChainRegistrationStore.
+func (r *PostgresRepository) RecordChainRegistrationFailure(ctx context.Context, providerID string, attemptErr error, nextAttemptAt time.Time, terminal bool) error {
+	state := "RETRY"
+	var next *time.Time
+	if terminal {
+		state = "FAILED"
+	} else {
+		next = &nextAttemptAt
+	}
+	command, err := r.pool.Exec(ctx, `
+		UPDATE provider_chain_registrations
+		SET state = $2, attempt_count = attempt_count + 1, next_attempt_at = $3,
+		    last_error = $4, updated_at = now()
+		WHERE provider_id = $1`,
+		providerID, state, next, attemptErr.Error())
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrProviderNotFound
+	}
+	return nil
+}
+
 func (r *PostgresRepository) challengeByBeginRequestID(ctx context.Context, requestID string) (Challenge, error) {
 	return scanChallenge(r.pool.QueryRow(ctx, `
 		SELECT challenge_id, begin_request_id, request_hash, public_key,
