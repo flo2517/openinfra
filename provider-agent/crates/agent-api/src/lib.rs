@@ -166,7 +166,7 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
 
         let resources = self
             .inventory_manager
-            .get_inventory()
+            .get_inventory(&self.config.executor.state_path)
             .map_err(|e| Status::internal(format!("Inventory error: {:?}", e)))?;
 
         Ok(Response::new(GetInventoryResponse {

@@ -447,10 +447,36 @@ func (x *GPUCapability) GetCount() int32 {
 	return 0
 }
 
+// Bandwidth describes a provider's advertised network capacity (on
+// ResourceCapability) or a workload's minimum requested network capacity
+// (on ResourceRequirements). Every field's unit is explicit and integer,
+// matching the wire protocol's existing no-implicit-float convention
+// (basis points for reputation/reward fractions, plain integers
+// everywhere else) rather than a float fraction or an ambiguous "some
+// unit" number:
+//
+//	ingress_mbps / egress_mbps: sustained throughput ceiling, megabits
+//	  per second (10^6 bits/s -- the conventional networking Mbps, not
+//	  mebibytes).
+//	burst_mbps: the highest short-lived throughput ceiling above the
+//	  sustained rate the link tolerates. 0 means "no burst allowance
+//	  advertised" (== the sustained rate), not "unlimited".
+//	latency_ms / jitter_ms: round-trip latency and its variation,
+//	  milliseconds.
+//	loss_bps: packet loss rate in basis points (parts per 10,000; 100 =
+//	  1%), matching ReputationVector/Rewards' existing basis-point
+//	  convention instead of a float fraction.
+//	transfer_cap_gb: a billing-period transfer allowance, gigabytes
+//	  (10^9 bytes). 0 means "not advertised/no cap", not "zero transfer".
 type Bandwidth struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	IngressMbps   int32                  `protobuf:"varint,1,opt,name=ingress_mbps,json=ingressMbps,proto3" json:"ingress_mbps,omitempty"`
 	EgressMbps    int32                  `protobuf:"varint,2,opt,name=egress_mbps,json=egressMbps,proto3" json:"egress_mbps,omitempty"`
+	BurstMbps     int32                  `protobuf:"varint,3,opt,name=burst_mbps,json=burstMbps,proto3" json:"burst_mbps,omitempty"`
+	LatencyMs     int32                  `protobuf:"varint,4,opt,name=latency_ms,json=latencyMs,proto3" json:"latency_ms,omitempty"`
+	JitterMs      int32                  `protobuf:"varint,5,opt,name=jitter_ms,json=jitterMs,proto3" json:"jitter_ms,omitempty"`
+	LossBps       int32                  `protobuf:"varint,6,opt,name=loss_bps,json=lossBps,proto3" json:"loss_bps,omitempty"`
+	TransferCapGb int64                  `protobuf:"varint,7,opt,name=transfer_cap_gb,json=transferCapGb,proto3" json:"transfer_cap_gb,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -495,6 +521,41 @@ func (x *Bandwidth) GetIngressMbps() int32 {
 func (x *Bandwidth) GetEgressMbps() int32 {
 	if x != nil {
 		return x.EgressMbps
+	}
+	return 0
+}
+
+func (x *Bandwidth) GetBurstMbps() int32 {
+	if x != nil {
+		return x.BurstMbps
+	}
+	return 0
+}
+
+func (x *Bandwidth) GetLatencyMs() int32 {
+	if x != nil {
+		return x.LatencyMs
+	}
+	return 0
+}
+
+func (x *Bandwidth) GetJitterMs() int32 {
+	if x != nil {
+		return x.JitterMs
+	}
+	return 0
+}
+
+func (x *Bandwidth) GetLossBps() int32 {
+	if x != nil {
+		return x.LossBps
+	}
+	return 0
+}
+
+func (x *Bandwidth) GetTransferCapGb() int64 {
+	if x != nil {
+		return x.TransferCapGb
 	}
 	return 0
 }
@@ -662,11 +723,15 @@ func (x *WorkloadDefinition) GetDurationSeconds() int32 {
 }
 
 type ResourceRequirements struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Cpu           float32                `protobuf:"fixed32,1,opt,name=cpu,proto3" json:"cpu,omitempty"`
-	RamMb         int64                  `protobuf:"varint,2,opt,name=ram_mb,json=ramMb,proto3" json:"ram_mb,omitempty"`
-	StorageGb     int64                  `protobuf:"varint,3,opt,name=storage_gb,json=storageGb,proto3" json:"storage_gb,omitempty"`
-	GpuCount      int32                  `protobuf:"varint,4,opt,name=gpu_count,json=gpuCount,proto3" json:"gpu_count,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Cpu       float32                `protobuf:"fixed32,1,opt,name=cpu,proto3" json:"cpu,omitempty"`
+	RamMb     int64                  `protobuf:"varint,2,opt,name=ram_mb,json=ramMb,proto3" json:"ram_mb,omitempty"`
+	StorageGb int64                  `protobuf:"varint,3,opt,name=storage_gb,json=storageGb,proto3" json:"storage_gb,omitempty"`
+	GpuCount  int32                  `protobuf:"varint,4,opt,name=gpu_count,json=gpuCount,proto3" json:"gpu_count,omitempty"`
+	// Optional: unset (nil) means the workload has no minimum bandwidth
+	// requirement. Only ingress_mbps/egress_mbps are meaningful here today
+	// -- see issue #30 for the scheduling/enforcement side.
+	Bandwidth     *Bandwidth `protobuf:"bytes,5,opt,name=bandwidth,proto3" json:"bandwidth,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -727,6 +792,13 @@ func (x *ResourceRequirements) GetGpuCount() int32 {
 		return x.GpuCount
 	}
 	return 0
+}
+
+func (x *ResourceRequirements) GetBandwidth() *Bandwidth {
+	if x != nil {
+		return x.Bandwidth
+	}
+	return nil
 }
 
 type WorkloadConstraints struct {
@@ -994,11 +1066,18 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\"\n" +
 	"\rvram_total_mb\x18\x02 \x01(\x03R\vvramTotalMb\x12*\n" +
 	"\x11vram_available_mb\x18\x03 \x01(\x03R\x0fvramAvailableMb\x12\x14\n" +
-	"\x05count\x18\x04 \x01(\x05R\x05count\"O\n" +
+	"\x05count\x18\x04 \x01(\x05R\x05count\"\xed\x01\n" +
 	"\tBandwidth\x12!\n" +
 	"\fingress_mbps\x18\x01 \x01(\x05R\vingressMbps\x12\x1f\n" +
 	"\vegress_mbps\x18\x02 \x01(\x05R\n" +
-	"egressMbps\"\xbe\x01\n" +
+	"egressMbps\x12\x1d\n" +
+	"\n" +
+	"burst_mbps\x18\x03 \x01(\x05R\tburstMbps\x12\x1d\n" +
+	"\n" +
+	"latency_ms\x18\x04 \x01(\x05R\tlatencyMs\x12\x1b\n" +
+	"\tjitter_ms\x18\x05 \x01(\x05R\bjitterMs\x12\x19\n" +
+	"\bloss_bps\x18\x06 \x01(\x05R\alossBps\x12&\n" +
+	"\x0ftransfer_cap_gb\x18\a \x01(\x03R\rtransferCapGb\"\xbe\x01\n" +
 	"\x10ReputationVector\x12\x18\n" +
 	"\acompute\x18\x01 \x01(\x02R\acompute\x12\x18\n" +
 	"\astorage\x18\x02 \x01(\x02R\astorage\x12\x18\n" +
@@ -1012,13 +1091,14 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\aprofile\x18\x02 \x01(\x0e2$.openinfra.shared.v1.WorkloadProfileR\aprofile\x12M\n" +
 	"\frequirements\x18\x03 \x01(\v2).openinfra.shared.v1.ResourceRequirementsR\frequirements\x12J\n" +
 	"\vconstraints\x18\x04 \x01(\v2(.openinfra.shared.v1.WorkloadConstraintsR\vconstraints\x12)\n" +
-	"\x10duration_seconds\x18\x05 \x01(\x05R\x0fdurationSeconds\"{\n" +
+	"\x10duration_seconds\x18\x05 \x01(\x05R\x0fdurationSeconds\"\xb9\x01\n" +
 	"\x14ResourceRequirements\x12\x10\n" +
 	"\x03cpu\x18\x01 \x01(\x02R\x03cpu\x12\x15\n" +
 	"\x06ram_mb\x18\x02 \x01(\x03R\x05ramMb\x12\x1d\n" +
 	"\n" +
 	"storage_gb\x18\x03 \x01(\x03R\tstorageGb\x12\x1b\n" +
-	"\tgpu_count\x18\x04 \x01(\x05R\bgpuCount\"\x7f\n" +
+	"\tgpu_count\x18\x04 \x01(\x05R\bgpuCount\x12<\n" +
+	"\tbandwidth\x18\x05 \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\"\x7f\n" +
 	"\x13WorkloadConstraints\x12$\n" +
 	"\x0emax_latency_ms\x18\x01 \x01(\x05R\fmaxLatencyMs\x12%\n" +
 	"\x0emin_reputation\x18\x02 \x01(\x02R\rminReputation\x12\x1b\n" +
@@ -1103,15 +1183,16 @@ var file_openinfra_shared_v1_shared_proto_depIdxs = []int32{
 	1,  // 4: openinfra.shared.v1.WorkloadDefinition.profile:type_name -> openinfra.shared.v1.WorkloadProfile
 	9,  // 5: openinfra.shared.v1.WorkloadDefinition.requirements:type_name -> openinfra.shared.v1.ResourceRequirements
 	10, // 6: openinfra.shared.v1.WorkloadDefinition.constraints:type_name -> openinfra.shared.v1.WorkloadConstraints
-	13, // 7: openinfra.shared.v1.Lease.start:type_name -> google.protobuf.Timestamp
-	13, // 8: openinfra.shared.v1.Lease.end:type_name -> google.protobuf.Timestamp
-	2,  // 9: openinfra.shared.v1.Lease.state:type_name -> openinfra.shared.v1.LeaseState
-	13, // 10: openinfra.shared.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	6,  // 7: openinfra.shared.v1.ResourceRequirements.bandwidth:type_name -> openinfra.shared.v1.Bandwidth
+	13, // 8: openinfra.shared.v1.Lease.start:type_name -> google.protobuf.Timestamp
+	13, // 9: openinfra.shared.v1.Lease.end:type_name -> google.protobuf.Timestamp
+	2,  // 10: openinfra.shared.v1.Lease.state:type_name -> openinfra.shared.v1.LeaseState
+	13, // 11: openinfra.shared.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_openinfra_shared_v1_shared_proto_init() }

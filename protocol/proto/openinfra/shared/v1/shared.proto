@@ -44,9 +44,34 @@ message GPUCapability {
   int32 count = 4;
 }
 
+// Bandwidth describes a provider's advertised network capacity (on
+// ResourceCapability) or a workload's minimum requested network capacity
+// (on ResourceRequirements). Every field's unit is explicit and integer,
+// matching the wire protocol's existing no-implicit-float convention
+// (basis points for reputation/reward fractions, plain integers
+// everywhere else) rather than a float fraction or an ambiguous "some
+// unit" number:
+//   ingress_mbps / egress_mbps: sustained throughput ceiling, megabits
+//     per second (10^6 bits/s -- the conventional networking Mbps, not
+//     mebibytes).
+//   burst_mbps: the highest short-lived throughput ceiling above the
+//     sustained rate the link tolerates. 0 means "no burst allowance
+//     advertised" (== the sustained rate), not "unlimited".
+//   latency_ms / jitter_ms: round-trip latency and its variation,
+//     milliseconds.
+//   loss_bps: packet loss rate in basis points (parts per 10,000; 100 =
+//     1%), matching ReputationVector/Rewards' existing basis-point
+//     convention instead of a float fraction.
+//   transfer_cap_gb: a billing-period transfer allowance, gigabytes
+//     (10^9 bytes). 0 means "not advertised/no cap", not "zero transfer".
 message Bandwidth {
   int32 ingress_mbps = 1;
   int32 egress_mbps = 2;
+  int32 burst_mbps = 3;
+  int32 latency_ms = 4;
+  int32 jitter_ms = 5;
+  int32 loss_bps = 6;
+  int64 transfer_cap_gb = 7;
 }
 
 // --- Reputation Vector ---
@@ -81,6 +106,10 @@ message ResourceRequirements {
   int64 ram_mb = 2;
   int64 storage_gb = 3;
   int32 gpu_count = 4;
+  // Optional: unset (nil) means the workload has no minimum bandwidth
+  // requirement. Only ingress_mbps/egress_mbps are meaningful here today
+  // -- see issue #30 for the scheduling/enforcement side.
+  Bandwidth bandwidth = 5;
 }
 
 message WorkloadConstraints {

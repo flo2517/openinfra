@@ -88,6 +88,34 @@ func insertSchedulingWorkload(t *testing.T, ctx context.Context, pool *pgxpool.P
 	return claimed
 }
 
+// insertSchedulingWorkloadWithBandwidth is insertSchedulingWorkload plus a
+// bandwidth reservation -- kept as a separate helper rather than widening
+// insertSchedulingWorkload's signature, since every other capacity test
+// doesn't care about bandwidth and would otherwise have to pass 0, 0 at
+// every call site.
+func insertSchedulingWorkloadWithBandwidth(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cpuMilli, ramMB, storageGB, ingressMbps, egressMbps int64) workloadapi.Workload {
+	t.Helper()
+	workloadID, requestID := uuid.NewString(), uuid.NewString()
+	ownerID := insertOwner(t, ctx, pool)
+	image := "example.invalid/image@sha256:" + fmt.Sprintf("%064d", 0)
+	_, err := pool.Exec(ctx, `
+		INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, state,
+		                        reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, reserved_ingress_mbps, reserved_egress_mbps)
+		VALUES ($1,$2,$3,$4,$5,$6,'SCHEDULING',$7,$8,$9,$10,$11)`,
+		workloadID, requestID, ownerID, make([]byte, 32), []byte{1}, image, cpuMilli, ramMB, storageGB, ingressMbps, egressMbps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := workloadapi.NewPostgresRepository(pool)
+	claimed, err := repository.ClaimNext(ctx, "test-worker-"+workloadID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed.ReservedCPUMillicores, claimed.ReservedRAMMB, claimed.ReservedStorageGB = cpuMilli, ramMB, storageGB
+	claimed.ReservedIngressMbps, claimed.ReservedEgressMbps = ingressMbps, egressMbps
+	return claimed
+}
+
 // insertProvider seeds the minimum valid providers row so workloads.
 // provider_id's foreign key can reference it.
 func insertProvider(t *testing.T, ctx context.Context, pool *pgxpool.Pool, providerID string) {
@@ -119,6 +147,24 @@ func insertOpenWorkload(t *testing.T, ctx context.Context, pool *pgxpool.Pool, p
 		                        provider_id, lease_id, container_id, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,nextval('workload_lease_id_seq'),'container',$8,$9,$10)`,
 		workloadID, requestID, make([]byte, 32), []byte{1}, image, state, provider, cpuMilli, ramMB, storageGB)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// insertOpenWorkloadWithBandwidth is insertOpenWorkload plus a bandwidth
+// reservation, for the same reason insertSchedulingWorkloadWithBandwidth
+// is separate from insertSchedulingWorkload.
+func insertOpenWorkloadWithBandwidth(t *testing.T, ctx context.Context, pool *pgxpool.Pool, provider, state string, cpuMilli, ramMB, storageGB, ingressMbps, egressMbps int64) {
+	t.Helper()
+	insertProvider(t, ctx, pool, provider)
+	workloadID, requestID := uuid.NewString(), uuid.NewString()
+	image := "example.invalid/image@sha256:" + fmt.Sprintf("%064d", 0)
+	_, err := pool.Exec(ctx, `
+		INSERT INTO workloads (workload_id, request_id, request_hash, definition, image, state,
+		                        provider_id, lease_id, container_id, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, reserved_ingress_mbps, reserved_egress_mbps)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,nextval('workload_lease_id_seq'),'container',$8,$9,$10,$11,$12)`,
+		workloadID, requestID, make([]byte, 32), []byte{1}, image, state, provider, cpuMilli, ramMB, storageGB, ingressMbps, egressMbps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,5 +294,110 @@ func TestAssignLeaseConcurrentRaceNeverOvercommits(t *testing.T) {
 	}
 	if totalCPU > capacity.TotalCPUMillicores {
 		t.Fatalf("overcommitted: reserved %d millicores against a %d ceiling", totalCPU, capacity.TotalCPUMillicores)
+	}
+}
+
+func TestAssignLeaseRejectsWhenBandwidthCapacityIsAlreadyClaimed(t *testing.T) {
+	ctx, pool := newCapacityTestPool(t)
+	repository := workloadapi.NewPostgresRepository(pool)
+
+	// provider-a's egress total is 100 Mbps; 80 already committed via an
+	// open (RUNNING) workload, plenty of CPU/RAM/storage headroom left.
+	insertOpenWorkloadWithBandwidth(t, ctx, pool, "provider-a", "RUNNING", 500, 512, 5, 50, 80)
+	item := insertSchedulingWorkloadWithBandwidth(t, ctx, pool, 500, 512, 5, 50, 30) // would push egress to 110 > 100
+	capacity := workloadapi.ProviderCapacity{
+		TotalCPUMillicores: 4000, TotalRAMMB: 8192, TotalStorageGB: 100,
+		TotalIngressMbps: 200, TotalEgressMbps: 100,
+	}
+
+	_, err := repository.AssignLease(ctx, item, "provider-a", [32]byte{1}, capacity)
+	if !errors.Is(err, workloadapi.ErrCapacityExceeded) {
+		t.Fatalf("expected ErrCapacityExceeded for bandwidth overcommit, got %v", err)
+	}
+	stored, err := repository.Get(ctx, item.WorkloadID, item.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != "SCHEDULING" || stored.ProviderID != "" {
+		t.Fatalf("a rejected AssignLease must not mutate the row: %+v", stored)
+	}
+}
+
+func TestAssignLeaseSucceedsWithinBandwidthCapacityAndCommitsTheReservation(t *testing.T) {
+	ctx, pool := newCapacityTestPool(t)
+	repository := workloadapi.NewPostgresRepository(pool)
+
+	insertProvider(t, ctx, pool, "provider-a")
+	item := insertSchedulingWorkloadWithBandwidth(t, ctx, pool, 500, 512, 5, 50, 30)
+	capacity := workloadapi.ProviderCapacity{
+		TotalCPUMillicores: 4000, TotalRAMMB: 8192, TotalStorageGB: 100,
+		TotalIngressMbps: 200, TotalEgressMbps: 100,
+	}
+
+	if _, err := repository.AssignLease(ctx, item, "provider-a", [32]byte{1}, capacity); err != nil {
+		t.Fatalf("AssignLease: %v", err)
+	}
+	stored, err := repository.Get(ctx, item.WorkloadID, item.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ReservedIngressMbps != 50 || stored.ReservedEgressMbps != 30 {
+		t.Fatalf("bandwidth reservation not persisted: %+v", stored)
+	}
+}
+
+// TestAssignLeaseConcurrentBandwidthRaceNeverOvercommits mirrors
+// TestAssignLeaseConcurrentRaceNeverOvercommits but for bandwidth: two
+// workloads each individually fit provider-a's declared egress capacity,
+// but their combined demand does not.
+func TestAssignLeaseConcurrentBandwidthRaceNeverOvercommits(t *testing.T) {
+	ctx, pool := newCapacityTestPool(t)
+	repository := workloadapi.NewPostgresRepository(pool)
+
+	insertProvider(t, ctx, pool, "provider-a")
+	capacity := workloadapi.ProviderCapacity{
+		TotalCPUMillicores: 8000, TotalRAMMB: 16384, TotalStorageGB: 200,
+		TotalIngressMbps: 200, TotalEgressMbps: 100,
+	}
+	itemA := insertSchedulingWorkloadWithBandwidth(t, ctx, pool, 500, 512, 5, 50, 70)
+	itemB := insertSchedulingWorkloadWithBandwidth(t, ctx, pool, 500, 512, 5, 50, 70)
+
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	for _, item := range []workloadapi.Workload{itemA, itemB} {
+		wg.Add(1)
+		go func(w workloadapi.Workload) {
+			defer wg.Done()
+			_, err := repository.AssignLease(ctx, w, "provider-a", [32]byte{1}, capacity)
+			results <- err
+		}(item)
+	}
+	wg.Wait()
+	close(results)
+
+	successes, rejections := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, workloadapi.ErrCapacityExceeded), errors.Is(err, workloadapi.ErrConflict):
+			rejections++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if successes != 1 || rejections != 1 {
+		t.Fatalf("expected exactly one winner and one rejection under a real race, got successes=%d rejections=%d", successes, rejections)
+	}
+
+	var totalEgress int64
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(reserved_egress_mbps), 0) FROM workloads
+		WHERE provider_id = 'provider-a' AND state IN ('LEASE_PENDING','LEASED','DEPLOYING','RUNNING')`,
+	).Scan(&totalEgress); err != nil {
+		t.Fatal(err)
+	}
+	if totalEgress > capacity.TotalEgressMbps {
+		t.Fatalf("overcommitted: reserved %d Mbps egress against a %d Mbps ceiling", totalEgress, capacity.TotalEgressMbps)
 	}
 }

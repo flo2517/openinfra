@@ -95,6 +95,15 @@ type Candidate struct {
 	CPUAvailableCores, CPUTotalCores   float32
 	RAMAvailableMB, RAMTotalMB         int64
 	StorageAvailableGB, StorageTotalGB int64
+	// IngressTotalMbps/EgressTotalMbps are the provider's declared
+	// bandwidth capacity (0 if not operator-configured; see agent-core's
+	// AgentSettings). Unlike CPU/RAM/storage there is no live "available"
+	// bandwidth signal on the wire (ResourceCapability.Bandwidth carries
+	// only a declared ceiling, not a currently-in-use figure), so fit
+	// scoring uses the total as its own "available" -- an honest
+	// reflection of what the system actually knows, not an invented
+	// live-usage number.
+	IngressTotalMbps, EgressTotalMbps int64
 
 	// Reputation is ignored (treated as DefaultReputationScore in every
 	// dimension, matching pallet-reputation's own default_vector) when
@@ -216,7 +225,27 @@ func (r *Ranker) scoreOne(
 	if !ok {
 		return Score{}, true, "insufficient storage"
 	}
-	resourceFitBps := (cpuFitBps + ramFitBps + storageFitBps) / 3
+	// Bandwidth only enters the average when the workload actually
+	// requested it: requirements.Bandwidth is a new, optional field that
+	// no existing caller populates yet, so unconditionally folding a
+	// trivial "always satisfied" 10_000 term into every score (diluting
+	// the divisor from 3 to 4 for workloads that never asked for
+	// bandwidth) would silently change every other profile's scoring.
+	resourceFitCount := uint32(3)
+	var bandwidthFitBps uint32
+	if bandwidth := requirements.Bandwidth; bandwidth != nil && (bandwidth.IngressMbps > 0 || bandwidth.EgressMbps > 0) {
+		ingressFitBps, ok := fitBps(candidate.IngressTotalMbps, int64(bandwidth.IngressMbps))
+		if !ok {
+			return Score{}, true, "insufficient ingress bandwidth"
+		}
+		egressFitBps, ok := fitBps(candidate.EgressTotalMbps, int64(bandwidth.EgressMbps))
+		if !ok {
+			return Score{}, true, "insufficient egress bandwidth"
+		}
+		bandwidthFitBps = (ingressFitBps + egressFitBps) / 2
+		resourceFitCount++
+	}
+	resourceFitBps := (cpuFitBps + ramFitBps + storageFitBps + bandwidthFitBps) / resourceFitCount
 
 	reputation := candidate.Reputation
 	if !candidate.HasReputation {

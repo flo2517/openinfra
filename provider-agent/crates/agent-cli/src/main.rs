@@ -154,7 +154,7 @@ async fn handle_join(dev: bool) -> Result<()> {
     let mut config = load_config()?;
     let identity = Ed25519IdentityManager::new(config.security.key_path.clone())?;
     let public_key = hex::decode(identity.get_public_key().await?)?;
-    let inventory = InventoryManager::new().get_inventory()?;
+    let inventory = InventoryManager::new().get_inventory(&config.executor.state_path)?;
     let channel = connect_control_plane(&config.control_plane.endpoint, dev).await?;
     let mut client =
         controlplanev1::control_plane_service_client::ControlPlaneServiceClient::new(channel);
@@ -178,13 +178,7 @@ async fn handle_join(dev: bool) -> Result<()> {
         request_id: Uuid::new_v4().to_string(),
         challenge_id: challenge.challenge_id,
         challenge_signature: signature,
-        capabilities: Some(sharedv1::ResourceCapability {
-            cpu_total: inventory.cpu_cores,
-            cpu_available: inventory.cpu_cores,
-            ram_total_mb: inventory.total_memory_mb,
-            ram_available_mb: inventory.available_memory_mb,
-            ..Default::default()
-        }),
+        capabilities: Some(resource_capability(&config, &inventory)),
     });
     // Registration may span multiple manually sealed blocks before finality.
     complete_request.set_timeout(Duration::from_secs(30));
@@ -216,7 +210,7 @@ async fn report_heartbeat_with_state(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("provider is not joined; run join first"))?;
     let identity = Ed25519IdentityManager::new(config.security.key_path.clone())?;
-    let inventory = InventoryManager::new().get_inventory()?;
+    let inventory = InventoryManager::new().get_inventory(&config.executor.state_path)?;
     let sequence = state.next_heartbeat_sequence()?;
     let observed_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     let payload = controlplanev1::HeartbeatSigningPayload {
@@ -227,13 +221,7 @@ async fn report_heartbeat_with_state(
             seconds: observed_at.as_secs().try_into()?,
             nanos: observed_at.subsec_nanos().try_into()?,
         }),
-        capabilities: Some(sharedv1::ResourceCapability {
-            cpu_total: inventory.cpu_cores,
-            cpu_available: inventory.cpu_cores,
-            ram_total_mb: inventory.total_memory_mb,
-            ram_available_mb: inventory.available_memory_mb,
-            ..Default::default()
-        }),
+        capabilities: Some(resource_capability(config, &inventory)),
     };
     let mut signed = Vec::with_capacity(HEARTBEAT_DOMAIN.len() + payload.encoded_len());
     signed.extend_from_slice(HEARTBEAT_DOMAIN);
@@ -254,6 +242,38 @@ async fn report_heartbeat_with_state(
     info!(%provider_id, sequence, "heartbeat accepted");
     println!("Provider ACTIVE: {provider_id} (heartbeat {sequence})");
     Ok(())
+}
+
+/// Builds the ResourceCapability reported on both CompleteJoin and every
+/// ReportHeartbeat, so the two call sites can't drift out of sync with
+/// each other. cpu/ram/storage come from InventoryManager's live OS
+/// reads; bandwidth is the operator-declared config value (see
+/// AgentSettings::bandwidth_ingress_mbps's doc comment for why bandwidth
+/// isn't auto-detected the same way).
+fn resource_capability(
+    config: &AgentConfig,
+    inventory: &agent_inventory::SystemResources,
+) -> sharedv1::ResourceCapability {
+    let bandwidth =
+        if config.agent.bandwidth_ingress_mbps > 0 || config.agent.bandwidth_egress_mbps > 0 {
+            Some(sharedv1::Bandwidth {
+                ingress_mbps: config.agent.bandwidth_ingress_mbps,
+                egress_mbps: config.agent.bandwidth_egress_mbps,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+    sharedv1::ResourceCapability {
+        cpu_total: inventory.cpu_cores,
+        cpu_available: inventory.cpu_cores,
+        ram_total_mb: inventory.total_memory_mb,
+        ram_available_mb: inventory.available_memory_mb,
+        storage_total_gb: inventory.total_storage_gb,
+        storage_available_gb: inventory.available_storage_gb,
+        bandwidth,
+        ..Default::default()
+    }
 }
 
 fn load_config() -> Result<AgentConfig> {
