@@ -164,6 +164,9 @@ impl pallet_provider_registry::Config for Runtime {
 
 impl pallet_resource_market::Config for Runtime {
     type ProviderRegistry = ProviderRegistry;
+    // Same delegation as pallet_provider_registry::RegistrationOrigin
+    // above: the Control Plane bridge publishes on a provider's behalf.
+    type AnnounceOrigin = frame_system::EnsureRoot<Self::AccountId>;
     type MaxCapabilitiesLen = MaxCapabilitiesLen;
     type WeightInfo = ();
 }
