@@ -18,7 +18,7 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 }
 
 func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload) (Workload, error) {
-	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, request_hash, definition, image, state, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt)
+	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, request_hash, definition, image, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB)
 	if err != nil {
 		return Workload{}, err
 	}
@@ -153,13 +153,74 @@ func (r *PostgresRepository) BeginScheduling(ctx context.Context, item Workload)
 	return nil
 }
 
-func (r *PostgresRepository) AssignLease(ctx context.Context, item Workload, providerID string, resourceHash [32]byte) (uint64, error) {
-	var leaseID uint64
-	err := r.pool.QueryRow(ctx, `UPDATE workloads SET state='LEASE_PENDING', provider_id=$2, lease_id=nextval('workload_lease_id_seq'), resource_hash=$3, version=version+1, updated_at=now(),worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='SCHEDULING' AND version=$4 AND worker_id=$5 AND worker_lease_until>now() RETURNING lease_id`, item.WorkloadID, providerID, resourceHash[:], item.Version, item.WorkerID).Scan(&leaseID)
+// AssignLease commits this workload to providerID, but only if the
+// provider's declared total capacity (capacity, from its latest heartbeat
+// -- stable hardware facts, not the live "available" figure that only
+// lives in Redis) still has headroom over every other open workload
+// already assigned to it. The check and the commit happen in one
+// Serializable transaction: two concurrent AssignLease calls racing to
+// fill the same provider's last slot will not both read "capacity still
+// free" before either commits -- Postgres aborts the loser with a
+// serialization failure, surfaced here as ErrConflict so the worker
+// retries the whole scheduling step (a different, or by-then-recovered,
+// provider may be chosen next attempt).
+//
+// This is deliberately a hard ceiling against declared total capacity,
+// not an attempt to reconcile with Redis's live "available" number --
+// Postgres is the only store this transaction can make atomic guarantees
+// about (AGENTS.md: PostgreSQL is authoritative off-chain, Redis is
+// reconstructible), and mixing an eventually-consistent Redis read into
+// an atomicity argument would not actually prevent overcommit, only look
+// like it did.
+func (r *PostgresRepository) AssignLease(ctx context.Context, item Workload, providerID string, resourceHash [32]byte, capacity ProviderCapacity) (leaseID uint64, err error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	var reservedCPU, reservedRAM, reservedStorage int64
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(reserved_cpu_millicores), 0), COALESCE(SUM(reserved_ram_mb), 0), COALESCE(SUM(reserved_storage_gb), 0)
+		FROM workloads
+		WHERE provider_id = $1 AND state IN ('LEASE_PENDING', 'LEASED', 'DEPLOYING', 'RUNNING')`,
+		providerID,
+	).Scan(&reservedCPU, &reservedRAM, &reservedStorage)
+	if err != nil {
+		return 0, err
+	}
+	if reservedCPU+item.ReservedCPUMillicores > capacity.TotalCPUMillicores ||
+		reservedRAM+item.ReservedRAMMB > capacity.TotalRAMMB ||
+		reservedStorage+item.ReservedStorageGB > capacity.TotalStorageGB {
+		return 0, ErrCapacityExceeded
+	}
+
+	err = tx.QueryRow(ctx, `
+		UPDATE workloads
+		SET state='LEASE_PENDING', provider_id=$2, lease_id=nextval('workload_lease_id_seq'), resource_hash=$3,
+		    version=version+1, updated_at=now(), worker_id=NULL, worker_lease_until=NULL
+		WHERE workload_id=$1 AND state='SCHEDULING' AND version=$4 AND worker_id=$5 AND worker_lease_until>now()
+		RETURNING lease_id`,
+		item.WorkloadID, providerID, resourceHash[:], item.Version, item.WorkerID,
+	).Scan(&leaseID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, ErrConflict
 	}
-	return leaseID, err
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "40001" { // serialization_failure
+			return 0, ErrConflict
+		}
+		return 0, err
+	}
+	return leaseID, nil
 }
 
 func (r *PostgresRepository) MarkLeased(ctx context.Context, item Workload, leaseID uint64) error {
@@ -187,9 +248,9 @@ func (r *PostgresRepository) RetryLater(ctx context.Context, item Workload, code
 	return nil
 }
 
-const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count`
+const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb`
 const selectWorkload = `SELECT ` + workloadColumns + ` FROM workloads`
-const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count`
+const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb`
 
 type scanner interface{ Scan(...any) error }
 
@@ -197,7 +258,7 @@ func scanWorkload(row scanner) (Workload, error) {
 	var w Workload
 	var hash, resourceHash []byte
 	var workerLeaseUntil *time.Time
-	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount)
+	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Workload{}, ErrNotFound
 	}

@@ -1,0 +1,313 @@
+// Package scheduler ranks schedulable providers for a workload
+// deterministically: same inputs always produce the same ordering, on any
+// machine, so a placement decision can be replayed and audited (issue
+// #11). All ranking arithmetic is integer basis points (0..10_000); no
+// float ever participates in a score comparison, even though some inputs
+// (CPU cores, from ResourceCapability on the wire) arrive as float32 --
+// they are converted to integer millicores at the boundary, the same
+// conversion workloadapi.CPUCoresToMillicores already uses for capacity
+// reservation, before any ranking math touches them.
+package scheduler
+
+import (
+	"sort"
+
+	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
+)
+
+// ReputationVector mirrors pallet-reputation's on-chain vector exactly:
+// u32 scores on a 0..MaxReputationScore scale, never a float. The wire
+// protocol's *sharedv1.ReputationVector (float32 fields) is a legacy/
+// display format; this is the scheduler's native type, populated from a
+// real chain read (see blockchainbridge.ReputationVector).
+type ReputationVector struct {
+	Compute, Storage, Network, Availability, Reliability uint32
+}
+
+// ProfileWeights are fixed-point basis-point weights applied to one
+// workload profile's score. ResourceBps and ReputationBps must sum to
+// 10_000; ComputeBps..ReliabilityBps (the weights within the reputation
+// vector) must also sum to 10_000. Documented per profile below rather
+// than tuned at runtime, so a placement decision's weights are always the
+// ones committed to source control.
+type ProfileWeights struct {
+	ResourceBps   uint32
+	ReputationBps uint32
+
+	ComputeBps      uint32
+	StorageBps      uint32
+	NetworkBps      uint32
+	AvailabilityBps uint32
+	ReliabilityBps  uint32
+}
+
+// DefaultProfileWeights: each profile leans on resource fit and its named
+// dimension, with Availability always present since a provider that is
+// unreachable is worthless regardless of profile. Chosen to be legible
+// and easy to argue with, not derived from measurement -- there is no
+// placement history yet to tune against.
+var DefaultProfileWeights = map[sharedv1.WorkloadProfile]ProfileWeights{
+	sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE: {
+		ResourceBps: 6000, ReputationBps: 4000,
+		ComputeBps: 5000, StorageBps: 500, NetworkBps: 500, AvailabilityBps: 3000, ReliabilityBps: 1000,
+	},
+	sharedv1.WorkloadProfile_WORKLOAD_PROFILE_MEMORY_INTENSIVE: {
+		ResourceBps: 6000, ReputationBps: 4000,
+		ComputeBps: 2000, StorageBps: 1000, NetworkBps: 500, AvailabilityBps: 3500, ReliabilityBps: 3000,
+	},
+	sharedv1.WorkloadProfile_WORKLOAD_PROFILE_STORAGE_INTENSIVE: {
+		ResourceBps: 6000, ReputationBps: 4000,
+		ComputeBps: 500, StorageBps: 5000, NetworkBps: 500, AvailabilityBps: 3000, ReliabilityBps: 1000,
+	},
+	sharedv1.WorkloadProfile_WORKLOAD_PROFILE_LATENCY_SENSITIVE: {
+		ResourceBps: 5000, ReputationBps: 5000,
+		ComputeBps: 1000, StorageBps: 500, NetworkBps: 5000, AvailabilityBps: 2500, ReliabilityBps: 1000,
+	},
+}
+
+// DefaultMaxReputationScore and DefaultDefaultReputationScore match
+// blockchain/runtime/src/lib.rs's MaxReputation/DefaultReputation
+// parameter_types! as of ADR-011. Passed explicitly at NewRanker's call
+// site rather than hard-coded inside it, so a future runtime parameter
+// change is one grep away from being caught here instead of silently
+// making every ranking pass wrong.
+const (
+	DefaultMaxReputationScore     = 1000
+	DefaultDefaultReputationScore = 500
+)
+
+// fallbackWeights applies when a profile has no entry above (defensively
+// -- callers upstream already reject WORKLOAD_PROFILE_UNSPECIFIED, but a
+// future profile value added to the enum without a matching entry here
+// must still rank sanely, not divide by an unweighted zero).
+var fallbackWeights = ProfileWeights{
+	ResourceBps: 5000, ReputationBps: 5000,
+	ComputeBps: 2000, StorageBps: 2000, NetworkBps: 2000, AvailabilityBps: 2500, ReliabilityBps: 1500,
+}
+
+// Candidate is everything the ranker needs about one schedulable
+// provider. Callers (worker.go) build this from agentmanager's live
+// heartbeat data plus a chain-sourced reputation read.
+type Candidate struct {
+	ProviderID    string
+	AgentEndpoint string
+
+	CPUAvailableCores, CPUTotalCores   float32
+	RAMAvailableMB, RAMTotalMB         int64
+	StorageAvailableGB, StorageTotalGB int64
+
+	// Reputation is ignored (treated as DefaultReputationScore in every
+	// dimension, matching pallet-reputation's own default_vector) when
+	// HasReputation is false -- a provider with no on-chain record yet is
+	// not the same as one with a proven-bad one, so it must not be
+	// scored as zero.
+	Reputation    ReputationVector
+	HasReputation bool
+}
+
+// Score is one candidate's fully-computed, auditable result.
+type Score struct {
+	ProviderID                    string
+	TotalBps                      uint32
+	ResourceFitBps, ReputationBps uint32
+}
+
+// Exclusion explains why a candidate never became a Score. Reason is a
+// stable, human-readable string safe to log or return to an operator --
+// never a certificate, key, or endpoint.
+type Exclusion struct {
+	ProviderID string
+	Reason     string
+}
+
+// Decision is the full, explainable result of one ranking pass: enough to
+// reconstruct why a specific provider won, and why every other candidate
+// did not (issue #11's "explain placement decisions" criterion).
+type Decision struct {
+	Selected *Score
+	Ranked   []Score // all scored candidates, best first, ties broken by ProviderID
+	Excluded []Exclusion
+}
+
+// Ranker holds the (small, fixed) configuration ranking needs beyond the
+// per-call inputs.
+type Ranker struct {
+	Weights                map[sharedv1.WorkloadProfile]ProfileWeights
+	MaxReputationScore     uint32
+	DefaultReputationScore uint32
+}
+
+// NewRanker returns a Ranker using DefaultProfileWeights and the same
+// MaxReputation/DefaultReputation the runtime uses
+// (blockchain/runtime/src/lib.rs: MaxReputation=1000, DefaultReputation=500)
+// -- kept as constructor parameters rather than hard-coded constants
+// because if the runtime's parameter_types! ever change, this must be
+// updated to match, and a constructor argument makes that dependency
+// visible at every call site instead of silently drifting.
+func NewRanker(maxReputationScore, defaultReputationScore uint32) *Ranker {
+	return &Ranker{Weights: DefaultProfileWeights, MaxReputationScore: maxReputationScore, DefaultReputationScore: defaultReputationScore}
+}
+
+// Rank scores every candidate against requirements/constraints for
+// profile, excluding anything stale, incompatible, or insufficient
+// (staleness/liveness is expected to already be filtered by the caller's
+// provider directory -- ListSchedulableProviders -- but a missing
+// endpoint or nil-equivalent capability is re-checked defensively here
+// since this package must not trust its caller blindly).
+func (r *Ranker) Rank(
+	profile sharedv1.WorkloadProfile,
+	requirements *sharedv1.ResourceRequirements,
+	constraints *sharedv1.WorkloadConstraints,
+	candidates []Candidate,
+) Decision {
+	weights, ok := r.Weights[profile]
+	if !ok {
+		weights = fallbackWeights
+	}
+
+	var decision Decision
+	for _, candidate := range candidates {
+		score, excluded, reason := r.scoreOne(weights, requirements, constraints, candidate)
+		if excluded {
+			decision.Excluded = append(decision.Excluded, Exclusion{ProviderID: candidate.ProviderID, Reason: reason})
+			continue
+		}
+		decision.Ranked = append(decision.Ranked, score)
+	}
+
+	sort.Slice(decision.Ranked, func(i, j int) bool {
+		if decision.Ranked[i].TotalBps != decision.Ranked[j].TotalBps {
+			return decision.Ranked[i].TotalBps > decision.Ranked[j].TotalBps
+		}
+		// Deterministic tie-break: lexicographic ProviderID. Not a
+		// meaningful preference by itself, but it must be *some* total
+		// order so two runs over the same input never disagree.
+		return decision.Ranked[i].ProviderID < decision.Ranked[j].ProviderID
+	})
+	if len(decision.Ranked) > 0 {
+		selected := decision.Ranked[0]
+		decision.Selected = &selected
+	}
+	return decision
+}
+
+func (r *Ranker) scoreOne(
+	weights ProfileWeights,
+	requirements *sharedv1.ResourceRequirements,
+	constraints *sharedv1.WorkloadConstraints,
+	candidate Candidate,
+) (score Score, excluded bool, reason string) {
+	if candidate.AgentEndpoint == "" {
+		return Score{}, true, "no advertised agent endpoint"
+	}
+	if requirements == nil {
+		return Score{}, true, "workload has no resource requirements"
+	}
+
+	cpuFitBps, ok := fitBps(cpuMillicores(candidate.CPUAvailableCores), cpuMillicores(requirements.Cpu))
+	if !ok {
+		return Score{}, true, "insufficient CPU"
+	}
+	ramFitBps, ok := fitBps(candidate.RAMAvailableMB, requirements.RamMb)
+	if !ok {
+		return Score{}, true, "insufficient RAM"
+	}
+	storageFitBps, ok := fitBps(candidate.StorageAvailableGB, requirements.StorageGb)
+	if !ok {
+		return Score{}, true, "insufficient storage"
+	}
+	resourceFitBps := (cpuFitBps + ramFitBps + storageFitBps) / 3
+
+	reputation := candidate.Reputation
+	if !candidate.HasReputation {
+		reputation = ReputationVector{
+			Compute: r.DefaultReputationScore, Storage: r.DefaultReputationScore, Network: r.DefaultReputationScore,
+			Availability: r.DefaultReputationScore, Reliability: r.DefaultReputationScore,
+		}
+	}
+	reputationBps := weightedReputationBps(weights, reputation, r.MaxReputationScore)
+
+	if constraints != nil && constraints.MinReputation > 0 {
+		// Documented convention: min_reputation is on the same
+		// 0..MaxReputationScore scale as the on-chain vector (matching
+		// DefaultReputation/MaxReputation in blockchain/runtime), not
+		// 0..1 -- there is no other established convention for this
+		// field anywhere else in the codebase to defer to.
+		if globalBps(reputation, r.MaxReputationScore) < uint32(constraints.MinReputation)*10_000/r.MaxReputationScore {
+			return Score{}, true, "below workload's minimum reputation constraint"
+		}
+	}
+	// constraints.MaxLatencyMs and constraints.MaxPrice are accepted but
+	// not enforced: this system has no latency measurement or pricing
+	// signal anywhere yet (no caller populates either), and inventing a
+	// number to compare against would be worse than the honest gap. They
+	// are wired through the constructor and this comment specifically so
+	// the next person adding either signal has one place to look.
+
+	totalBps := (resourceFitBps*weights.ResourceBps + reputationBps*weights.ReputationBps) / 10_000
+	return Score{
+		ProviderID:     candidate.ProviderID,
+		TotalBps:       totalBps,
+		ResourceFitBps: resourceFitBps,
+		ReputationBps:  reputationBps,
+	}, false, ""
+}
+
+// weightedReputationBps folds the vector's five dimensions into one
+// basis-point score (0..10_000) for this profile's weights, then
+// globalBps folds them unweighted (equal parts) for the min_reputation
+// constraint check -- deliberately not the same formula, since a
+// constraint is a floor on general standing, not on fitness for this one
+// profile.
+func weightedReputationBps(weights ProfileWeights, vector ReputationVector, maxScore uint32) uint32 {
+	if maxScore == 0 {
+		return 0
+	}
+	// weights.* sum to 10_000 and each vector.* is in [0, maxScore], so
+	// sum's maximum is 10_000*maxScore; dividing by maxScore scales the
+	// result back to a plain 0..10_000 basis-point score.
+	sum := uint64(weights.ComputeBps)*uint64(vector.Compute) +
+		uint64(weights.StorageBps)*uint64(vector.Storage) +
+		uint64(weights.NetworkBps)*uint64(vector.Network) +
+		uint64(weights.AvailabilityBps)*uint64(vector.Availability) +
+		uint64(weights.ReliabilityBps)*uint64(vector.Reliability)
+	return uint32(sum / uint64(maxScore))
+}
+
+func globalBps(vector ReputationVector, maxScore uint32) uint32 {
+	if maxScore == 0 {
+		return 0
+	}
+	average := (uint64(vector.Compute) + uint64(vector.Storage) + uint64(vector.Network) + uint64(vector.Availability) + uint64(vector.Reliability)) / 5
+	return uint32(average * 10_000 / uint64(maxScore))
+}
+
+// fitBps returns how well available covers required, clamped to
+// 10_000 (i.e. covering the requirement fully or more scores the same as
+// covering it exactly -- extra headroom beyond what was asked for is not
+// rewarded). ok is false when required > 0 and available cannot cover it;
+// a zero requirement is always satisfied and scores full marks.
+func fitBps(available, required int64) (bps uint32, ok bool) {
+	if required <= 0 {
+		return 10_000, true
+	}
+	if available < required {
+		return 0, false
+	}
+	ratio := available * 10_000 / required
+	if ratio > 10_000 {
+		ratio = 10_000
+	}
+	return uint32(ratio), true
+}
+
+// cpuMillicores converts a float32 core count (as received on the wire in
+// ResourceCapability/ResourceRequirements) to integer millicores, the
+// same conversion workloadapi.CPUCoresToMillicores performs for capacity
+// reservation, so a CPU comparison never depends on float precision.
+func cpuMillicores(cores float32) int64 {
+	if cores < 0 {
+		return 0
+	}
+	return int64(cores*1000 + 0.5)
+}

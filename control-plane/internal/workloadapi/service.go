@@ -20,7 +20,13 @@ import (
 var (
 	ErrNotFound = errors.New("workload not found")
 	ErrConflict = errors.New("workload idempotency conflict")
-	digestImage = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9._-]+)?@sha256:[a-f0-9]{64}$`)
+	// ErrCapacityExceeded means the chosen provider's declared total
+	// capacity is already fully claimed by other open workloads at the
+	// moment of commit. Distinct from ErrConflict (an optimistic-lock or
+	// idempotency mismatch) so callers can retry against a different
+	// provider rather than treating it as a stale-read bug.
+	ErrCapacityExceeded = errors.New("provider capacity exceeded")
+	digestImage         = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9._-]+)?@sha256:[a-f0-9]{64}$`)
 )
 
 type Workload struct {
@@ -35,6 +41,29 @@ type Workload struct {
 	WorkerLeaseUntil                            time.Time
 	Version                                     int64
 	AttemptCount                                int
+	// ReservedCPUMillicores/RAMMB/StorageGB are this workload's claim on
+	// its eventual provider's declared total capacity, fixed at creation
+	// time from validated ResourceRequirements. See migration 000008.
+	ReservedCPUMillicores            int64
+	ReservedRAMMB, ReservedStorageGB int64
+}
+
+// ProviderCapacity is a provider's declared total capacity, used as the
+// hard ceiling AssignLease checks reservations against -- not its live
+// "available" figure, which lives only in Redis (reconstructible, not
+// authoritative for an atomic Postgres check; see AssignLease's doc
+// comment in postgres.go for the reasoning).
+type ProviderCapacity struct {
+	TotalCPUMillicores         int64
+	TotalRAMMB, TotalStorageGB int64
+}
+
+// CPUCoresToMillicores converts a validated ResourceCapability/
+// ResourceRequirements CPU float (already checked positive, finite) into
+// an integer millicore count, so the reservation ledger never depends on
+// floating-point comparisons.
+func CPUCoresToMillicores(cores float32) int64 {
+	return int64(math.Round(float64(cores) * 1000))
 }
 
 type Repository interface {
@@ -58,7 +87,20 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	now := s.now().UTC()
-	stored, err := s.repository.CreateOrGet(ctx, Workload{WorkloadID: request.Definition.WorkloadId, RequestID: request.RequestId, RequestHash: requestHash, Definition: definitionBytes, Image: request.Image, State: "REQUESTED", CreatedAt: now, UpdatedAt: now})
+	requirements := request.Definition.Requirements
+	stored, err := s.repository.CreateOrGet(ctx, Workload{
+		WorkloadID:            request.Definition.WorkloadId,
+		RequestID:             request.RequestId,
+		RequestHash:           requestHash,
+		Definition:            definitionBytes,
+		Image:                 request.Image,
+		State:                 "REQUESTED",
+		CreatedAt:             now,
+		UpdatedAt:             now,
+		ReservedCPUMillicores: CPUCoresToMillicores(requirements.Cpu),
+		ReservedRAMMB:         requirements.RamMb,
+		ReservedStorageGB:     requirements.StorageGb,
+	})
 	if err != nil {
 		return nil, repositoryError(err)
 	}

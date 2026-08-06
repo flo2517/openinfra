@@ -12,16 +12,27 @@ import (
 	"github.com/google/uuid"
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/scheduler"
 	"github.com/openinfra/network/internal/workloadapi"
 	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"google.golang.org/protobuf/proto"
 )
 
+// ReputationSource reads a provider's on-chain reputation vector by its
+// raw 32-byte account (not the sha256-derived provider_id used in
+// Postgres/dashboard). Optional: SetReputationSource may be left unset,
+// in which case every candidate ranks with the ranker's default
+// reputation score -- degraded (no signal), never a hard failure, since
+// a chain RPC hiccup must not stall scheduling.
+type ReputationSource interface {
+	LatestReputationVector(ctx context.Context, provider [32]byte) (blockchainbridge.ReputationVector, bool, error)
+}
+
 type PersistentStore interface {
 	ClaimNext(context.Context, string, time.Duration) (workloadapi.Workload, error)
 	BeginScheduling(context.Context, workloadapi.Workload) error
-	AssignLease(context.Context, workloadapi.Workload, string, [32]byte) (uint64, error)
+	AssignLease(context.Context, workloadapi.Workload, string, [32]byte, workloadapi.ProviderCapacity) (uint64, error)
 	MarkLeased(context.Context, workloadapi.Workload, uint64) error
 	RetryLater(context.Context, workloadapi.Workload, string, string, time.Duration) error
 	MarkDeploying(context.Context, workloadapi.Workload, uint64) error
@@ -60,19 +71,29 @@ type Worker struct {
 	leases              LeaseRegistrar
 	dispatcher          AgentDispatcher
 	overlay             OverlayManager
+	ranker              *scheduler.Ranker
+	reputation          ReputationSource
 	interval, blockTime time.Duration
 	workerID            string
 	claimDuration       time.Duration
 }
 
-func NewWorker(store PersistentStore, directory ProviderDirectory, leases LeaseRegistrar, dispatcher AgentDispatcher) *Worker {
-	return &Worker{store: store, directory: directory, leases: leases, dispatcher: dispatcher, interval: time.Second, blockTime: 3 * time.Second, workerID: uuid.NewString(), claimDuration: 2 * time.Minute}
+// NewWorker's ranker is required, not a setter-configured optional like
+// overlay/reputation: there is no reasonable degraded mode for "how do we
+// rank providers at all" the way there is for "we have no live reputation
+// signal" or "no WireGuard overlay in this environment".
+func NewWorker(store PersistentStore, directory ProviderDirectory, leases LeaseRegistrar, dispatcher AgentDispatcher, ranker *scheduler.Ranker) *Worker {
+	return &Worker{store: store, directory: directory, leases: leases, dispatcher: dispatcher, ranker: ranker, interval: time.Second, blockTime: 3 * time.Second, workerID: uuid.NewString(), claimDuration: 2 * time.Minute}
 }
 
 // SetOverlay enables the optional WireGuard overlay. It is intentionally a
 // setter to keep existing worker tests and deployments that lack CAP_NET_ADMIN
 // fully functional; production deployments configure it explicitly.
 func (w *Worker) SetOverlay(overlay OverlayManager) { w.overlay = overlay }
+
+// SetReputationSource enables real on-chain reputation-aware ranking. See
+// ReputationSource's doc comment for the degraded-mode behavior when unset.
+func (w *Worker) SetReputationSource(reputation ReputationSource) { w.reputation = reputation }
 func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -104,11 +125,21 @@ func (w *Worker) processOne(ctx context.Context) error {
 		if err != nil {
 			return w.retry(ctx, item, "DIRECTORY_UNAVAILABLE", err)
 		}
-		provider, err := selectProvider(providers, definition.Requirements)
-		if err != nil {
+		candidates, capacities := w.rankableCandidates(ctx, providers)
+		decision := w.ranker.Rank(definition.Profile, definition.Requirements, definition.Constraints, candidates)
+		if decision.Selected == nil {
+			return w.retry(ctx, item, "NO_CAPACITY", fmt.Errorf("no eligible provider (%d candidates excluded)", len(decision.Excluded)))
+		}
+		_, err = w.store.AssignLease(ctx, item, decision.Selected.ProviderID, canonicalResourceHash(item.Definition, item.Image), capacities[decision.Selected.ProviderID])
+		if errors.Is(err, workloadapi.ErrCapacityExceeded) || errors.Is(err, workloadapi.ErrConflict) {
+			// The ranking snapshot is now known-stale (either this
+			// provider filled up between ranking and commit, or another
+			// worker won a concurrent race for the same row/provider).
+			// Retry promptly rather than waiting out the claim lease --
+			// a fresh ranking pass may pick a different provider, or the
+			// same one if it was just a transient race.
 			return w.retry(ctx, item, "NO_CAPACITY", err)
 		}
-		_, err = w.store.AssignLease(ctx, item, provider.ProviderID, canonicalResourceHash(item.Definition, item.Image))
 		return err
 	case "LEASE_PENDING":
 		leaseID, err := strconv.ParseUint(item.LeaseID, 10, 64)
@@ -232,17 +263,46 @@ func (w *Worker) provider(ctx context.Context, id string) (agentmanager.Schedula
 	}
 	return agentmanager.SchedulableProvider{}, errors.New("selected provider is no longer active with a fresh heartbeat")
 }
-func selectProvider(providers []agentmanager.SchedulableProvider, requirements *sharedv1.ResourceRequirements) (agentmanager.SchedulableProvider, error) {
-	if requirements == nil {
-		return agentmanager.SchedulableProvider{}, errors.New("requirements missing")
-	}
+
+// rankableCandidates converts live directory entries into scheduler.Candidate
+// (best-effort, live-data-driven ranking input) and a parallel map of
+// ProviderCapacity (each provider's declared total, the hard ceiling
+// AssignLease's atomic check enforces against -- see its doc comment in
+// workloadapi/postgres.go). Reputation is fetched per candidate when
+// w.reputation is configured; a read failure or missing record degrades
+// that one candidate to the ranker's default score rather than excluding
+// it or failing the whole scheduling attempt.
+func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanager.SchedulableProvider) ([]scheduler.Candidate, map[string]workloadapi.ProviderCapacity) {
+	candidates := make([]scheduler.Candidate, 0, len(providers))
+	capacities := make(map[string]workloadapi.ProviderCapacity, len(providers))
 	for _, p := range providers {
-		c := p.Capabilities
-		if p.AgentEndpoint != "" && c != nil && c.CpuAvailable >= requirements.Cpu && c.RamAvailableMb >= requirements.RamMb && c.StorageAvailableGb >= requirements.StorageGb {
-			return p, nil
+		candidate := scheduler.Candidate{ProviderID: p.ProviderID, AgentEndpoint: p.AgentEndpoint}
+		if c := p.Capabilities; c != nil {
+			candidate.CPUAvailableCores, candidate.CPUTotalCores = c.CpuAvailable, c.CpuTotal
+			candidate.RAMAvailableMB, candidate.RAMTotalMB = c.RamAvailableMb, c.RamTotalMb
+			candidate.StorageAvailableGB, candidate.StorageTotalGB = c.StorageAvailableGb, c.StorageTotalGb
+			capacities[p.ProviderID] = workloadapi.ProviderCapacity{
+				TotalCPUMillicores: workloadapi.CPUCoresToMillicores(c.CpuTotal),
+				TotalRAMMB:         c.RamTotalMb,
+				TotalStorageGB:     c.StorageTotalGb,
+			}
 		}
+		if w.reputation != nil && len(p.PublicKey) == 32 {
+			var key [32]byte
+			copy(key[:], p.PublicKey)
+			if vector, found, err := w.reputation.LatestReputationVector(ctx, key); err == nil {
+				candidate.Reputation = scheduler.ReputationVector{
+					Compute: vector.Compute, Storage: vector.Storage, Network: vector.Network,
+					Availability: vector.Availability, Reliability: vector.Reliability,
+				}
+				candidate.HasReputation = found
+			} else {
+				slog.Warn("reputation read failed; ranking with default score", "provider_id", p.ProviderID, "error", err)
+			}
+		}
+		candidates = append(candidates, candidate)
 	}
-	return agentmanager.SchedulableProvider{}, errors.New("no active provider has sufficient resources")
+	return candidates, capacities
 }
 func decodeDefinition(encoded []byte) (*sharedv1.WorkloadDefinition, error) {
 	var definition sharedv1.WorkloadDefinition
