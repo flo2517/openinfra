@@ -105,6 +105,15 @@ jobs:
     name: Blockchain / Substrate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # `cargo check`/`cargo test` never run the compiled node, so the real
+      # WASM runtime blob (a second, cross-compiled build of the whole
+      # runtime + pallet graph, plus a wasm-opt pass) is pure overhead here.
+      # WASM_BINARY is only read at runtime in chain_spec.rs, never at
+      # check/test time. Skipping it cuts both slow steps below
+      # significantly; a real WASM build still happens for release/dev
+      # artifacts outside CI.
+      SKIP_WASM_BUILD: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
