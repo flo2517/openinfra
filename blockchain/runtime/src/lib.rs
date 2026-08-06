@@ -87,6 +87,8 @@ mod runtime {
     pub type Rewards = pallet_openinfra_rewards::Pallet<Runtime>;
     #[runtime::pallet_index(15)]
     pub type Availability = pallet_availability::Pallet<Runtime>;
+    #[runtime::pallet_index(16)]
+    pub type NetworkValidator = pallet_network_validator::Pallet<Runtime>;
 }
 
 parameter_types! {
@@ -101,6 +103,8 @@ parameter_types! {
     pub const MaxProofAge: u32 = 1_000;
     pub const MaxRewardResourceUnits: u64 = 1_000_000_000;
     pub const MaxRewardDuration: u64 = 10_000_000;
+    pub const MinValidatorStake: u64 = 1_000;
+    pub const ValidatorUnbondingPeriod: u32 = 14_400; // ~1 day at 6s blocks
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -206,6 +210,17 @@ impl pallet_availability::Config for Runtime {
     type MaxChallengeLifetime = MaxChallengeLifetime;
     type MaxProofAge = MaxProofAge;
     type MaxProofSamples = frame::traits::ConstU32<10_000>;
+    type WeightInfo = ();
+}
+
+impl pallet_network_validator::Config for Runtime {
+    type Currency = Balances;
+    // Suspend/reinstate is root-gated for the MVP; a validator
+    // committee/governance origin is ADR-011 §5 follow-up work, not decided
+    // by this pallet yet.
+    type SuspensionOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    type MinStake = MinValidatorStake;
+    type UnbondingPeriod = ValidatorUnbondingPeriod;
     type WeightInfo = ();
 }
 
