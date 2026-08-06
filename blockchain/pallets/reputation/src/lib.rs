@@ -267,7 +267,78 @@ pub mod pallet {
         }
     }
 
+    /// One component of the reputation vector. Declared here (rather than
+    /// shared with the scoring pallet) so this pallet stays the single
+    /// owner of what a reputation dimension means; the runtime maps the
+    /// scoring pallet's own dimension enum onto this one.
+    #[derive(
+        Clone,
+        Copy,
+        Encode,
+        Decode,
+        DecodeWithMemTracking,
+        Eq,
+        MaxEncodedLen,
+        PartialEq,
+        Debug,
+        TypeInfo,
+    )]
+    pub enum VectorDimension {
+        Compute,
+        Storage,
+        Network,
+        Availability,
+        Reliability,
+    }
+
     impl<T: Config> Pallet<T> {
+        /// Set a single reputation dimension from an aggregated, integer
+        /// basis-points score (0..=10_000) and recompute the global score.
+        ///
+        /// Not an extrinsic: this is the internal entry point used by the
+        /// validator scoring pallet's round aggregation, so that
+        /// `pallet-reputation` remains the only writer of
+        /// `ReputationVectors` and keeps enforcing its own `MaxScore`
+        /// bound regardless of which pallet triggered the update
+        /// (ADR-011 §5).
+        pub fn set_dimension_score(
+            provider: &T::AccountId,
+            dimension: VectorDimension,
+            score_bps: u16,
+        ) -> DispatchResult {
+            ensure!(
+                T::ProviderInspector::is_registered(provider),
+                Error::<T>::ProviderNotRegistered
+            );
+            ensure!(score_bps <= 10_000, Error::<T>::AvailabilityOutOfBounds);
+            let score = u32::from(score_bps)
+                .checked_mul(T::MaxScore::get())
+                .ok_or(Error::<T>::VectorValueOutOfBounds)?
+                / 10_000;
+            let mut vector =
+                ReputationVectors::<T>::get(provider).unwrap_or_else(|| Self::default_vector());
+            match dimension {
+                VectorDimension::Compute => vector.compute = score,
+                VectorDimension::Storage => vector.storage = score,
+                VectorDimension::Network => vector.network = score,
+                VectorDimension::Availability => vector.availability = score,
+                VectorDimension::Reliability => vector.reliability = score,
+            }
+            vector.global = Self::global(&vector);
+            ReputationVectors::<T>::insert(provider, vector);
+            if matches!(dimension, VectorDimension::Availability) {
+                // Keep the legacy scalar score in step with the
+                // availability component, as submit_score/record_availability
+                // already do.
+                ReputationScores::<T>::insert(provider, score);
+            }
+            Self::deposit_event(Event::VectorUpdated {
+                provider: provider.clone(),
+                vector,
+            });
+            Ok(())
+        }
+
         fn default_vector() -> ReputationVector {
             let score = T::DefaultScore::get();
             ReputationVector {

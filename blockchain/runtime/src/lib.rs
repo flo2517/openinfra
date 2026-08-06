@@ -105,6 +105,11 @@ parameter_types! {
     pub const MaxRewardDuration: u64 = 10_000_000;
     pub const MinValidatorStake: u64 = 1_000;
     pub const ValidatorUnbondingPeriod: u32 = 14_400; // ~1 day at 6s blocks
+    pub const MaxValidatorSubmissionsPerRound: u32 = 32;
+    // Three independent submissions is the smallest committee where the
+    // trimmed mean can discard an outlier at both ends (ADR-011 §5).
+    pub const ValidatorMinQuorum: u32 = 3;
+    pub const ValidatorTargetCommitteeSize: u32 = 5;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -239,14 +244,43 @@ impl pallet_availability::Config for Runtime {
     type WeightInfo = ();
 }
 
+/// Applies closed-round aggregates to the reputation vector, mapping the
+/// scoring pallet's `ScoreDimension` onto `pallet-reputation`'s own
+/// `VectorDimension` so neither pallet depends on the other's types.
+pub struct ScoringReputationUpdater;
+impl pallet_network_validator::ReputationUpdater<interface::AccountId>
+    for ScoringReputationUpdater
+{
+    fn record_dimension_score(
+        provider: &interface::AccountId,
+        dimension: pallet_network_validator::ScoreDimension,
+        score_bps: u16,
+    ) -> frame::deps::sp_runtime::DispatchResult {
+        use pallet_network_validator::ScoreDimension;
+        use pallet_reputation::pallet::VectorDimension;
+        let mapped = match dimension {
+            ScoreDimension::Compute => VectorDimension::Compute,
+            ScoreDimension::Storage => VectorDimension::Storage,
+            ScoreDimension::Network => VectorDimension::Network,
+            ScoreDimension::Availability => VectorDimension::Availability,
+            ScoreDimension::Reliability => VectorDimension::Reliability,
+        };
+        pallet_reputation::Pallet::<Runtime>::set_dimension_score(provider, mapped, score_bps)
+    }
+}
+
 impl pallet_network_validator::Config for Runtime {
     type Currency = Balances;
+    type ReputationUpdater = ScoringReputationUpdater;
     // Suspend/reinstate is root-gated for the MVP; a validator
     // committee/governance origin is ADR-011 §5 follow-up work, not decided
     // by this pallet yet.
     type SuspensionOrigin = frame_system::EnsureRoot<Self::AccountId>;
     type MinStake = MinValidatorStake;
     type UnbondingPeriod = ValidatorUnbondingPeriod;
+    type MaxSubmissionsPerRound = MaxValidatorSubmissionsPerRound;
+    type MinQuorum = ValidatorMinQuorum;
+    type TargetCommitteeSize = ValidatorTargetCommitteeSize;
     type WeightInfo = ();
 }
 
