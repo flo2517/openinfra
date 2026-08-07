@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"math"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,23 +99,82 @@ type OfferSummary struct {
 }
 
 type Overview struct {
-	GeneratedAt    string     `json:"generated_at"`
-	ProvidersTotal int        `json:"providers_total"`
-	ProvidersFresh int        `json:"providers_fresh"`
-	CPUAvailable   float64    `json:"cpu_available"`
-	MemoryMB       int64      `json:"memory_available_mb"`
-	FinalizedBlock uint64     `json:"finalized_block"`
-	BestBlock      uint64     `json:"best_block"`
-	ChainSyncing   bool       `json:"chain_syncing"`
-	Partial        bool       `json:"partial"`
-	Errors         []string   `json:"errors,omitempty"`
-	Providers      []Provider `json:"providers"`
-	Workloads      []Workload `json:"workloads"`
+	GeneratedAt string `json:"generated_at"`
+	// ProvidersTotal/WorkloadsTotal are true row counts (a separate
+	// COUNT(*), not len(Providers)/len(Workloads)) -- #76's "pagination
+	// and bounded cardinality" item: before this, a caller had no way to
+	// tell "500 providers, all shown" apart from "500 providers, a page
+	// of an unknown larger total" other than guessing from the hardcoded
+	// LIMIT.
+	ProvidersTotal  int        `json:"providers_total"`
+	ProvidersLimit  int        `json:"providers_limit"`
+	ProvidersOffset int        `json:"providers_offset"`
+	ProvidersFresh  int        `json:"providers_fresh"`
+	WorkloadsTotal  int        `json:"workloads_total"`
+	WorkloadsLimit  int        `json:"workloads_limit"`
+	WorkloadsOffset int        `json:"workloads_offset"`
+	CPUAvailable    float64    `json:"cpu_available"`
+	MemoryMB        int64      `json:"memory_available_mb"`
+	FinalizedBlock  uint64     `json:"finalized_block"`
+	BestBlock       uint64     `json:"best_block"`
+	ChainSyncing    bool       `json:"chain_syncing"`
+	Partial         bool       `json:"partial"`
+	Errors          []string   `json:"errors,omitempty"`
+	Providers       []Provider `json:"providers"`
+	Workloads       []Workload `json:"workloads"`
 	// ValidatorsActive is -1 when the read failed, so a client can tell
 	// "no validators registered" (0) apart from "unavailable" (-1) --
 	// ADR-011 requires never reporting false success on a degraded read.
 	ValidatorsActive int      `json:"validators_active"`
 	Validators       []string `json:"validators,omitempty"`
+}
+
+// overviewPagination bounds /api/v1/overview's two independently
+// paginated collections. Defaults match this endpoint's pre-pagination
+// behavior exactly (LIMIT 500 / LIMIT 100, offset 0) so an existing
+// caller that never passes these query params sees no change.
+type overviewPagination struct {
+	ProvidersLimit, ProvidersOffset int
+	WorkloadsLimit, WorkloadsOffset int
+}
+
+const (
+	defaultProvidersLimit = 500
+	maxProvidersLimit     = 500
+	defaultWorkloadsLimit = 100
+	maxWorkloadsLimit     = 200
+)
+
+func parseOverviewPagination(r *http.Request) overviewPagination {
+	query := r.URL.Query()
+	return overviewPagination{
+		ProvidersLimit:  boundedQueryInt(query, "providers_limit", defaultProvidersLimit, 1, maxProvidersLimit),
+		ProvidersOffset: boundedQueryInt(query, "providers_offset", 0, 0, math.MaxInt32),
+		WorkloadsLimit:  boundedQueryInt(query, "workloads_limit", defaultWorkloadsLimit, 1, maxWorkloadsLimit),
+		WorkloadsOffset: boundedQueryInt(query, "workloads_offset", 0, 0, math.MaxInt32),
+	}
+}
+
+// boundedQueryInt parses a query parameter to an int clamped to [min, max],
+// falling back to fallback for a missing or unparsable value -- never an
+// error response, since an operator-facing dashboard query param is not
+// worth failing the whole request over; it just clamps to something safe.
+func boundedQueryInt(query url.Values, key string, fallback, min, max int) int {
+	raw := query.Get(key)
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if parsed < min {
+		return min
+	}
+	if parsed > max {
+		return max
+	}
+	return parsed
 }
 
 type Workload struct {
@@ -141,6 +202,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/v1/auth/api-keys", s.authIssueAPIKey)
 	mux.HandleFunc("GET /api/v1/agent-endpoint/{provider_id}", s.agentEndpoint)
+	mux.HandleFunc("GET /api/v1/validator-scores/{provider_id}", s.validatorScores)
 	mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(static))))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -173,7 +235,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	result, err := s.loadOverview(ctx)
+	result, err := s.loadOverview(ctx, parseOverviewPagination(r))
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authoritative provider data unavailable"})
 		return
@@ -181,18 +243,25 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
+func (s *Server) loadOverview(ctx context.Context, pagination overviewPagination) (Overview, error) {
 	result := Overview{
 		GeneratedAt:      s.now().UTC().Format(time.RFC3339),
 		Providers:        []Provider{},
 		Workloads:        []Workload{},
 		ValidatorsActive: -1,
+		ProvidersLimit:   pagination.ProvidersLimit,
+		ProvidersOffset:  pagination.ProvidersOffset,
+		WorkloadsLimit:   pagination.WorkloadsLimit,
+		WorkloadsOffset:  pagination.WorkloadsOffset,
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM providers`).Scan(&result.ProvidersTotal); err != nil {
+		return Overview{}, err
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.provider_id, p.public_key, p.status, p.agent_version, p.registered_at,
 		       COALESCE(c.state, 'UNKNOWN')
 		FROM providers p LEFT JOIN provider_chain_registrations c USING (provider_id)
-		ORDER BY p.registered_at DESC LIMIT 500`)
+		ORDER BY p.registered_at DESC LIMIT $1 OFFSET $2`, pagination.ProvidersLimit, pagination.ProvidersOffset)
 	if err != nil {
 		return Overview{}, err
 	}
@@ -214,8 +283,10 @@ func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
 	if err := rows.Err(); err != nil {
 		return Overview{}, err
 	}
-	result.ProvidersTotal = len(result.Providers)
-	workloadRows, err := s.pool.Query(ctx, `SELECT workload_id::text, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), created_at FROM workloads ORDER BY created_at DESC LIMIT 100`)
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM workloads`).Scan(&result.WorkloadsTotal); err != nil {
+		return Overview{}, err
+	}
+	workloadRows, err := s.pool.Query(ctx, `SELECT workload_id::text, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), created_at FROM workloads ORDER BY created_at DESC LIMIT $1 OFFSET $2`, pagination.WorkloadsLimit, pagination.WorkloadsOffset)
 	if err != nil {
 		return Overview{}, err
 	}
