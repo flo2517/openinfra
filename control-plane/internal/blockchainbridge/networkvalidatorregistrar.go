@@ -16,7 +16,44 @@ const (
 	registerValidatorCallIndex  = 0
 	requestExitCallIndex        = 1
 	withdrawUnbondedCallIndex   = 2
+	submitEvidenceCallIndex     = 5
+	closeRoundCallIndex         = 6
 )
+
+// ScoreDimension mirrors pallet-network-validator::ScoreDimension
+// (blockchain/pallets/network-validator/src/lib.rs) byte-for-byte: a
+// C-like enum with no associated data, so its SCALE encoding is a single
+// byte equal to its declaration-order variant index. That order --
+// Compute, Storage, Network, Availability, Reliability -- must track the
+// pallet's `pub enum ScoreDimension { ... }` exactly; it is not
+// alphabetical and not the same order agent.proto's
+// SolveChallengeRequest.Type declares its variants in.
+type ScoreDimension byte
+
+const (
+	DimensionCompute ScoreDimension = iota
+	DimensionStorage
+	DimensionNetwork
+	DimensionAvailability
+	DimensionReliability
+)
+
+func (d ScoreDimension) String() string {
+	switch d {
+	case DimensionCompute:
+		return "compute"
+	case DimensionStorage:
+		return "storage"
+	case DimensionNetwork:
+		return "network"
+	case DimensionAvailability:
+		return "availability"
+	case DimensionReliability:
+		return "reliability"
+	default:
+		return "unknown"
+	}
+}
 
 // Account returns this Registrar's own public key -- the account every
 // extrinsic it signs is attributed to. Exported so callers that need to
@@ -51,6 +88,59 @@ func (r *Registrar) RequestExit(ctx context.Context) error {
 // unbonding period has already elapsed.
 func (r *Registrar) WithdrawUnbonded(ctx context.Context) error {
 	return r.SubmitDirect(ctx, []byte{networkValidatorPalletIndex, withdrawUnbondedCallIndex})
+}
+
+// SubmitEvidence submits pallet-network-validator's submit_evidence
+// extrinsic (call_index 5), directly signed by this Registrar's own
+// account -- one validator's bounded, integer-only, attributable
+// observation for (provider, round, dimension). Field encoding is fixed-
+// width throughout (the pallet's submit_evidence signature has no
+// #[pallet::compact] annotations on any argument, verified directly
+// against blockchain/pallets/network-validator/src/lib.rs): provider is
+// 32 raw bytes, round is u64 LE, dimension is a 1-byte SCALE enum tag,
+// score_bps is u16 LE, sample_count is u32 LE, payload_hash is 32 raw
+// bytes.
+func (r *Registrar) SubmitEvidence(ctx context.Context, provider [32]byte, round uint64, dimension ScoreDimension, scoreBps uint16, sampleCount uint32, payloadHash [32]byte) error {
+	return r.SubmitDirect(ctx, encodeSubmitEvidenceCall(provider, round, dimension, scoreBps, sampleCount, payloadHash))
+}
+
+// encodeSubmitEvidenceCall is split out from SubmitEvidence so its exact
+// byte layout can be unit tested without a live/mock RPC round trip
+// (SubmitDirect itself needs one, for RuntimeVersion/genesis/nonce).
+func encodeSubmitEvidenceCall(provider [32]byte, round uint64, dimension ScoreDimension, scoreBps uint16, sampleCount uint32, payloadHash [32]byte) []byte {
+	call := []byte{networkValidatorPalletIndex, submitEvidenceCallIndex}
+	call = append(call, provider[:]...)
+	call = binary.LittleEndian.AppendUint64(call, round)
+	call = append(call, byte(dimension))
+	call = binary.LittleEndian.AppendUint16(call, scoreBps)
+	call = binary.LittleEndian.AppendUint32(call, sampleCount)
+	call = append(call, payloadHash[:]...)
+	return call
+}
+
+// CloseRound submits close_round (call_index 6) for (provider, round,
+// dimension). Callable by any active validator -- closing is a
+// deterministic function of already-committed Evidence, gated only by
+// quorum, not by caller identity beyond "an active validator" (see the
+// pallet's own doc comment on close_round). A call that arrives before
+// MinQuorum submissions exist is accepted by the chain (the extrinsic
+// dispatches) but fails with QuorumNotReached inside the runtime -- an
+// RPC-visible submission success that is nonetheless a no-op, which
+// callers of this method (the challenge loop's periodic close-attempt
+// pass) must expect and treat as normal, not as an error to retry
+// aggressively.
+func (r *Registrar) CloseRound(ctx context.Context, provider [32]byte, round uint64, dimension ScoreDimension) error {
+	return r.SubmitDirect(ctx, encodeCloseRoundCall(provider, round, dimension))
+}
+
+// encodeCloseRoundCall mirrors encodeSubmitEvidenceCall's reasoning: split
+// out purely so the byte layout is directly unit testable.
+func encodeCloseRoundCall(provider [32]byte, round uint64, dimension ScoreDimension) []byte {
+	call := []byte{networkValidatorPalletIndex, closeRoundCallIndex}
+	call = append(call, provider[:]...)
+	call = binary.LittleEndian.AppendUint64(call, round)
+	call = append(call, byte(dimension))
+	return call
 }
 
 // SubmitDirect signs and submits an arbitrary call with this Registrar's

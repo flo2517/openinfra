@@ -28,6 +28,12 @@ const (
 	SolveChallengeRequest_TYPE_COMPUTE      SolveChallengeRequest_Type = 1
 	SolveChallengeRequest_TYPE_STORAGE      SolveChallengeRequest_Type = 2
 	SolveChallengeRequest_TYPE_AVAILABILITY SolveChallengeRequest_Type = 3
+	// Added for ADR-013 slice 4 (issue #78): a Network Validator's
+	// challenge loop scores these two additional dimensions of
+	// pallet-network-validator's ScoreDimension enum. compute/storage/
+	// availability above predate this addition and are unchanged.
+	SolveChallengeRequest_TYPE_NETWORK     SolveChallengeRequest_Type = 4
+	SolveChallengeRequest_TYPE_RELIABILITY SolveChallengeRequest_Type = 5
 )
 
 // Enum value maps for SolveChallengeRequest_Type.
@@ -37,12 +43,16 @@ var (
 		1: "TYPE_COMPUTE",
 		2: "TYPE_STORAGE",
 		3: "TYPE_AVAILABILITY",
+		4: "TYPE_NETWORK",
+		5: "TYPE_RELIABILITY",
 	}
 	SolveChallengeRequest_Type_value = map[string]int32{
 		"TYPE_UNSPECIFIED":  0,
 		"TYPE_COMPUTE":      1,
 		"TYPE_STORAGE":      2,
 		"TYPE_AVAILABILITY": 3,
+		"TYPE_NETWORK":      4,
+		"TYPE_RELIABILITY":  5,
 	}
 )
 
@@ -1065,16 +1075,18 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"public_key\x18\x03 \x01(\tR\tpublicKey\x12)\n" +
 	"\x10protocol_version\x18\x04 \x01(\tR\x0fprotocolVersion\x12\"\n" +
 	"\fcapabilities\x18\x05 \x03(\tR\fcapabilities\x12%\n" +
-	"\x0euptime_seconds\x18\x06 \x01(\x04R\ruptimeSeconds\"\xf1\x01\n" +
+	"\x0euptime_seconds\x18\x06 \x01(\x04R\ruptimeSeconds\"\x99\x02\n" +
 	"\x15SolveChallengeRequest\x12!\n" +
 	"\fchallenge_id\x18\x01 \x01(\tR\vchallengeId\x12B\n" +
 	"\x04type\x18\x02 \x01(\x0e2..openinfra.agent.v1.SolveChallengeRequest.TypeR\x04type\x12\x18\n" +
-	"\apayload\x18\x03 \x01(\fR\apayload\"W\n" +
+	"\apayload\x18\x03 \x01(\fR\apayload\"\x7f\n" +
 	"\x04Type\x12\x14\n" +
 	"\x10TYPE_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fTYPE_COMPUTE\x10\x01\x12\x10\n" +
 	"\fTYPE_STORAGE\x10\x02\x12\x15\n" +
-	"\x11TYPE_AVAILABILITY\x10\x03\"\xb7\x01\n" +
+	"\x11TYPE_AVAILABILITY\x10\x03\x12\x10\n" +
+	"\fTYPE_NETWORK\x10\x04\x12\x14\n" +
+	"\x10TYPE_RELIABILITY\x10\x05\"\xb7\x01\n" +
 	"\x16SolveChallengeResponse\x12!\n" +
 	"\fchallenge_id\x18\x01 \x01(\tR\vchallengeId\x12#\n" +
 	"\rresource_type\x18\x02 \x01(\tR\fresourceType\x12\x16\n" +

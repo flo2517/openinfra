@@ -1,27 +1,34 @@
-// Command networkvalidator is the first implementation slice of ADR-013
-// (docs/adr/013-network-validator-daemon.md): a Network Validator's
-// identity and lifecycle, independently operable and never sharing a key
-// with the Control Plane's own bridge account. It registers, checks
-// status, and exits/withdraws stake by submitting pallet-network-validator
-// extrinsics directly signed by the operator's own key -- never
-// sudo-wrapped, never routed through the Control Plane -- the exact trust
-// boundary ADR-011 introduced.
+// Command networkvalidator is a Network Validator's full local process
+// (ADR-013, docs/adr/013-network-validator-daemon.md): identity and
+// lifecycle (register/status/request-exit/withdraw, slice 1) plus the
+// continuous challenge loop (run, slice 4 / issue #78) that discovers
+// assigned providers, calls their Agent's SolveChallenge over mTLS,
+// scores the response, and submits evidence/closes rounds on
+// pallet-network-validator. Every extrinsic is signed directly by this
+// binary's own operator-supplied key -- never sudo-wrapped, never routed
+// through the Control Plane -- the exact trust boundary ADR-011
+// introduced.
 //
-// This binary does not yet challenge providers or submit evidence: that
-// requires agent endpoint discovery, the validator-allowlist push to
-// Agents, and the challenge loop itself, tracked as issue #78 (ADR-013
-// slices 2-5). `status` says so explicitly rather than implying readiness.
+// Still out of scope (see docs/adr/013-network-validator-daemon.md's
+// sequencing and issue #78): dispute_round/resolve_dispute handling
+// (ADR-013 slice 5, a deliberate, attributable human action, not
+// automated).
 package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/networkvalidator"
 )
 
 func main() {
@@ -90,6 +97,11 @@ func run(args []string) error {
 			return errors.New("usage: networkvalidator status")
 		}
 		return printStatus(ctx, chain, registrar)
+	case "run":
+		if len(args) != 1 {
+			return errors.New("usage: networkvalidator run")
+		}
+		return runLoop(chain, registrar)
 	default:
 		return usageError()
 	}
@@ -111,13 +123,96 @@ func printStatus(ctx context.Context, chain *blockchainbridge.RPCClient, registr
 	if record.Status == blockchainbridge.ValidatorExiting {
 		fmt.Printf("withdrawable_at: block %d\n", record.AvailableAt)
 	}
-	// Honest, not aspirational: this binary cannot yet do the thing a
-	// Network Validator ultimately exists for. See the package doc
-	// comment and issue #78.
-	fmt.Println("note: this binary does not yet challenge providers or submit evidence (see issue #78)")
+	if record.Status == blockchainbridge.ValidatorActive {
+		fmt.Println("note: run `networkvalidator run` to start challenging assigned providers and submitting evidence")
+	}
 	return nil
 }
 
+// runLoop wires up and starts networkvalidator.Run: everything the
+// challenge loop needs beyond the chain client and Registrar already
+// constructed by run() above. Configured entirely through environment
+// variables, matching this binary's existing SUBSTRATE_RPC_URL/
+// VALIDATOR_SIGNER_KEY_FILE convention rather than introducing a flag
+// parser for a single new subcommand.
+func runLoop(chain *blockchainbridge.RPCClient, registrar *blockchainbridge.Registrar) error {
+	dashboardBaseURL := os.Getenv("DASHBOARD_BASE_URL")
+	if dashboardBaseURL == "" {
+		return errors.New("DASHBOARD_BASE_URL is required for `run` (the Control Plane dashboard's base URL, e.g. http://127.0.0.1:8080 -- serves ADR-013 §2's GET /api/v1/agent-endpoint/{provider_id})")
+	}
+	resolver, err := networkvalidator.NewEndpointResolver(dashboardBaseURL)
+	if err != nil {
+		return fmt.Errorf("configure agent-endpoint resolver: %w", err)
+	}
+
+	clientCert, err := registrar.ClientIdentity()
+	if err != nil {
+		return fmt.Errorf("build mTLS client identity: %w", err)
+	}
+
+	var agentCAPool *x509.CertPool
+	if caFile := os.Getenv("AGENT_SERVER_CA_FILE"); caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return fmt.Errorf("read AGENT_SERVER_CA_FILE: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return errors.New("AGENT_SERVER_CA_FILE contains no usable certificate")
+		}
+		agentCAPool = pool
+	} else {
+		// See challenge.go's callSolveChallenge doc comment for the full
+		// discussion: without a CA to verify an Agent's server
+		// certificate against, this validator cannot authenticate which
+		// server it is really talking to. This is loud on purpose.
+		fmt.Fprintln(os.Stderr, "networkvalidator: WARNING -- AGENT_SERVER_CA_FILE is not set; Agent TLS server certificates will NOT be verified (InsecureSkipVerify). This validator's mTLS client identity is still fully verified by the Agent; what is weakened is only this validator's assurance that it is really talking to the Agent it intends to challenge. Set AGENT_SERVER_CA_FILE to the Control Plane's public CA certificate to close this gap.")
+	}
+
+	roundLength := networkvalidator.RoundLength(networkvalidator.DefaultRoundLengthBlocks)
+	if raw := os.Getenv("ROUND_LENGTH_BLOCKS"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse ROUND_LENGTH_BLOCKS: %w", err)
+		}
+		roundLength = networkvalidator.RoundLength(parsed)
+	}
+
+	pollInterval := networkvalidator.DefaultPollInterval
+	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 32)
+		if err != nil {
+			return fmt.Errorf("parse POLL_INTERVAL_SECONDS: %w", err)
+		}
+		pollInterval = time.Duration(parsed) * time.Second
+	}
+
+	challenger := networkvalidator.NewChallengeClient(networkvalidator.ChallengeClientConfig{
+		Resolver:          resolver,
+		ClientCertificate: clientCert,
+		AgentServerCAPool: agentCAPool,
+	})
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	fmt.Printf("networkvalidator: starting challenge loop (account=%x, round_length=%d blocks, poll_interval=%s)\n", registrar.Account(), roundLength, pollInterval)
+	fmt.Println("networkvalidator: round derivation (round = finalized_block_number / round_length_blocks) is an off-chain convention this implementation chooses, not enforced by pallet-network-validator -- see internal/networkvalidator/round.go")
+
+	err = networkvalidator.Run(ctx, networkvalidator.LoopConfig{
+		Chain:        chain,
+		Registrar:    registrar,
+		Challenger:   challenger,
+		RoundLength:  roundLength,
+		PollInterval: pollInterval,
+	})
+	if errors.Is(err, context.Canceled) {
+		fmt.Println("networkvalidator: shutting down")
+		return nil
+	}
+	return err
+}
+
 func usageError() error {
-	return errors.New("usage: networkvalidator <register <stake> | status | request-exit | withdraw>")
+	return errors.New("usage: networkvalidator <register <stake> | status | request-exit | withdraw | run>")
 }
