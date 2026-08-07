@@ -64,3 +64,45 @@ func TestOverviewReportsUnavailableValidatorSetDistinctlyFromZero(t *testing.T) 
 		t.Fatalf("a genuinely empty validator set must still read as 0, got %v", decoded["validators_active"])
 	}
 }
+
+// A provider's Reputation/Offer must distinguish three states in the JSON
+// a client sees: never read (chain unavailable -> field absent), read but
+// no record yet (available/found: false), and a real record. Collapsing
+// "unavailable" and "no record yet" into the same shape would make a
+// degraded chain read look identical to a freshly joined, honestly-scored
+// provider.
+func TestProviderReputationAndOfferDistinguishUnavailableFromNoRecordYet(t *testing.T) {
+	notRead := Provider{ProviderID: "p1"}
+	encoded, err := json.Marshal(notRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := decoded["reputation"]; present {
+		t.Fatalf("expected no reputation field when never read, got %v", decoded["reputation"])
+	}
+	if _, present := decoded["offer"]; present {
+		t.Fatalf("expected no offer field when never read, got %v", decoded["offer"])
+	}
+
+	noRecordYet := Provider{ProviderID: "p1", Reputation: &ReputationSummary{Available: false}, Offer: &OfferSummary{Found: false}}
+	encoded, err = json.Marshal(noRecordYet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded = nil
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	reputation, ok := decoded["reputation"].(map[string]any)
+	if !ok || reputation["available"] != false {
+		t.Fatalf("expected reputation.available=false, got %v", decoded["reputation"])
+	}
+	offer, ok := decoded["offer"].(map[string]any)
+	if !ok || offer["found"] != false {
+		t.Fatalf("expected offer.found=false, got %v", decoded["offer"])
+	}
+}

@@ -2,6 +2,16 @@ const $=id=>document.getElementById(id);let active;
 function text(id,value){$(id).textContent=value}
 function status(value){const span=document.createElement('span');span.className=`status ${value}`;span.textContent=value;return span}
 function row(values){const tr=document.createElement('tr');for(const value of values){const td=document.createElement('td');td.textContent=value;tr.append(td)}return tr}
+// storage/bandwidth totals of 0 mean "not advertised" (see internal/dashboard's
+// doc comments), not "genuinely zero capacity" -- shown as "—", never as "0",
+// so an unconfigured provider never looks like a broken/empty one.
+function storageCell(p){return p.storage_total_gb>0?`${p.storage_available_gb}/${p.storage_total_gb} Go`:'—'}
+function bandwidthCell(p){return(p.bandwidth_ingress_mbps||p.bandwidth_egress_mbps)?`${p.bandwidth_ingress_mbps||0}/${p.bandwidth_egress_mbps||0} Mbps`:'—'}
+// reputation===undefined: chain read never happened this pass (unavailable).
+// reputation.available===false: chain read succeeded, no record yet -- a
+// normal state for a freshly joined provider, not the same as unavailable.
+function reputationCell(p){if(!p.reputation)return'—';return p.reputation.available?String(p.reputation.global):'pas encore noté'}
+function offerCell(p){if(!p.offer)return'—';return p.offer.found?`${(p.offer.cpu_millicores/1000).toFixed(1)} vCPU / ${p.offer.ram_mb} Mo`:'aucune offre'}
 async function refresh(){
   if(active)active.abort();active=new AbortController();text('sample','Actualisation…');
   try{
@@ -11,7 +21,7 @@ async function refresh(){
     // never as zero, so an outage never reads as "no validators".
     text('validator-count',data.validators_active<0?'—':data.validators_active);
     text('sample',new Date(data.generated_at).toLocaleTimeString());
-    const providers=$('providers');providers.replaceChildren();for(const p of data.providers){const tr=row([p.provider_id,p.status,'',p.agent_version,p.cpu_available.toFixed(1),`${Math.round(p.memory_available_mb/1024)} GiB`,p.chain_state]);tr.children[2].append(status(p.liveness));providers.append(tr)}
+    const providers=$('providers');providers.replaceChildren();for(const p of data.providers){const tr=row([p.provider_id,p.status,'',p.agent_version,p.cpu_available.toFixed(1),`${Math.round(p.memory_available_mb/1024)} GiB`,storageCell(p),bandwidthCell(p),reputationCell(p),offerCell(p),p.chain_state]);tr.children[2].append(status(p.liveness));providers.append(tr)}
     const workloads=$('workloads');workloads.replaceChildren();for(const w of data.workloads)workloads.append(row([w.workload_id,w.state,w.provider_id||'—',w.lease_id||'—',new Date(w.created_at).toLocaleString()]));
     const validators=$('validators');validators.replaceChildren();for(const v of data.validators||[])validators.append(row([v]));
     $('validators-warning').hidden=data.validators_active>=0;
