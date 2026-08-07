@@ -44,7 +44,20 @@ services:
     command:
       - --chain=openinfra-dev
       - --base-path=/var/lib/openinfra/data
-      - --consensus=manual-seal-3000
+      # ADR-009: the dev chain spec (openinfra-dev) has exactly one
+      # genesis authority, Alice. --consensus=manual-seal-3000 (pre-
+      # ADR-009) is gone: the node's CLI no longer accepts it at all now
+      # that it runs real Aura block production + GRANDPA finality
+      # instead of manual sealing. --alice sets name=Alice and
+      # role=authority, but does NOT put usable Aura/GRANDPA keys in the
+      # keystore for this image/polkadot-sdk pinning (confirmed directly:
+      # an empty keystore, chain stuck at genesis, no block ever
+      # authored). The actual keys come from OPENINFRA_DEV_AUTHORITY_SEED
+      # below via docker/authority-entrypoint.sh (this image's
+      # ENTRYPOINT) -- that explicit `key insert` step is load-bearing
+      # here, not redundant with --alice.
+      - --alice
+      - --force-authoring
       - --rpc-external
       - --rpc-port=9944
       - --rpc-methods=safe
@@ -52,6 +65,16 @@ services:
       - --prometheus-external
     environment:
       OPENINFRA_DEV_SUDO_PUBLIC_KEY_FILE: /run/openinfra-chain/bridge-public.hex
+      # Consumed by docker/authority-entrypoint.sh (this image's
+      # ENTRYPOINT), not by openinfra-node directly. //Alice is the
+      # well-known dev SURI matching openinfra-dev's genesis authority
+      # (sp_keyring::Sr25519Keyring::Alice / Ed25519Keyring::Alice --
+      # blockchain/node/src/chain_spec.rs). base_path/chain must match
+      # the --base-path/--chain args above exactly, or the script inserts
+      # keys into a keystore path the running node never reads from.
+      OPENINFRA_DEV_AUTHORITY_SEED: "//Alice"
+      OPENINFRA_NODE_BASE_PATH: /var/lib/openinfra/data
+      OPENINFRA_NODE_CHAIN: openinfra-dev
     ports:
       - "127.0.0.1:9944:9944"
       - "127.0.0.1:30333:30333"
