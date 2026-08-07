@@ -52,19 +52,19 @@ Progressively remove centralized frontend, database, scheduler, and operational 
 | Issue | Gate |
 |---|---|
 | #32 — decentralization roadmap and trust boundaries | ADR-012 (accepted) |
-| #33 — replicated off-chain data plane | ADR-013 |
-| #34 — multiple Control Planes and scheduling relays | ADR-014 |
-| #35 — content-addressed frontend distribution | ADR-018 |
-| #36 — decentralized identity, governance, validator operations | ADR-020 |
-| #50 — orchestration in smart contracts | ADR-016 |
+| #33 — replicated off-chain data plane | ADR-016 |
+| #34 — multiple Control Planes and scheduling relays | ADR-017 |
+| #35 — content-addressed frontend distribution | ADR-021 |
+| #36 — decentralized identity, governance, validator operations | ADR-023 |
+| #50 — orchestration in smart contracts | ADR-019 |
 | #51 — streaming payments | #19 (v1.1), no new ADR |
-| #52 — slashing for availability guarantees | ADR-015 |
+| #52 — slashing for availability guarantees | ADR-018 |
 
 ## v4.0 — P2P Mesh & Global Fabric
 
 Full P2P WireGuard mesh, DHT discovery, Virtual VPC and decentralized ingress/DNS. Stage 2 of ADR-012 §5: remove the Control Plane from the packet path. Depends on #36, because peer authentication cannot rest on a Control-Plane-issued allowlist once the Control Plane is no longer in the path.
 
-Issues #53 (P2P mesh), #54 (gateway nodes), #55 (decentralized DNS) — all gated by ADR-017.
+Issues #53 (P2P mesh), #54 (gateway nodes), #55 (decentralized DNS) — all gated by ADR-020.
 
 ## v5.0 — Geo-Distributed Economy & Storage
 
@@ -72,10 +72,10 @@ Geo-discovery, Proof of Resource (PoR), and decentralized S3/block storage. Stag
 
 | Issue | Gate |
 |---|---|
-| #56 — DHT geo-discovery | ADR-017 |
+| #56 — DHT geo-discovery | ADR-020 |
 | #57 — Proof of Resource | none; extends ADR-007 and ADR-011 §3 |
-| #58 — S3-compatible object storage | ADR-018 |
-| #59 — replicated block volumes | ADR-018 |
+| #58 — S3-compatible object storage | ADR-021 |
+| #59 — replicated block volumes | ADR-021 |
 
 ## v6.0 — Confidential Cloud & Auto-Healing
 
@@ -83,7 +83,7 @@ TEE support, distributed attestation, auto-migration and P2P IaC. Stage 4 of ADR
 
 | Issue | Gate |
 |---|---|
-| #60 — TEE support (Intel SGX / AMD SEV) | ADR-019 |
-| #61 — distributed enclave attestation | ADR-019 |
-| #62 — auto-healing and workload migration | ADR-016 |
-| #63 — infrastructure topology DSL | none while evaluated off-chain; ADR-016 if evaluated on-chain |
+| #60 — TEE support (Intel SGX / AMD SEV) | ADR-022 |
+| #61 — distributed enclave attestation | ADR-022 |
+| #62 — auto-healing and workload migration | ADR-019 |
+| #63 — infrastructure topology DSL | none while evaluated off-chain; ADR-019 if evaluated on-chain |
