@@ -278,7 +278,44 @@ fn resource_capability(
 
 fn load_config() -> Result<AgentConfig> {
     let contents = fs::read_to_string("config.yaml")?;
-    Ok(serde_yaml::from_str(&contents)?)
+    let mut config: AgentConfig = serde_yaml::from_str(&contents)?;
+    apply_executor_env_overrides(&mut config)?;
+    Ok(config)
+}
+
+// Overrides the four ExecutorSettings fields from environment variables when
+// set, matching the docker-compose.yml OPENINFRA_AGENT_* vars an operator
+// expects to take effect. An unset var leaves config.yaml's value untouched;
+// a set-but-unparseable var is a hard error rather than a silently ignored
+// or defaulted value.
+fn apply_executor_env_overrides(config: &mut AgentConfig) -> Result<()> {
+    if let Some(value) = parse_env("OPENINFRA_AGENT_MAX_WORKLOADS")? {
+        config.executor.max_workloads = value;
+    }
+    if let Some(value) = parse_env("OPENINFRA_AGENT_MAX_CPU_CORES")? {
+        config.executor.max_cpu_cores = value;
+    }
+    if let Some(value) = parse_env("OPENINFRA_AGENT_MAX_MEMORY_MB")? {
+        config.executor.max_memory_mb = value;
+    }
+    if let Some(value) = parse_env("OPENINFRA_AGENT_PIDS_LIMIT")? {
+        config.executor.pids_limit = value;
+    }
+    Ok(())
+}
+
+fn parse_env<T: std::str::FromStr>(name: &str) -> Result<Option<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse()
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("{name}={raw:?} is not valid: {error}")),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("{name} is set but unreadable: {error}")),
+    }
 }
 
 fn persist_config(config: &AgentConfig) -> Result<()> {
@@ -332,6 +369,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn plaintext_endpoint_requires_dev_mode() {
@@ -347,5 +385,96 @@ mod tests {
             .await
             .expect_err("non-loopback plaintext must be rejected");
         assert!(error.to_string().contains("loopback"));
+    }
+
+    // The four OPENINFRA_AGENT_* tests below mutate process-global env vars,
+    // so they're serialized against each other via this lock to avoid
+    // cross-test races under cargo test's default parallelism.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            env::set_var(name, value);
+            Self { name }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            env::remove_var(self.name);
+        }
+    }
+
+    #[test]
+    fn max_workloads_env_override_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_MAX_WORKLOADS", "16");
+        let mut config = AgentConfig::default();
+        apply_executor_env_overrides(&mut config).expect("override should apply");
+        assert_eq!(config.executor.max_workloads, 16);
+    }
+
+    #[test]
+    fn max_cpu_cores_env_override_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_MAX_CPU_CORES", "4.5");
+        let mut config = AgentConfig::default();
+        apply_executor_env_overrides(&mut config).expect("override should apply");
+        assert_eq!(config.executor.max_cpu_cores, 4.5);
+    }
+
+    #[test]
+    fn max_memory_mb_env_override_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_MAX_MEMORY_MB", "32768");
+        let mut config = AgentConfig::default();
+        apply_executor_env_overrides(&mut config).expect("override should apply");
+        assert_eq!(config.executor.max_memory_mb, 32768);
+    }
+
+    #[test]
+    fn pids_limit_env_override_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_PIDS_LIMIT", "256");
+        let mut config = AgentConfig::default();
+        apply_executor_env_overrides(&mut config).expect("override should apply");
+        assert_eq!(config.executor.pids_limit, 256);
+    }
+
+    #[test]
+    fn unset_env_leaves_config_value_untouched() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        env::remove_var("OPENINFRA_AGENT_MAX_WORKLOADS");
+        env::remove_var("OPENINFRA_AGENT_MAX_CPU_CORES");
+        env::remove_var("OPENINFRA_AGENT_MAX_MEMORY_MB");
+        env::remove_var("OPENINFRA_AGENT_PIDS_LIMIT");
+
+        let mut config = AgentConfig::default();
+        config.executor.max_workloads = 3;
+        config.executor.max_cpu_cores = 1.5;
+        config.executor.max_memory_mb = 2048;
+        config.executor.pids_limit = 64;
+
+        apply_executor_env_overrides(&mut config).expect("no env vars set, nothing to apply");
+
+        assert_eq!(config.executor.max_workloads, 3);
+        assert_eq!(config.executor.max_cpu_cores, 1.5);
+        assert_eq!(config.executor.max_memory_mb, 2048);
+        assert_eq!(config.executor.pids_limit, 64);
+    }
+
+    #[test]
+    fn unparseable_env_value_produces_clear_error() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_MAX_WORKLOADS", "not-a-number");
+        let mut config = AgentConfig::default();
+        let error = apply_executor_env_overrides(&mut config)
+            .expect_err("unparseable value must be rejected, not silently ignored");
+        assert!(error.to_string().contains("OPENINFRA_AGENT_MAX_WORKLOADS"));
+        assert!(error.to_string().contains("not-a-number"));
     }
 }
