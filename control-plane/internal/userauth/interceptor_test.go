@@ -25,7 +25,8 @@ func (r fakeRepository) CreateAPIKey(context.Context, string) (userauth.APIKey, 
 func (r fakeRepository) CreateAPIKeyWithExpiry(context.Context, string, *time.Time) (userauth.APIKey, error) {
 	panic("unused")
 }
-func (r fakeRepository) RevokeAPIKey(context.Context, string) error { panic("unused") }
+func (r fakeRepository) RevokeAPIKey(context.Context, string) error    { panic("unused") }
+func (r fakeRepository) SetRole(context.Context, string, string) error { panic("unused") }
 func (r fakeRepository) Authenticate(_ context.Context, hash [32]byte) (userauth.User, error) {
 	if r.err != nil {
 		return userauth.User{}, r.err

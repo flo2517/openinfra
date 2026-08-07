@@ -205,7 +205,6 @@ named in the last column.
 
 | Gate | Unblocks | Prohibition it must lift, and what it must settle |
 |---|---|---|
-| **ADR-016** — replicated off-chain data plane | #33 | "another database". Must settle: event log vs CRDT, deterministic IDs, ordering, snapshots, pruning, and the PostgreSQL deprecation criteria |
 | **ADR-017** — multi-Control-Plane and relay protocol | #34 | single-Control-Plane component boundary. Must settle: leader/leaderless rules, idempotency, peer admission, and how an Agent refuses an unauthenticated relay |
 | **ADR-018** — slashing and economic penalties | #52 | none (new mechanism). Already demanded by ADR-011 §5, which ships rewards but explicitly defers slashing economics. Must settle: false-positive protection, appeals, and interaction with `dispute_round` |
 | **ADR-019** — on-chain orchestration | #50, #62 | "runtime orchestration". Must settle: what scheduling logic is deterministic enough for the runtime, and what stays off-chain |
@@ -213,6 +212,7 @@ named in the last column.
 | **ADR-021** — content-addressed distribution and decentralized storage | #35, #58, #59 | "another database". Must settle: pinning, retention proofs, erasure, and gateway trust |
 | **ADR-022** — TEE and distributed attestation | #60, #61 | none (new trust root). Must settle: which vendor roots are trusted, revocation, and what an unattested provider may still do |
 | **ADR-023** — decentralized identity, key rotation, and governance | #36 | `EnsureRoot` as governance (`blockchain/runtime/src/lib.rs:316`). Must settle: rotation and recovery per role, stake/delegation, timelocks, and emergency constraints |
+| **ADR-024** — replicated off-chain data plane | #33 | "another database". Must settle: event log vs CRDT, deterministic IDs, ordering, snapshots, pruning, and the PostgreSQL deprecation criteria. (Moved here from its original `ADR-016` reservation — see "Consequences" below.) |
 
 Three issues need **no new gate**:
 
@@ -297,3 +297,19 @@ It does not change any code, origin, or storage item today.
   from whatever is next free at the time; this table is a *reservation of
   intent*, not a claim on the number, and the next accepted ADR of any kind
   (gate or not) takes the next integer regardless of what this table says.
+- **§6 was corrected a second time, more narrowly.** `ADR-016` (dashboard RBAC
+  and tenant isolation, `docs/adr/016-dashboard-rbac-and-tenant-isolation.md`)
+  was accepted next, colliding with this table's reservation of `ADR-016` for
+  "replicated off-chain data plane" (#33). Cascading the whole table down by
+  one again (as the first correction above did) would only guarantee a third
+  collision the next time an unplanned ADR lands — this project's actual
+  velocity, four times running now (`ADR-013` through `ADR-016`), is
+  "unplanned work claims the next number," not "gates are claimed in this
+  table's order." The policy is revised accordingly: an unplanned ADR always
+  takes the next integer; if that collides with a reserved gate, **only that
+  one gate** moves to one past this table's current highest reserved number,
+  the rest of the table is left untouched. Concretely here: `#33`'s gate moved
+  from `ADR-016` to `ADR-024` (§6's table above reflects this; no other gate
+  number changed). This is expected to be the stable policy going forward —
+  no further cascading renumbering, just individual gates relocating to the
+  ceiling as they collide, one at a time.

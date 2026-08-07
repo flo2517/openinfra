@@ -27,6 +27,13 @@ import (
 // the raw key.
 var ErrInvalidKey = errors.New("invalid or expired API key")
 
+// ErrUserNotFound is SetRole's failure for a user_id that does not exist
+// -- deliberately a distinct error from ErrInvalidKey, since granting a
+// role is an operator (cmd/controlplane-admin) action against a known
+// user_id, not a credential check with the same "don't leak which part
+// was wrong" concern ErrInvalidKey exists for.
+var ErrUserNotFound = errors.New("user not found")
+
 // keyPrefix marks OpenInfra user API keys recognizably in logs/tooling
 // output, the same spirit as GitHub's "ghp_" or Stripe's "sk_" prefixes.
 const keyPrefix = "oiu_"
@@ -43,6 +50,54 @@ type User struct {
 	UserID      string
 	DisplayName string
 	CreatedAt   time.Time
+	// Role is ADR-016's dashboard-authorization tier: RoleTenant (the
+	// default for every user, existing or new) or RoleOperator (only
+	// reachable via an explicit controlplane-admin grant-role). Distinct
+	// from anything about API-key scoping -- this field governs what a
+	// browser dashboard session may see, not what the gRPC user-facing
+	// API already scopes by owner_id.
+	Role string
+}
+
+// RoleTenant and RoleOperator are the only two values users.role's CHECK
+// constraint (migrations/000012_user_roles.sql) allows -- ADR-016 §1
+// deliberately keeps this to one column, two values, rather than a
+// many-to-many roles table the MVP doesn't need yet.
+const (
+	RoleTenant   = "tenant"
+	RoleOperator = "operator"
+)
+
+// ValidRole reports whether role is one of the two roles this system
+// recognizes -- used by both SetRole implementations and
+// cmd/controlplane-admin's grant-role argument parsing, so "reject an
+// unknown role" is defined exactly once.
+func ValidRole(role string) bool {
+	return role == RoleTenant || role == RoleOperator
+}
+
+// roleRank orders roles for internal/dashboard's requireRole check:
+// higher ranks satisfy lower-or-equal requirements (an operator may reach
+// a tenant-tier endpoint; a tenant may never reach an operator-tier one).
+// Unexported here deliberately -- RoleSatisfies below is the only
+// intended way to compare roles, so the ranking itself can be
+// restructured later (e.g. a third tier) without every caller needing to
+// know it's backed by integers.
+var roleRank = map[string]int{RoleTenant: 1, RoleOperator: 2}
+
+// RoleSatisfies reports whether actual is at least as privileged as
+// required. An unrecognized actual role (should not happen once
+// ValidRole is enforced at every write path, but this must still fail
+// closed rather than panic or vacuously succeed on a corrupt/future
+// value) never satisfies anything -- explicitly checked via ValidRole
+// rather than relying on roleRank's zero-value-for-a-missing-key
+// behavior, which would otherwise let two equally-unrecognized values
+// compare as satisfying each other.
+func RoleSatisfies(actual, required string) bool {
+	if !ValidRole(actual) {
+		return false
+	}
+	return roleRank[actual] >= roleRank[required]
 }
 
 // APIKey is a credential a User authenticates with. Raw is populated only
@@ -100,6 +155,14 @@ type Repository interface {
 	// must not fail authentication itself.
 	Authenticate(ctx context.Context, hash [32]byte) (User, error)
 	RevokeAPIKey(ctx context.Context, keyID string) error
+	// SetRole is ADR-016's grant path (cmd/controlplane-admin's
+	// grant-role): an operator-only, offline, break-glass action, the
+	// same trust boundary create-user/issue-key already require -- there
+	// is deliberately no self-service way for a user to grant themselves
+	// (or anyone else) the operator role. Returns ErrUserNotFound for an
+	// unknown userID; callers are expected to have already validated
+	// role via ValidRole before calling.
+	SetRole(ctx context.Context, userID string, role string) error
 }
 
 type contextKey int

@@ -1,6 +1,6 @@
-// Command controlplane-admin is operator tooling for two unrelated
-// privileged actions that both need the Control Plane's own credentials
-// rather than an ordinary user's or validator's:
+// Command controlplane-admin is operator tooling for privileged actions
+// that need the Control Plane's own credentials rather than an ordinary
+// user's or validator's:
 //
 //   - User/API-key management (issue #12): there is deliberately no
 //     self-service user registration RPC (that would be a much larger
@@ -10,6 +10,10 @@
 //     exactly once, to stdout, and never persisted anywhere (only its
 //     SHA-256 hash lives in Postgres) -- copy it immediately; there is no
 //     way to recover it later, only to revoke it and issue a new one.
+//   - grant-role (ADR-016 §4, issue #76): the only way a user becomes a
+//     dashboard operator (or is demoted back to tenant). Same trust
+//     boundary as create-user/issue-key -- there is no self-service way
+//     for a user to grant themselves elevated dashboard access.
 //   - resolve-dispute (ADR-013 slice 5, issue #78): pallet-network-
 //     validator's resolve_dispute extrinsic is SuspensionOrigin-gated
 //     (EnsureRoot in this runtime) -- only the Control Plane's own
@@ -20,8 +24,8 @@
 //     account.
 //
 // Each subcommand only connects to the credential store it actually
-// needs -- user/API-key commands never touch the chain, resolve-dispute
-// never touches Postgres.
+// needs -- user/API-key/role commands never touch the chain,
+// resolve-dispute never touches Postgres.
 package main
 
 import (
@@ -53,7 +57,7 @@ func run(args []string) error {
 	ctx := context.Background()
 
 	switch args[0] {
-	case "create-user", "issue-key", "revoke-key":
+	case "create-user", "issue-key", "revoke-key", "grant-role":
 		return runUserCommand(ctx, args)
 	case "resolve-dispute":
 		return runResolveDispute(ctx, args)
@@ -97,6 +101,11 @@ func runUserCommand(ctx context.Context, args []string) error {
 		}
 		fmt.Println("revoked")
 		return nil
+	case "grant-role":
+		if len(args) != 3 {
+			return errors.New("usage: controlplane-admin grant-role <user-id> <tenant|operator>")
+		}
+		return grantRole(ctx, repository, args[1], args[2])
 	}
 	return usageError()
 }
@@ -117,6 +126,23 @@ func issueKey(ctx context.Context, repository *userauth.PostgresRepository, user
 	}
 	fmt.Println("key_id:", key.KeyID)
 	fmt.Println("api_key:", key.Raw, "  (shown once -- store it now; only its hash is kept)")
+	return nil
+}
+
+// grantRole is ADR-016 §4's break-glass grant path: the only way a user
+// becomes (or stops being) a dashboard operator. Deliberately the same
+// operational shape as create-user/issue-key/revoke-key -- an offline
+// Postgres write requiring this binary's own DATABASE_URL access, not a
+// self-service RPC a logged-in user could call on themselves or anyone
+// else.
+func grantRole(ctx context.Context, repository *userauth.PostgresRepository, userID, role string) error {
+	if !userauth.ValidRole(role) {
+		return fmt.Errorf("%q must be exactly %q or %q", role, userauth.RoleTenant, userauth.RoleOperator)
+	}
+	if err := repository.SetRole(ctx, userID, role); err != nil {
+		return fmt.Errorf("grant role: %w", err)
+	}
+	fmt.Printf("user %s is now role=%s\n", userID, role)
 	return nil
 }
 
@@ -197,5 +223,5 @@ func parseUpholdOrReject(value string) (bool, error) {
 }
 
 func usageError() error {
-	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject>>")
+	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject>>")
 }
