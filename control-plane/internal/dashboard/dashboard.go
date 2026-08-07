@@ -140,6 +140,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/challenge", s.authChallenge)
 	mux.HandleFunc("POST /api/v1/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/v1/auth/api-keys", s.authIssueAPIKey)
+	mux.HandleFunc("GET /api/v1/agent-endpoint/{provider_id}", s.agentEndpoint)
 	mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(static))))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
