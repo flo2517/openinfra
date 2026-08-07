@@ -7,11 +7,12 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header><div><span class="eyebrow">OPENINFRA NETWORK</span><h1>Network operations</h1></div><div id="sample" class="sample">Connexion…</div></header>
-  <main>
+  <a class="skip-link" href="#main">Aller au contenu principal</a>
+  <header><div><span class="eyebrow">OPENINFRA NETWORK</span><h1>Network operations</h1></div><div id="sample" class="sample" role="status" aria-live="polite">Connexion…</div></header>
+  <main id="main">
     <section class="panel" id="auth-panel">
       <div class="panel-head"><div><span class="eyebrow">COMPTE</span><h2>Connexion par portefeuille</h2></div></div>
-      <div id="auth-unsupported" class="warning" hidden>Ce navigateur ne prend pas en charge Ed25519 via WebCrypto — la connexion par portefeuille n'est pas disponible ici.</div>
+      <div id="auth-unsupported" class="warning" role="alert" hidden>Ce navigateur ne prend pas en charge Ed25519 via WebCrypto — la connexion par portefeuille n'est pas disponible ici.</div>
       <div id="auth-logged-out">
         <p class="muted">Une clé locale (Ed25519, générée dans ce navigateur) sert d'identité — voir ADR-014. Aucune extension de portefeuille requise pour cette première version.</p>
         <p class="account-line">Compte local : <code id="auth-account">—</code></p>
@@ -21,7 +22,7 @@
         <p class="muted">Connecté en tant que <code id="auth-connected-account"></code>. Session valable jusqu'à <span id="auth-session-expiry"></span>.</p>
         <button id="auth-issue-key" type="button">Générer une clé API longue durée</button>
         <button id="auth-logout" type="button">Se déconnecter</button>
-        <p id="auth-issued-key" class="warning" hidden></p>
+        <p id="auth-issued-key" class="warning" role="status" hidden></p>
       </div>
     </section>
     <section class="cards">
@@ -33,25 +34,31 @@
       <article><span>Network Validators</span><strong id="validator-count">—</strong><small>actifs on-chain</small></article>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">WORKLOADS</span><h2>Orchestration durable</h2></div></div>
-      <div class="table-wrap"><table><thead><tr><th>Workload</th><th>État</th><th>Provider</th><th>Lease</th><th>Créé</th></tr></thead><tbody id="workloads"></tbody></table></div>
+      <div class="table-wrap"><table><caption class="sr-only">Workloads récents, les plus récents en premier</caption><thead><tr><th scope="col">Workload</th><th scope="col">État</th><th scope="col">Provider</th><th scope="col">Lease</th><th scope="col">Créé</th></tr></thead><tbody id="workloads"></tbody></table></div>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">VALIDATORS</span><h2>Scoring décentralisé</h2></div></div>
-      <div id="validators-warning" class="warning" hidden>Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.</div>
-      <div class="table-wrap"><table><thead><tr><th>Validator</th></tr></thead><tbody id="validators"></tbody></table></div>
+      <div id="validators-warning" class="warning" role="alert" hidden>Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.</div>
+      <div class="table-wrap"><table><caption class="sr-only">Network Validators actuellement actifs on-chain</caption><thead><tr><th scope="col">Validator</th></tr></thead><tbody id="validators"></tbody></table></div>
     </section>
     <section class="panel" id="validator-scores-panel">
       <div class="panel-head"><div><span class="eyebrow">VALIDATOR SCORES</span><h2>Historique des rounds de scoring</h2></div></div>
       <p class="muted">Résultats des derniers rounds de challenge (ADR-013) pour un provider donné, par dimension. Un round sans ligne n'a simplement pas encore été clos — ce n'est pas une erreur.</p>
       <div class="score-controls">
+        <label for="score-provider-id">Identifiant du provider</label>
         <input id="score-provider-id" type="text" placeholder="provider_id">
         <button id="score-load" type="button">Charger</button>
       </div>
-      <div id="score-warning" class="warning" hidden></div>
-      <div class="table-wrap"><table><thead><tr><th>Dimension</th><th>Round</th><th>Score</th><th>Précédent</th><th>Confiance</th><th>Soumissions</th><th>Statut</th><th>Bloc de clôture</th></tr></thead><tbody id="score-rows"></tbody></table></div>
+      <div id="score-warning" class="warning" role="alert" aria-live="polite" hidden></div>
+      <div class="table-wrap"><table><caption class="sr-only">Historique des rounds de scoring pour le provider recherché, par dimension</caption><thead><tr><th scope="col">Dimension</th><th scope="col">Round</th><th scope="col">Score</th><th scope="col">Précédent</th><th scope="col">Confiance</th><th scope="col">Soumissions</th><th scope="col">Statut</th><th scope="col">Bloc de clôture</th></tr></thead><tbody id="score-rows"></tbody></table></div>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">PROVIDERS</span><h2>État du réseau</h2></div><button id="refresh" type="button">Actualiser</button></div>
-      <div id="warning" class="warning" hidden></div>
-      <div class="table-wrap"><table><thead><tr><th>Provider</th><th>État durable</th><th>Connexion</th><th>Agent</th><th>CPU</th><th>RAM</th><th>Stockage</th><th>Bande passante</th><th>Réputation</th><th>Offre on-chain</th><th>On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>
+      <div id="warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap"><table><caption class="sr-only">Providers enregistrés, les plus récents en premier</caption><thead><tr><th scope="col">Provider</th><th scope="col">État durable</th><th scope="col">Connexion</th><th scope="col">Agent</th><th scope="col">CPU</th><th scope="col">RAM</th><th scope="col">Stockage</th><th scope="col">Bande passante</th><th scope="col">Réputation</th><th scope="col">Offre on-chain</th><th scope="col">On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>
+      <div class="pagination">
+        <button id="providers-prev" type="button">← Précédent</button>
+        <span id="providers-range" aria-live="polite">—</span>
+        <button id="providers-next" type="button">Suivant →</button>
+      </div>
     </section>
   </main>
   <script src="auth.js" defer></script>

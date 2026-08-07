@@ -12,11 +12,17 @@ function bandwidthCell(p){return(p.bandwidth_ingress_mbps||p.bandwidth_egress_mb
 // normal state for a freshly joined provider, not the same as unavailable.
 function reputationCell(p){if(!p.reputation)return'—';return p.reputation.available?String(p.reputation.global):'pas encore noté'}
 function offerCell(p){if(!p.offer)return'—';return p.offer.found?`${(p.offer.cpu_millicores/1000).toFixed(1)} vCPU / ${p.offer.ram_mb} Mo`:'aucune offre'}
+// #76 pagination: providersOffset is the only piece of paging state kept
+// client-side (workloads/validators stay unpaginated in the UI for now --
+// their tables are far smaller in practice); refresh() always re-reads it
+// so prev/next just mutate this and re-fetch, no separate code path.
+let providersOffset=0,providersLimit=500;
 async function refresh(){
   if(active)active.abort();active=new AbortController();text('sample','Actualisation…');
   try{
-    const response=await fetch('/api/v1/overview',{signal:active.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();
-    text('fresh',data.providers_fresh);text('total',`${data.providers_total} enregistrés`);text('cpu',Number(data.cpu_available).toFixed(1));text('memory',`${Math.round(data.memory_available_mb/1024)} GiB`);text('block',`#${data.finalized_block}`);text('chain',data.chain_syncing?'synchronisation en cours':`best #${data.best_block}`);text('workload-count',data.workloads.length);
+    const response=await fetch(`/api/v1/overview?providers_offset=${providersOffset}`,{signal:active.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();
+    providersLimit=data.providers_limit||providersLimit;
+    text('fresh',data.providers_fresh);text('total',`${data.providers_total} enregistrés`);text('cpu',Number(data.cpu_available).toFixed(1));text('memory',`${Math.round(data.memory_available_mb/1024)} GiB`);text('block',`#${data.finalized_block}`);text('chain',data.chain_syncing?'synchronisation en cours':`best #${data.best_block}`);text('workload-count',data.workloads_total);
     // validators_active is -1 when the read failed: show that as unknown,
     // never as zero, so an outage never reads as "no validators".
     text('validator-count',data.validators_active<0?'—':data.validators_active);
@@ -26,9 +32,17 @@ async function refresh(){
     const validators=$('validators');validators.replaceChildren();for(const v of data.validators||[])validators.append(row([v]));
     $('validators-warning').hidden=data.validators_active>=0;
     const warning=$('warning');warning.hidden=!data.partial;warning.textContent=data.partial?'Certaines sources sont momentanément indisponibles. Les données affichées restent partielles.':'';
+    const shown=data.providers.length;
+    const rangeStart=shown===0?0:data.providers_offset+1;
+    const rangeEnd=data.providers_offset+shown;
+    text('providers-range',`${rangeStart}–${rangeEnd} sur ${data.providers_total}`);
+    $('providers-prev').disabled=data.providers_offset<=0;
+    $('providers-next').disabled=data.providers_offset+shown>=data.providers_total;
   }catch(error){if(error.name!=='AbortError'){text('sample','Indisponible');const warning=$('warning');warning.hidden=false;warning.textContent='Le dashboard ne peut pas charger les données.'}}
 }
 $('refresh').addEventListener('click',refresh);refresh();setInterval(refresh,10000);
+$('providers-prev').addEventListener('click',()=>{providersOffset=Math.max(0,providersOffset-providersLimit);refresh()});
+$('providers-next').addEventListener('click',()=>{providersOffset+=providersLimit;refresh()});
 
 // #76 validator score history: fetched on demand for a single provider_id
 // rather than folded into refresh()'s periodic /api/v1/overview poll --
