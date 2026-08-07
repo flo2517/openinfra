@@ -86,6 +86,11 @@ message ReportHeartbeatResponse {
   openinfra.shared.v1.NodeStatus status = 1;
   google.protobuf.Timestamp accepted_at = 2;
   uint32 next_heartbeat_seconds = 3;
+  // Raw 32-byte Ed25519 public keys of the currently active Network
+  // Validators (ADR-011/ADR-013), refreshed every heartbeat. The Agent
+  // uses this to authorize a second mTLS client class alongside the
+  // Control Plane's own certificate -- see ADR-013 §3.
+  repeated bytes active_validators = 4;
 }
 
 enum WorkloadState {

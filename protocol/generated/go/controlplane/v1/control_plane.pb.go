@@ -513,8 +513,13 @@ type ReportHeartbeatResponse struct {
 	Status               v1.NodeStatus          `protobuf:"varint,1,opt,name=status,proto3,enum=openinfra.shared.v1.NodeStatus" json:"status,omitempty"`
 	AcceptedAt           *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=accepted_at,json=acceptedAt,proto3" json:"accepted_at,omitempty"`
 	NextHeartbeatSeconds uint32                 `protobuf:"varint,3,opt,name=next_heartbeat_seconds,json=nextHeartbeatSeconds,proto3" json:"next_heartbeat_seconds,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Raw 32-byte Ed25519 public keys of the currently active Network
+	// Validators (ADR-011/ADR-013), refreshed every heartbeat. The Agent
+	// uses this to authorize a second mTLS client class alongside the
+	// Control Plane's own certificate -- see ADR-013 §3.
+	ActiveValidators [][]byte `protobuf:"bytes,4,rep,name=active_validators,json=activeValidators,proto3" json:"active_validators,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ReportHeartbeatResponse) Reset() {
@@ -566,6 +571,13 @@ func (x *ReportHeartbeatResponse) GetNextHeartbeatSeconds() uint32 {
 		return x.NextHeartbeatSeconds
 	}
 	return 0
+}
+
+func (x *ReportHeartbeatResponse) GetActiveValidators() [][]byte {
+	if x != nil {
+		return x.ActiveValidators
+	}
+	return nil
 }
 
 type SubmitWorkloadRequest struct {
@@ -987,12 +999,13 @@ const file_openinfra_controlplane_v1_control_plane_proto_rawDesc = "" +
 	"\bsequence\x18\x03 \x01(\x04R\bsequence\x12;\n" +
 	"\vobserved_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"observedAt\x12K\n" +
-	"\fcapabilities\x18\x05 \x01(\v2'.openinfra.shared.v1.ResourceCapabilityR\fcapabilities\"\xc5\x01\n" +
+	"\fcapabilities\x18\x05 \x01(\v2'.openinfra.shared.v1.ResourceCapabilityR\fcapabilities\"\xf2\x01\n" +
 	"\x17ReportHeartbeatResponse\x127\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x1f.openinfra.shared.v1.NodeStatusR\x06status\x12;\n" +
 	"\vaccepted_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"acceptedAt\x124\n" +
-	"\x16next_heartbeat_seconds\x18\x03 \x01(\rR\x14nextHeartbeatSeconds\"\x95\x01\n" +
+	"\x16next_heartbeat_seconds\x18\x03 \x01(\rR\x14nextHeartbeatSeconds\x12+\n" +
+	"\x11active_validators\x18\x04 \x03(\fR\x10activeValidators\"\x95\x01\n" +
 	"\x15SubmitWorkloadRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12G\n" +

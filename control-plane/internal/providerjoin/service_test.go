@@ -1,10 +1,12 @@
 package providerjoin
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -52,6 +54,23 @@ type memoryRegistrar struct {
 func (r *memoryRegistrar) EnsureActive(_ context.Context, _ [ed25519.PublicKeySize]byte) ([]byte, []byte, uint64, error) {
 	r.calls++
 	return nil, nil, 1, r.err
+}
+
+// memoryValidatorSource stubs blockchainbridge's LatestActiveNetworkValidators
+// for the heartbeat-allowlist tests: either returns validators, or fails,
+// never both, matching the real RPCClient's single-read behavior.
+type memoryValidatorSource struct {
+	validators [][32]byte
+	err        error
+	calls      int
+}
+
+func (s *memoryValidatorSource) LatestActiveNetworkValidators(context.Context) ([][32]byte, error) {
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.validators, nil
 }
 
 type memoryHeartbeatStore struct {
@@ -255,5 +274,115 @@ func TestHeartbeatAcceptsValidSignatureAndRejectsReplay(t *testing.T) {
 	_, err = service.ReportHeartbeat(context.Background(), request)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("replay code = %s, want FailedPrecondition", status.Code(err))
+	}
+}
+
+// heartbeatFixture builds a repository, identity, and signed request ready
+// to submit via ReportHeartbeat, factored out of
+// TestHeartbeatAcceptsValidSignatureAndRejectsReplay so the two
+// validator-allowlist tests below don't have to duplicate its signing
+// boilerplate.
+func heartbeatFixture(t *testing.T) (*memoryRepository, *controlplanev1.ReportHeartbeatRequest, time.Time) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	repository := newMemoryRepository()
+	providerDigest := sha256.Sum256(publicKey)
+	providerID := fmt.Sprintf("%x", providerDigest)
+	repository.completion[uuid.NewString()] = Completion{ProviderID: providerID, Challenge: Challenge{PublicKey: publicKey}, Status: sharedv1.NodeStatus_NODE_STATUS_ACTIVE}
+	now := time.Unix(1_700_000_000, 0).UTC()
+	payload := &controlplanev1.HeartbeatSigningPayload{
+		RequestId: uuid.NewString(), ProviderId: providerID, Sequence: 1,
+		ObservedAt:   timestamppb.New(now),
+		Capabilities: &sharedv1.ResourceCapability{CpuTotal: 8, CpuAvailable: 6, RamTotalMb: 16_384, RamAvailableMb: 12_000},
+	}
+	payloadBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	request := &controlplanev1.ReportHeartbeatRequest{Payload: payload, Signature: ed25519.Sign(privateKey, append([]byte(heartbeatDomain), payloadBytes...))}
+	return repository, request, now
+}
+
+// TestHeartbeatIncludesActiveValidatorSetWhenChainReadSucceeds is ADR-013
+// §3's core wire contract: a successful chain read is forwarded verbatim
+// as the raw 32-byte Ed25519 keys the Agent will allowlist for mTLS.
+func TestHeartbeatIncludesActiveValidatorSetWhenChainReadSucceeds(t *testing.T) {
+	repository, request, now := heartbeatFixture(t)
+	validatorOne := [32]byte{1, 2, 3}
+	validatorTwo := [32]byte{4, 5, 6}
+	source := &memoryValidatorSource{validators: [][32]byte{validatorOne, validatorTwo}}
+	service := NewService(repository, newMemoryHeartbeatStore(), &memoryRegistrar{})
+	service.now = func() time.Time { return now }
+	service.SetValidatorSource(source)
+
+	response, err := service.ReportHeartbeat(context.Background(), request)
+	if err != nil {
+		t.Fatalf("report heartbeat: %v", err)
+	}
+	if response.Status != sharedv1.NodeStatus_NODE_STATUS_ACTIVE {
+		t.Fatalf("status = %s, want ACTIVE", response.Status)
+	}
+	if len(response.ActiveValidators) != 2 {
+		t.Fatalf("active_validators length = %d, want 2", len(response.ActiveValidators))
+	}
+	if !bytes.Equal(response.ActiveValidators[0], validatorOne[:]) || !bytes.Equal(response.ActiveValidators[1], validatorTwo[:]) {
+		t.Fatalf("active_validators = %x, want [%x %x]", response.ActiveValidators, validatorOne, validatorTwo)
+	}
+	if source.calls != 1 {
+		t.Fatalf("chain read calls = %d, want 1", source.calls)
+	}
+}
+
+// TestHeartbeatSucceedsWithEmptyValidatorsWhenChainReadFails is the
+// degraded-mode half of ADR-013 §3's contract: liveness (this RPC's core
+// job) must not depend on the chain being reachable, so a chain read
+// failure degrades to an empty allowlist rather than failing the whole
+// heartbeat -- status/accepted_at/next_heartbeat_seconds are unaffected.
+func TestHeartbeatSucceedsWithEmptyValidatorsWhenChainReadFails(t *testing.T) {
+	repository, request, now := heartbeatFixture(t)
+	source := &memoryValidatorSource{err: errors.New("substrate RPC unavailable")}
+	service := NewService(repository, newMemoryHeartbeatStore(), &memoryRegistrar{})
+	service.now = func() time.Time { return now }
+	service.SetValidatorSource(source)
+
+	response, err := service.ReportHeartbeat(context.Background(), request)
+	if err != nil {
+		t.Fatalf("report heartbeat: %v", err)
+	}
+	if response.Status != sharedv1.NodeStatus_NODE_STATUS_ACTIVE {
+		t.Fatalf("status = %s, want ACTIVE", response.Status)
+	}
+	if response.NextHeartbeatSeconds == 0 {
+		t.Fatal("next_heartbeat_seconds should still be populated on a degraded chain read")
+	}
+	if len(response.ActiveValidators) != 0 {
+		t.Fatalf("active_validators = %x, want empty", response.ActiveValidators)
+	}
+	if source.calls != 1 {
+		t.Fatalf("chain read calls = %d, want 1", source.calls)
+	}
+}
+
+// TestHeartbeatSucceedsWithoutValidatorSourceConfigured covers the
+// SetValidatorSource-never-called path (e.g. a chain client that failed to
+// initialize at startup): heartbeats must keep working exactly as they did
+// before this ADR-013 slice existed.
+func TestHeartbeatSucceedsWithoutValidatorSourceConfigured(t *testing.T) {
+	repository, request, now := heartbeatFixture(t)
+	service := NewService(repository, newMemoryHeartbeatStore(), &memoryRegistrar{})
+	service.now = func() time.Time { return now }
+
+	response, err := service.ReportHeartbeat(context.Background(), request)
+	if err != nil {
+		t.Fatalf("report heartbeat: %v", err)
+	}
+	if response.Status != sharedv1.NodeStatus_NODE_STATUS_ACTIVE {
+		t.Fatalf("status = %s, want ACTIVE", response.Status)
+	}
+	if response.ActiveValidators != nil {
+		t.Fatalf("active_validators = %x, want nil", response.ActiveValidators)
 	}
 }

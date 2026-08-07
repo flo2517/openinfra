@@ -19,3 +19,24 @@ uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 prost = "0.12"
 prost-types = "0.12"
+# ADR-013 §3: the Agent's mTLS server accepts a second client class (an
+# allowlisted Network Validator key) alongside the Control Plane CA chain.
+# tonic's ServerTlsConfig has no hook for a custom rustls ClientCertVerifier
+# (see mtls.rs's module doc), so this drops to the same rustls/tokio-rustls
+# versions tonic 0.10's "tls" feature already pulls in (kept in lockstep --
+# do not bump independently of tonic) and builds the ServerConfig by hand.
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+rustls-pemfile = "1"
+tokio-rustls = "0.24"
+tokio-stream = "0.1"
+# Parses the peer certificate's DER to extract its raw Ed25519
+# SubjectPublicKeyInfo for the allowlist check -- a real X.509 parse, not a
+# byte-offset guess, since a wrong extraction here is a security bug, not
+# just a correctness one.
+x509-parser = "0.16"
+
+[dev-dependencies]
+# Test-only: generates both a CA-issued client cert (to exercise the
+# existing chain-verification path unchanged) and a self-signed Ed25519
+# cert (to exercise the new allowlist path), per ADR-011 §2.
+rcgen = "0.13"
