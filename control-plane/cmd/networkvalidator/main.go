@@ -1,23 +1,26 @@
 // Command networkvalidator is a Network Validator's full local process
 // (ADR-013, docs/adr/013-network-validator-daemon.md): identity and
-// lifecycle (register/status/request-exit/withdraw, slice 1) plus the
+// lifecycle (register/status/request-exit/withdraw, slice 1), the
 // continuous challenge loop (run, slice 4 / issue #78) that discovers
 // assigned providers, calls their Agent's SolveChallenge over mTLS,
 // scores the response, and submits evidence/closes rounds on
-// pallet-network-validator. Every extrinsic is signed directly by this
+// pallet-network-validator, and disputing a closed round (dispute, slice
+// 5) as a deliberate, attributable human action -- never automated by the
+// challenge loop itself. Every extrinsic here is signed directly by this
 // binary's own operator-supplied key -- never sudo-wrapped, never routed
 // through the Control Plane -- the exact trust boundary ADR-011
 // introduced.
 //
-// Still out of scope (see docs/adr/013-network-validator-daemon.md's
-// sequencing and issue #78): dispute_round/resolve_dispute handling
-// (ADR-013 slice 5, a deliberate, attributable human action, not
-// automated).
+// resolve_dispute (also slice 5) is deliberately not in this binary: the
+// pallet gates it to SuspensionOrigin (EnsureRoot in this runtime), so
+// only the Control Plane's own bridge/sudo account can call it -- see
+// cmd/controlplane-admin's resolve-dispute instead.
 package main
 
 import (
 	"context"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -102,9 +105,52 @@ func run(args []string) error {
 			return errors.New("usage: networkvalidator run")
 		}
 		return runLoop(chain, registrar)
+	case "dispute":
+		if len(args) != 4 {
+			return errors.New("usage: networkvalidator dispute <provider-hex> <round> <dimension>")
+		}
+		return dispute(ctx, registrar, args[1], args[2], args[3])
 	default:
 		return usageError()
 	}
+}
+
+// dispute is ADR-013 slice 5's manual, explicit CLI action (deliberately
+// not something the challenge loop triggers automatically -- see
+// Registrar.DisputeRound's doc comment). Only the validator side of
+// dispute_round's authorization is reachable from this binary: a
+// provider has no independent chain-signing path in this MVP.
+func dispute(ctx context.Context, registrar *blockchainbridge.Registrar, providerHex, roundArg, dimensionArg string) error {
+	provider, err := parseAccountHex(providerHex)
+	if err != nil {
+		return fmt.Errorf("parse provider: %w", err)
+	}
+	round, err := strconv.ParseUint(roundArg, 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse round: %w", err)
+	}
+	dimension, err := blockchainbridge.ParseScoreDimension(dimensionArg)
+	if err != nil {
+		return err
+	}
+	if err := registrar.DisputeRound(ctx, provider, round, dimension); err != nil {
+		return fmt.Errorf("dispute_round: %w", err)
+	}
+	fmt.Printf("dispute_round submitted for provider=%s round=%d dimension=%s; the score rolled back to its pre-round value pending resolve_dispute\n", providerHex, round, dimension)
+	return nil
+}
+
+func parseAccountHex(value string) ([32]byte, error) {
+	var account [32]byte
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return account, fmt.Errorf("%q is not valid hex: %w", value, err)
+	}
+	if len(decoded) != 32 {
+		return account, fmt.Errorf("%q decodes to %d bytes, want 32", value, len(decoded))
+	}
+	copy(account[:], decoded)
+	return account, nil
 }
 
 func printStatus(ctx context.Context, chain *blockchainbridge.RPCClient, registrar *blockchainbridge.Registrar) error {
@@ -214,5 +260,5 @@ func runLoop(chain *blockchainbridge.RPCClient, registrar *blockchainbridge.Regi
 }
 
 func usageError() error {
-	return errors.New("usage: networkvalidator <register <stake> | status | request-exit | withdraw | run>")
+	return errors.New("usage: networkvalidator <register <stake> | status | request-exit | withdraw | run | dispute <provider-hex> <round> <dimension>>")
 }
