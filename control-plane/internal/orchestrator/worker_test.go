@@ -41,6 +41,34 @@ func TestRankableCandidatesExcludesMissingEndpointAndSelectsBestFit(t *testing.T
 	}
 }
 
+func TestRankableCandidatesWiresBandwidthCapacityThrough(t *testing.T) {
+	providers := []agentmanager.SchedulableProvider{
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "with-bandwidth", AgentEndpoint: "https://a:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuTotal: 4, CpuAvailable: 4, RamTotalMb: 4096, RamAvailableMb: 4096, Bandwidth: &sharedv1.Bandwidth{IngressMbps: 200, EgressMbps: 100}}},
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "no-bandwidth-declared", AgentEndpoint: "https://b:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuTotal: 4, CpuAvailable: 4, RamTotalMb: 4096, RamAvailableMb: 4096}},
+	}
+	worker := NewWorker(nil, nil, nil, nil, testRanker())
+	candidates, capacities := worker.rankableCandidates(context.Background(), providers)
+
+	if capacities["with-bandwidth"].TotalIngressMbps != 200 || capacities["with-bandwidth"].TotalEgressMbps != 100 {
+		t.Fatalf("unexpected bandwidth capacity: %+v", capacities["with-bandwidth"])
+	}
+	if capacities["no-bandwidth-declared"].TotalIngressMbps != 0 || capacities["no-bandwidth-declared"].TotalEgressMbps != 0 {
+		t.Fatalf("expected zero bandwidth capacity for an undeclared provider: %+v", capacities["no-bandwidth-declared"])
+	}
+	var found bool
+	for _, c := range candidates {
+		if c.ProviderID == "with-bandwidth" {
+			found = true
+			if c.IngressTotalMbps != 200 || c.EgressTotalMbps != 100 {
+				t.Fatalf("candidate bandwidth not wired through: %+v", c)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected the with-bandwidth candidate to be present")
+	}
+}
+
 func TestCanonicalResourceHashIsStable(t *testing.T) {
 	first := canonicalResourceHash([]byte{1, 2, 3}, "image@sha256:abc")
 	if first != canonicalResourceHash([]byte{1, 2, 3}, "image@sha256:abc") {

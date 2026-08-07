@@ -18,7 +18,7 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 }
 
 func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload) (Workload, error) {
-	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.OwnerID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB)
+	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, reserved_ingress_mbps, reserved_egress_mbps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.OwnerID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB, candidate.ReservedIngressMbps, candidate.ReservedEgressMbps)
 	if err != nil {
 		return Workload{}, err
 	}
@@ -192,13 +192,14 @@ func (r *PostgresRepository) AssignLease(ctx context.Context, item Workload, pro
 		}
 	}()
 
-	var reservedCPU, reservedRAM, reservedStorage int64
+	var reservedCPU, reservedRAM, reservedStorage, reservedIngress, reservedEgress int64
 	err = tx.QueryRow(ctx, `
-		SELECT COALESCE(SUM(reserved_cpu_millicores), 0), COALESCE(SUM(reserved_ram_mb), 0), COALESCE(SUM(reserved_storage_gb), 0)
+		SELECT COALESCE(SUM(reserved_cpu_millicores), 0), COALESCE(SUM(reserved_ram_mb), 0), COALESCE(SUM(reserved_storage_gb), 0),
+		       COALESCE(SUM(reserved_ingress_mbps), 0), COALESCE(SUM(reserved_egress_mbps), 0)
 		FROM workloads
 		WHERE provider_id = $1 AND state IN ('LEASE_PENDING', 'LEASED', 'DEPLOYING', 'RUNNING')`,
 		providerID,
-	).Scan(&reservedCPU, &reservedRAM, &reservedStorage)
+	).Scan(&reservedCPU, &reservedRAM, &reservedStorage, &reservedIngress, &reservedEgress)
 	if isSerializationFailure(err) {
 		return 0, ErrConflict
 	}
@@ -207,7 +208,9 @@ func (r *PostgresRepository) AssignLease(ctx context.Context, item Workload, pro
 	}
 	if reservedCPU+item.ReservedCPUMillicores > capacity.TotalCPUMillicores ||
 		reservedRAM+item.ReservedRAMMB > capacity.TotalRAMMB ||
-		reservedStorage+item.ReservedStorageGB > capacity.TotalStorageGB {
+		reservedStorage+item.ReservedStorageGB > capacity.TotalStorageGB ||
+		reservedIngress+item.ReservedIngressMbps > capacity.TotalIngressMbps ||
+		reservedEgress+item.ReservedEgressMbps > capacity.TotalEgressMbps {
 		return 0, ErrCapacityExceeded
 	}
 
@@ -270,9 +273,9 @@ func (r *PostgresRepository) RetryLater(ctx context.Context, item Workload, code
 	return nil
 }
 
-const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,'')`
+const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps`
 const selectWorkload = `SELECT ` + workloadColumns + ` FROM workloads`
-const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,'')`
+const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps`
 
 type scanner interface{ Scan(...any) error }
 
@@ -280,7 +283,7 @@ func scanWorkload(row scanner) (Workload, error) {
 	var w Workload
 	var hash, resourceHash []byte
 	var workerLeaseUntil *time.Time
-	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID)
+	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID, &w.ReservedIngressMbps, &w.ReservedEgressMbps)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Workload{}, ErrNotFound
 	}

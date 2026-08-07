@@ -187,6 +187,52 @@ func TestProfileWeightsSumToTenThousand(t *testing.T) {
 	}
 }
 
+func TestRankExcludesInsufficientBandwidthOnlyWhenRequested(t *testing.T) {
+	requirements := &sharedv1.ResourceRequirements{
+		Cpu: 1, RamMb: 512,
+		Bandwidth: &sharedv1.Bandwidth{IngressMbps: 100, EgressMbps: 50},
+	}
+	candidates := []Candidate{
+		{ProviderID: "no-bandwidth-declared", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096},
+		{ProviderID: "insufficient-egress", AgentEndpoint: "https://b", CPUAvailableCores: 4, RAMAvailableMB: 4096, IngressTotalMbps: 200, EgressTotalMbps: 10},
+		{ProviderID: "fits", AgentEndpoint: "https://c", CPUAvailableCores: 4, RAMAvailableMB: 4096, IngressTotalMbps: 200, EgressTotalMbps: 100},
+	}
+	decision := testRanker().Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, candidates)
+
+	if decision.Selected == nil || decision.Selected.ProviderID != "fits" {
+		t.Fatalf("Selected = %+v, want fits", decision.Selected)
+	}
+	excludedIDs := map[string]bool{}
+	for _, e := range decision.Excluded {
+		excludedIDs[e.ProviderID] = true
+	}
+	for _, want := range []string{"no-bandwidth-declared", "insufficient-egress"} {
+		if !excludedIDs[want] {
+			t.Fatalf("expected %s to be excluded for insufficient bandwidth, excluded=%v", want, decision.Excluded)
+		}
+	}
+}
+
+func TestRankIgnoresBandwidthEntirelyWhenNotRequested(t *testing.T) {
+	// A workload with no bandwidth requirement must select the same
+	// winner and produce the same score as before bandwidth existed --
+	// bandwidth must never silently dilute cpu/ram/storage's weight in
+	// the resource-fit average for workloads that don't care about it.
+	requirements := &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 512}
+	candidateWithoutBandwidth := Candidate{ProviderID: "a", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096}
+	candidateWithZeroBandwidth := Candidate{ProviderID: "a", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096, IngressTotalMbps: 0, EgressTotalMbps: 0}
+
+	withoutBandwidth := testRanker().Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, []Candidate{candidateWithoutBandwidth})
+	withZeroBandwidth := testRanker().Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, []Candidate{candidateWithZeroBandwidth})
+
+	if withoutBandwidth.Selected == nil || withZeroBandwidth.Selected == nil {
+		t.Fatalf("expected both to select, got %+v and %+v", withoutBandwidth.Selected, withZeroBandwidth.Selected)
+	}
+	if withoutBandwidth.Selected.ResourceFitBps != withZeroBandwidth.Selected.ResourceFitBps {
+		t.Fatalf("ResourceFitBps differs by bandwidth alone: %d vs %d", withoutBandwidth.Selected.ResourceFitBps, withZeroBandwidth.Selected.ResourceFitBps)
+	}
+}
+
 func TestRankUsesFallbackWeightsForAnUnknownProfile(t *testing.T) {
 	requirements := &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 512}
 	candidates := []Candidate{

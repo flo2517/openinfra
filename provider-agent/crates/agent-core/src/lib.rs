@@ -23,6 +23,19 @@ pub struct AgentSettings {
     pub listen_address: String,
     #[serde(default)]
     pub advertised_endpoint: String,
+    // Operator-declared sustained network capacity, megabits per second
+    // (see protocol/proto Bandwidth for the exact unit convention). Unlike
+    // CPU/RAM/storage, real link speed generally isn't auto-detectable in
+    // virtualized/cloud environments (no reliable NIC-speed API sysinfo
+    // or the OS can expose for virtio/cloud interfaces), so this is
+    // operator-configured, the same trust boundary as the price/
+    // reputation claims a provider already self-declares. Independent
+    // measurement/validation of this claim is issue #30's still-open
+    // remainder, not this field.
+    #[serde(default)]
+    pub bandwidth_ingress_mbps: i32,
+    #[serde(default)]
+    pub bandwidth_egress_mbps: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -65,6 +78,8 @@ impl Default for AgentConfig {
                 agent_version: "0.1.0".to_string(),
                 listen_address: default_listen_address(),
                 advertised_endpoint: String::new(),
+                bandwidth_ingress_mbps: 0,
+                bandwidth_egress_mbps: 0,
             },
             security: SecuritySettings {
                 key_path: PathBuf::from("identity.key"),

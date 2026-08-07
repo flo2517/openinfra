@@ -281,10 +281,17 @@ func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanage
 			candidate.CPUAvailableCores, candidate.CPUTotalCores = c.CpuAvailable, c.CpuTotal
 			candidate.RAMAvailableMB, candidate.RAMTotalMB = c.RamAvailableMb, c.RamTotalMb
 			candidate.StorageAvailableGB, candidate.StorageTotalGB = c.StorageAvailableGb, c.StorageTotalGb
+			var ingressMbps, egressMbps int64
+			if c.Bandwidth != nil {
+				ingressMbps, egressMbps = int64(c.Bandwidth.IngressMbps), int64(c.Bandwidth.EgressMbps)
+			}
+			candidate.IngressTotalMbps, candidate.EgressTotalMbps = ingressMbps, egressMbps
 			capacities[p.ProviderID] = workloadapi.ProviderCapacity{
 				TotalCPUMillicores: workloadapi.CPUCoresToMillicores(c.CpuTotal),
 				TotalRAMMB:         c.RamTotalMb,
 				TotalStorageGB:     c.StorageTotalGb,
+				TotalIngressMbps:   ingressMbps,
+				TotalEgressMbps:    egressMbps,
 			}
 		}
 		if w.reputation != nil && len(p.PublicKey) == 32 {

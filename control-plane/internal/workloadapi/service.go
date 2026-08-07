@@ -48,21 +48,28 @@ type Workload struct {
 	WorkerLeaseUntil                            time.Time
 	Version                                     int64
 	AttemptCount                                int
-	// ReservedCPUMillicores/RAMMB/StorageGB are this workload's claim on
-	// its eventual provider's declared total capacity, fixed at creation
-	// time from validated ResourceRequirements. See migration 000008.
-	ReservedCPUMillicores            int64
-	ReservedRAMMB, ReservedStorageGB int64
+	// ReservedCPUMillicores/RAMMB/StorageGB/IngressMbps/EgressMbps are this
+	// workload's claim on its eventual provider's declared total
+	// capacity, fixed at creation time from validated
+	// ResourceRequirements. See migrations 000008 and 000010.
+	ReservedCPUMillicores                   int64
+	ReservedRAMMB, ReservedStorageGB        int64
+	ReservedIngressMbps, ReservedEgressMbps int64
 }
 
 // ProviderCapacity is a provider's declared total capacity, used as the
 // hard ceiling AssignLease checks reservations against -- not its live
 // "available" figure, which lives only in Redis (reconstructible, not
 // authoritative for an atomic Postgres check; see AssignLease's doc
-// comment in postgres.go for the reasoning).
+// comment in postgres.go for the reasoning). TotalIngressMbps/
+// TotalEgressMbps are 0 for a provider that hasn't operator-configured a
+// bandwidth capacity (see agent-core's AgentSettings doc comment) -- a
+// workload with a nonzero bandwidth requirement simply cannot fit such a
+// provider, the same as any other zero-capacity dimension.
 type ProviderCapacity struct {
-	TotalCPUMillicores         int64
-	TotalRAMMB, TotalStorageGB int64
+	TotalCPUMillicores                int64
+	TotalRAMMB, TotalStorageGB        int64
+	TotalIngressMbps, TotalEgressMbps int64
 }
 
 // CPUCoresToMillicores converts a validated ResourceCapability/
@@ -104,6 +111,11 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 	}
 	now := s.now().UTC()
 	requirements := request.Definition.Requirements
+	var ingressMbps, egressMbps int64
+	if requirements.Bandwidth != nil {
+		ingressMbps = int64(requirements.Bandwidth.IngressMbps)
+		egressMbps = int64(requirements.Bandwidth.EgressMbps)
+	}
 	stored, err := s.repository.CreateOrGet(ctx, Workload{
 		WorkloadID:            request.Definition.WorkloadId,
 		RequestID:             request.RequestId,
@@ -117,6 +129,8 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 		ReservedCPUMillicores: CPUCoresToMillicores(requirements.Cpu),
 		ReservedRAMMB:         requirements.RamMb,
 		ReservedStorageGB:     requirements.StorageGb,
+		ReservedIngressMbps:   ingressMbps,
+		ReservedEgressMbps:    egressMbps,
 	})
 	if err != nil {
 		return nil, repositoryError(err)
@@ -206,6 +220,11 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 	}
 	if requirements.RamMb <= 0 || requirements.StorageGb < 0 || requirements.GpuCount != 0 {
 		return nil, [32]byte{}, errors.New("RAM must be positive, storage non-negative, and GPU unsupported in MVP")
+	}
+	if bandwidth := requirements.Bandwidth; bandwidth != nil {
+		if bandwidth.IngressMbps < 0 || bandwidth.EgressMbps < 0 {
+			return nil, [32]byte{}, errors.New("bandwidth ingress/egress must be non-negative")
+		}
 	}
 	if definition.DurationSeconds <= 0 || definition.DurationSeconds > 30*24*60*60 {
 		return nil, [32]byte{}, errors.New("duration_seconds must be between 1 and 2592000")
