@@ -25,4 +25,11 @@ RUN chmod 0755 /usr/local/bin/openinfra-authority-entrypoint
 
 USER 10001:10001
 EXPOSE 9944 30333
-ENTRYPOINT ["/usr/local/bin/openinfra-node"]
+# docker/authority-entrypoint.sh inserts this authority's Aura/GRANDPA
+# keys (via OPENINFRA_DEV_AUTHORITY_SEED) before exec'ing openinfra-node
+# with whatever CLI args docker-compose/CMD supplies -- without this, an
+# authority's keystore stays empty and it can never author a block or
+# vote in GRANDPA, no matter what CLI flags (--alice, etc.) are passed to
+# openinfra-node directly. This was previously dead code: the script was
+# copied into the image but never made the entrypoint.
+ENTRYPOINT ["/usr/local/bin/openinfra-authority-entrypoint"]
