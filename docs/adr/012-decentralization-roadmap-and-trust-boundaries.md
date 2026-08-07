@@ -205,14 +205,14 @@ named in the last column.
 
 | Gate | Unblocks | Prohibition it must lift, and what it must settle |
 |---|---|---|
-| **ADR-013** — replicated off-chain data plane | #33 | "another database". Must settle: event log vs CRDT, deterministic IDs, ordering, snapshots, pruning, and the PostgreSQL deprecation criteria |
-| **ADR-014** — multi-Control-Plane and relay protocol | #34 | single-Control-Plane component boundary. Must settle: leader/leaderless rules, idempotency, peer admission, and how an Agent refuses an unauthenticated relay |
-| **ADR-015** — slashing and economic penalties | #52 | none (new mechanism). Already demanded by ADR-011 §5, which ships rewards but explicitly defers slashing economics. Must settle: false-positive protection, appeals, and interaction with `dispute_round` |
-| **ADR-016** — on-chain orchestration | #50, #62 | "runtime orchestration". Must settle: what scheduling logic is deterministic enough for the runtime, and what stays off-chain |
-| **ADR-017** — P2P mesh and DHT discovery | #53, #54, #55, #56 | "direct Agent-to-chain access", and the Control-Plane-mediated key exchange in `control-plane/internal/wireguard/wireguard.go`. Must settle: peer authentication without a central introducer, and what stays lease-gated per ADR-010 |
-| **ADR-018** — content-addressed distribution and decentralized storage | #35, #58, #59 | "another database". Must settle: pinning, retention proofs, erasure, and gateway trust |
-| **ADR-019** — TEE and distributed attestation | #60, #61 | none (new trust root). Must settle: which vendor roots are trusted, revocation, and what an unattested provider may still do |
-| **ADR-020** — decentralized identity, key rotation, and governance | #36 | `EnsureRoot` as governance (`blockchain/runtime/src/lib.rs:316`). Must settle: rotation and recovery per role, stake/delegation, timelocks, and emergency constraints |
+| **ADR-016** — replicated off-chain data plane | #33 | "another database". Must settle: event log vs CRDT, deterministic IDs, ordering, snapshots, pruning, and the PostgreSQL deprecation criteria |
+| **ADR-017** — multi-Control-Plane and relay protocol | #34 | single-Control-Plane component boundary. Must settle: leader/leaderless rules, idempotency, peer admission, and how an Agent refuses an unauthenticated relay |
+| **ADR-018** — slashing and economic penalties | #52 | none (new mechanism). Already demanded by ADR-011 §5, which ships rewards but explicitly defers slashing economics. Must settle: false-positive protection, appeals, and interaction with `dispute_round` |
+| **ADR-019** — on-chain orchestration | #50, #62 | "runtime orchestration". Must settle: what scheduling logic is deterministic enough for the runtime, and what stays off-chain |
+| **ADR-020** — P2P mesh and DHT discovery | #53, #54, #55, #56 | "direct Agent-to-chain access", and the Control-Plane-mediated key exchange in `control-plane/internal/wireguard/wireguard.go`. Must settle: peer authentication without a central introducer, and what stays lease-gated per ADR-010 |
+| **ADR-021** — content-addressed distribution and decentralized storage | #35, #58, #59 | "another database". Must settle: pinning, retention proofs, erasure, and gateway trust |
+| **ADR-022** — TEE and distributed attestation | #60, #61 | none (new trust root). Must settle: which vendor roots are trusted, revocation, and what an unattested provider may still do |
+| **ADR-023** — decentralized identity, key rotation, and governance | #36 | `EnsureRoot` as governance (`blockchain/runtime/src/lib.rs:316`). Must settle: rotation and recovery per role, stake/delegation, timelocks, and emergency constraints |
 
 Three issues need **no new gate**:
 
@@ -223,7 +223,7 @@ Three issues need **no new gate**:
 - **#51 streaming payments** is gated on the metering and settlement architecture
   already scoped by #19 (milestone v1.1), not on a new ADR.
 - **#63 IaC DSL** needs no gate while it is evaluated off-chain. If any part of it
-  is ever evaluated in the runtime, it falls under ADR-016 and inherits the
+  is ever evaluated in the runtime, it falls under ADR-019 and inherits the
   determinism, bounded-input, and no-floats rules of `AGENTS.md:23`.
 
 ### 7. Trade-offs and rollback
@@ -280,3 +280,20 @@ It does not change any code, origin, or storage item today.
   (`009-control-plane-provider-registration.md` and
   `009-local-aura-grandpa-testnet.md`). This ADR takes `012` and does not renumber
   them; the collision is noted so it is not repeated.
+- **§6's gate numbers were renumbered once, after the fact.** This ADR originally
+  reserved `ADR-013` through `ADR-020` for the eight gates above. `ADR-013` and
+  `ADR-014` were then accepted for unrelated, unplanned work (the Network
+  Validator daemon and wallet-based dashboard login, respectively — neither is a
+  Stage 1+ decentralization gate), and `ADR-015` was about to be claimed the same
+  way (independent bandwidth measurement) before this correction. Rather than let
+  `AGENTS.md`'s prohibition list keep citing gate numbers that actually name
+  something else, every gate in §6 (and every citation of it in `AGENTS.md` and
+  `ROADMAP.md`) was shifted by three: `ADR-013`→`ADR-016`,
+  `ADR-014`→`ADR-017`, `ADR-015`→`ADR-018`, `ADR-016`→`ADR-019`,
+  `ADR-017`→`ADR-020`, `ADR-018`→`ADR-021`, `ADR-019`→`ADR-022`,
+  `ADR-020`→`ADR-023`. `ADR-015` (bandwidth measurement) still lands as the real,
+  accepted `ADR-015` — a coincidence of timing with this correction, not a
+  renumbering of it. Future ADR numbers are assigned strictly in submission order
+  from whatever is next free at the time; this table is a *reservation of
+  intent*, not a claim on the number, and the next accepted ADR of any kind
+  (gate or not) takes the next integer regardless of what this table says.
