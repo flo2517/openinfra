@@ -25,12 +25,16 @@ func (r *PostgresRepository) CreateUser(ctx context.Context, displayName string)
 }
 
 func (r *PostgresRepository) CreateAPIKey(ctx context.Context, userID string) (APIKey, error) {
+	return r.CreateAPIKeyWithExpiry(ctx, userID, nil)
+}
+
+func (r *PostgresRepository) CreateAPIKeyWithExpiry(ctx context.Context, userID string, expiresAt *time.Time) (APIKey, error) {
 	raw, hash, prefix, err := GenerateAPIKey()
 	if err != nil {
 		return APIKey{}, err
 	}
-	key := APIKey{KeyID: uuid.NewString(), UserID: userID, Prefix: prefix, Raw: raw, CreatedAt: time.Now().UTC()}
-	if _, err := r.pool.Exec(ctx, `INSERT INTO api_keys (key_id, user_id, key_hash, prefix, created_at) VALUES ($1,$2,$3,$4,$5)`, key.KeyID, key.UserID, hash[:], key.Prefix, key.CreatedAt); err != nil {
+	key := APIKey{KeyID: uuid.NewString(), UserID: userID, Prefix: prefix, Raw: raw, CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt}
+	if _, err := r.pool.Exec(ctx, `INSERT INTO api_keys (key_id, user_id, key_hash, prefix, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6)`, key.KeyID, key.UserID, hash[:], key.Prefix, key.CreatedAt, key.ExpiresAt); err != nil {
 		return APIKey{}, err
 	}
 	return key, nil

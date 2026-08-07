@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/userauth"
+	"github.com/openinfra/network/internal/walletlogin"
 	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"github.com/redis/go-redis/v9"
@@ -23,11 +25,21 @@ import (
 //go:embed assets/*
 var assets embed.FS
 
+// RateLimiter is satisfied by internal/ratelimit.RedisLimiter -- named
+// locally rather than importing that package's own interface, so this
+// package doesn't couple to userauth's copy of the same tiny shape.
+type RateLimiter interface {
+	Allow(ctx context.Context, key string) (bool, error)
+}
+
 type Server struct {
-	pool  *pgxpool.Pool
-	redis redis.UniversalClient
-	chain *blockchainbridge.RPCClient
-	now   func() time.Time
+	pool    *pgxpool.Pool
+	redis   redis.UniversalClient
+	chain   *blockchainbridge.RPCClient
+	wallet  *walletlogin.Service
+	users   userauth.Repository
+	limiter RateLimiter
+	now     func() time.Time
 }
 
 type Provider struct {
@@ -112,8 +124,8 @@ type Workload struct {
 	CreatedAt  string `json:"created_at"`
 }
 
-func New(pool *pgxpool.Pool, redisClient redis.UniversalClient, chain *blockchainbridge.RPCClient) *Server {
-	return &Server{pool: pool, redis: redisClient, chain: chain, now: time.Now}
+func New(pool *pgxpool.Pool, redisClient redis.UniversalClient, chain *blockchainbridge.RPCClient, wallet *walletlogin.Service, users userauth.Repository, limiter RateLimiter) *Server {
+	return &Server{pool: pool, redis: redisClient, chain: chain, wallet: wallet, users: users, limiter: limiter, now: time.Now}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -125,6 +137,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /api/v1/overview", s.overview)
+	mux.HandleFunc("POST /api/v1/auth/challenge", s.authChallenge)
+	mux.HandleFunc("POST /api/v1/auth/login", s.authLogin)
+	mux.HandleFunc("POST /api/v1/auth/api-keys", s.authIssueAPIKey)
 	mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(static))))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
