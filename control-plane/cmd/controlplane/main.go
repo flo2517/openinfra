@@ -139,6 +139,11 @@ func run() error {
 	providerRepository := providerjoin.NewPostgresRepository(pool)
 	service := providerjoin.NewService(providerRepository, providerjoin.NewRedisHeartbeatStore(redisClient), registrar)
 	service.SetWorkloadService(workloadapi.NewService(workloadRepository))
+	// ADR-013 §3: push the current active-validator allowlist to Agents on
+	// every heartbeat. chainClient already implements ValidatorSource via
+	// RPCClient.LatestActiveNetworkValidators; a read failure degrades to
+	// an empty list inside Service, it never fails ReportHeartbeat itself.
+	service.SetValidatorSource(chainClient)
 	// Independently drives provider_chain_registrations rows left in
 	// READY/RETRY (e.g. after a Control Plane or chain restart) to
 	// FINALIZED, without depending on the Agent retrying CompleteJoin.

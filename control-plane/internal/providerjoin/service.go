@@ -96,6 +96,16 @@ type WorkloadService interface {
 	StopWorkload(context.Context, *controlplanev1.StopWorkloadRequest) (*controlplanev1.StopWorkloadResponse, error)
 }
 
+// ValidatorSource reads the current active Network Validator set (raw
+// 32-byte Ed25519 public keys) so ReportHeartbeat can push it to the Agent
+// every ~15s (ADR-013 §3). Optional, like orchestrator's ReputationSource:
+// SetValidatorSource may be left unset, and a read failure once set must
+// degrade to an empty allowlist rather than fail the heartbeat -- liveness
+// must never depend on the chain being reachable.
+type ValidatorSource interface {
+	LatestActiveNetworkValidators(ctx context.Context) ([][32]byte, error)
+}
+
 type Service struct {
 	controlplanev1.UnimplementedControlPlaneServiceServer
 	repository        Repository
@@ -105,9 +115,15 @@ type Service struct {
 	challengeTTL      time.Duration
 	heartbeatInterval time.Duration
 	workloads         WorkloadService
+	validators        ValidatorSource
 }
 
 func (s *Service) SetWorkloadService(workloads WorkloadService) { s.workloads = workloads }
+
+// SetValidatorSource enables pushing the active Network Validator allowlist
+// on every heartbeat response. See ValidatorSource's doc comment for the
+// degraded-mode behavior when unset or when a read fails.
+func (s *Service) SetValidatorSource(validators ValidatorSource) { s.validators = validators }
 
 func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.SubmitWorkloadRequest) (*controlplanev1.SubmitWorkloadResponse, error) {
 	if s.workloads == nil {
@@ -259,7 +275,30 @@ func (s *Service) ReportHeartbeat(ctx context.Context, request *controlplanev1.R
 		Status:               sharedv1.NodeStatus_NODE_STATUS_ACTIVE,
 		AcceptedAt:           timestamppb.New(now),
 		NextHeartbeatSeconds: uint32(s.heartbeatInterval / time.Second),
+		ActiveValidators:     s.activeValidators(ctx),
 	}, nil
+}
+
+// activeValidators reads the current active Network Validator set for the
+// heartbeat response. A read failure (chain unreachable, RPC error) or an
+// unset source degrades to an empty list rather than failing the
+// heartbeat -- liveness (this RPC's core job) must not depend on chain
+// availability. Logged at warn, not error: an Agent temporarily missing a
+// refreshed allowlist is a availability/degraded-mode concern, not a bug.
+func (s *Service) activeValidators(ctx context.Context) [][]byte {
+	if s.validators == nil {
+		return nil
+	}
+	accounts, err := s.validators.LatestActiveNetworkValidators(ctx)
+	if err != nil {
+		slog.Warn("active validator set unavailable; pushing empty allowlist", "error", err)
+		return nil
+	}
+	keys := make([][]byte, len(accounts))
+	for i, account := range accounts {
+		keys[i] = bytes.Clone(account[:])
+	}
+	return keys
 }
 
 func validateHeartbeat(request *controlplanev1.ReportHeartbeatRequest, now time.Time) error {

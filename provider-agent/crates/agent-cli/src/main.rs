@@ -1,3 +1,5 @@
+mod mtls;
+
 use agent_api::{
     openinfra::{controlplane::v1 as controlplanev1, shared::v1 as sharedv1},
     proto::provider_agent_service_server::ProviderAgentServiceServer,
@@ -12,12 +14,11 @@ use agent_executor::DockerExecutor;
 use agent_inventory::InventoryManager;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use mtls::ValidatorAllowlist;
 use prost::Message;
 use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
-use tonic::transport::{
-    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig,
-};
-use tracing::{error, info};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const JOIN_DOMAIN: &[u8] = b"openinfra-join-v1\0";
@@ -75,12 +76,25 @@ async fn handle_start(dev: bool) -> Result<()> {
     )?);
     let inventory_manager = Arc::new(InventoryManager::new());
     let local_state = Arc::new(LocalState::open(&config.executor.state_path)?);
+    // ADR-013 §3: the most recently ReportHeartbeat-pushed set of active
+    // Network Validator keys, read live by the mTLS verifier built below
+    // (non-dev branch) and updated after every successful heartbeat
+    // round-trip by the background task spawned here. Built unconditionally
+    // (even in --dev, where it's never read) so report_heartbeat_with_state
+    // has one signature regardless of mode.
+    let validator_allowlist = ValidatorAllowlist::new();
     let heartbeat_config = config.clone();
     let heartbeat_state = Arc::clone(&local_state);
+    let heartbeat_allowlist = validator_allowlist.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(error) =
-                report_heartbeat_with_state(&heartbeat_config, dev, &heartbeat_state).await
+            if let Err(error) = report_heartbeat_with_state(
+                &heartbeat_config,
+                dev,
+                &heartbeat_state,
+                &heartbeat_allowlist,
+            )
+            .await
             {
                 error!(%error, "background heartbeat failed");
             }
@@ -126,27 +140,35 @@ async fn handle_start(dev: bool) -> Result<()> {
         executor,
     };
 
-    let mut builder = tonic::transport::Server::builder();
+    let router =
+        tonic::transport::Server::builder().add_service(ProviderAgentServiceServer::new(server));
     if dev {
         if !addr.ip().is_loopback() {
             anyhow::bail!("plaintext development Agent requires a loopback listen address")
         }
         info!(%addr, "gRPC server listening in loopback plaintext development mode");
+        router.serve(addr).await?;
     } else {
         let certificate = fs::read(env::var("AGENT_TLS_CERT_FILE")?)?;
         let private_key = fs::read(env::var("AGENT_TLS_KEY_FILE")?)?;
         let client_ca = fs::read(env::var("AGENT_TLS_CLIENT_CA_FILE")?)?;
-        builder = builder.tls_config(
-            ServerTlsConfig::new()
-                .identity(Identity::from_pem(certificate, private_key))
-                .client_ca_root(Certificate::from_pem(client_ca)),
-        )?;
-        info!(%addr, "gRPC server listening with mandatory mTLS");
-    }
-    builder
-        .add_service(ProviderAgentServiceServer::new(server))
-        .serve(addr)
+        // ADR-013 §3: tonic's ServerTlsConfig has no hook for a custom
+        // rustls ClientCertVerifier, so this builds the rustls::ServerConfig
+        // by hand (mtls::build_server_config) and drives the listener
+        // through tonic's serve_with_incoming escape hatch instead of
+        // Server::tls_config/serve. See mtls.rs's module doc for the full
+        // reasoning.
+        let incoming = mtls::serve_incoming(
+            addr,
+            &certificate,
+            &private_key,
+            &client_ca,
+            validator_allowlist,
+        )
         .await?;
+        info!(%addr, "gRPC server listening with mandatory mTLS (Control Plane CA or allowlisted Network Validator key)");
+        router.serve_with_incoming(incoming).await?;
+    }
     Ok(())
 }
 
@@ -196,13 +218,17 @@ async fn handle_join(dev: bool) -> Result<()> {
 async fn handle_heartbeat(dev: bool) -> Result<()> {
     let config = load_config()?;
     let state = LocalState::open(&config.executor.state_path)?;
-    report_heartbeat_with_state(&config, dev, &state).await
+    // A one-shot `heartbeat` CLI invocation has no running mTLS server to
+    // update, so this allowlist handle is discarded after the call; it
+    // only matters to the long-running loop `handle_start` spawns.
+    report_heartbeat_with_state(&config, dev, &state, &ValidatorAllowlist::new()).await
 }
 
 async fn report_heartbeat_with_state(
     config: &AgentConfig,
     dev: bool,
     state: &LocalState,
+    validator_allowlist: &ValidatorAllowlist,
 ) -> Result<()> {
     let provider_id = config
         .agent
@@ -239,6 +265,27 @@ async fn report_heartbeat_with_state(
     if response.status != sharedv1::NodeStatus::Active as i32 {
         anyhow::bail!("Control Plane returned non-active heartbeat status")
     }
+    // ADR-013 §3: replace -- never merge into -- the mTLS allowlist with
+    // exactly what this heartbeat carried, so a validator the Control
+    // Plane no longer reports as active stops being trusted starting with
+    // the very next inbound handshake. A malformed (non-32-byte) entry is
+    // dropped with a warning, not treated as fatal: one bad entry must not
+    // take every other legitimate validator off the allowlist.
+    let active_validators = response
+        .active_validators
+        .iter()
+        .filter_map(|key| match <[u8; 32]>::try_from(key.as_slice()) {
+            Ok(key) => Some(key),
+            Err(_) => {
+                warn!(
+                    length = key.len(),
+                    "dropping malformed active_validators entry"
+                );
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    validator_allowlist.set(active_validators);
     info!(%provider_id, sequence, "heartbeat accepted");
     println!("Provider ACTIVE: {provider_id} (heartbeat {sequence})");
     Ok(())

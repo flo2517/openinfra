@@ -24,6 +24,19 @@ func (c *RPCClient) ActiveNetworkValidators(ctx context.Context, blockHash strin
 	return decodeAccountIdVec(value)
 }
 
+// LatestActiveNetworkValidators resolves the current finalized head and
+// reads ActiveNetworkValidators at it -- the convenience form callers that
+// don't otherwise need a specific block hash (e.g. the heartbeat path
+// pushing the allowlist to Agents, ADR-013 §3) should use, mirroring
+// LatestReputationVector's role for reputation.go.
+func (c *RPCClient) LatestActiveNetworkValidators(ctx context.Context) ([][32]byte, error) {
+	head, err := c.FinalizedHead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.ActiveNetworkValidators(ctx, head)
+}
+
 // networkValidatorStorageKey addresses a StorageValue item (no map key
 // component), unlike mapStorageKey which hashes a lookup key onto the
 // prefix. "NetworkValidator" must match the pallet's identifier in
