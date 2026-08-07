@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,23 +26,42 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-// fakeAgentServer reproduces agent-api's real solve_challenge handler
-// (provider-agent/crates/agent-api/src/lib.rs) exactly, in Go, so this
-// test exercises the validator's actual verification logic against a
-// byte-for-byte faithful re-implementation of what the real Agent
-// computes -- not a stub that just echoes back whatever would make the
-// test pass.
+// fakeAgentServer reproduces agent-api's real solve_challenge and
+// measure_bandwidth handlers (provider-agent/crates/agent-api/src/lib.rs)
+// exactly, in Go, so tests exercise the validator's actual verification
+// logic against a byte-for-byte faithful re-implementation of what the
+// real Agent computes -- not a stub that just echoes back whatever would
+// make the test pass.
 type fakeAgentServer struct {
 	agentv1.UnimplementedProviderAgentServiceServer
 	privateKey ed25519.PrivateKey
 	// tamperSignature/tamperResult let individual tests corrupt an
-	// otherwise-correct response to prove the validator's verification
-	// actually rejects a bad response, not just accepts a good one.
+	// otherwise-correct SolveChallenge response to prove the validator's
+	// verification actually rejects a bad response, not just accepts a
+	// good one.
 	tamperSignature bool
 	tamperResult    bool
+	// tamperBandwidthSignature/tamperBandwidthUploadHash do the same for
+	// MeasureBandwidth responses (ADR-015).
+	tamperBandwidthSignature  bool
+	tamperBandwidthUploadHash bool
+	// declaredIngressMbps/declaredEgressMbps feed the fake dashboard's
+	// agent-endpoint response (see startTestAgentHarness) -- the
+	// "provider's own declared bandwidth" ADR-015 §5's tolerance check
+	// scores a MeasureBandwidth probe against.
+	declaredIngressMbps int32
+	declaredEgressMbps  int32
+
+	mu                    sync.Mutex
+	solveChallengeTypes   []agentv1.SolveChallengeRequest_Type
+	measureBandwidthCalls int
 }
 
 func (s *fakeAgentServer) SolveChallenge(_ context.Context, req *agentv1.SolveChallengeRequest) (*agentv1.SolveChallengeResponse, error) {
+	s.mu.Lock()
+	s.solveChallengeTypes = append(s.solveChallengeTypes, req.Type)
+	s.mu.Unlock()
+
 	sum := sha256.Sum256(req.Payload)
 	result := sum[:]
 	signed := signedChallengeBytes(req.ChallengeId, int32(req.Type), result)
@@ -60,6 +80,40 @@ func (s *fakeAgentServer) SolveChallenge(_ context.Context, req *agentv1.SolveCh
 		Result:       result,
 		DurationMs:   1,
 		Signature:    signature,
+	}, nil
+}
+
+// MeasureBandwidth reproduces agent-api's real measure_bandwidth handler
+// (see bandwidth.go's bandwidthSignedBytes doc comment for the exact
+// signed-byte layout this mirrors).
+func (s *fakeAgentServer) MeasureBandwidth(_ context.Context, req *agentv1.MeasureBandwidthRequest) (*agentv1.MeasureBandwidthResponse, error) {
+	s.mu.Lock()
+	s.measureBandwidthCalls++
+	s.mu.Unlock()
+
+	sum := sha256.Sum256(req.UploadPayload)
+	uploadPayloadHash := sum[:]
+	downloadPayload := make([]byte, req.RequestedDownloadBytes)
+	if _, err := rand.Read(downloadPayload); err != nil {
+		return nil, err
+	}
+	const serverProcessingMs = 1
+	signed := bandwidthSignedBytes(req.ProbeId, uploadPayloadHash, downloadPayload, serverProcessingMs)
+	signature := ed25519.Sign(s.privateKey, signed)
+	if s.tamperBandwidthUploadHash {
+		uploadPayloadHash = append([]byte{}, uploadPayloadHash...)
+		uploadPayloadHash[0] ^= 0xFF
+	}
+	if s.tamperBandwidthSignature {
+		signature = append([]byte{}, signature...)
+		signature[0] ^= 0xFF
+	}
+	return &agentv1.MeasureBandwidthResponse{
+		ProbeId:            req.ProbeId,
+		UploadPayloadHash:  uploadPayloadHash,
+		DownloadPayload:    downloadPayload,
+		ServerProcessingMs: serverProcessingMs,
+		Signature:          signature,
 	}, nil
 }
 
@@ -87,16 +141,28 @@ func startTestAgentHarness(t *testing.T, fake *fakeAgentServer) *testAgentHarnes
 		ClientAuth:   tls.RequireAnyClientCert,
 		MinVersion:   tls.VersionTLS13,
 	}
-	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
+	// MaxRecvMsgSize/MaxSendMsgSize: this fake server stands in for the
+	// real Agent, which (agent-cli/src/main.rs) raises tonic's default
+	// 4 MiB message limit for MeasureBandwidth's bandwidthProbeBytes-sized
+	// payloads -- matched here so this harness exercises the same
+	// message-size behavior the real Agent has, not grpc-go's smaller
+	// default.
+	grpcServer := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		grpc.MaxRecvMsgSize(bandwidthMessageSizeLimit),
+		grpc.MaxSendMsgSize(bandwidthMessageSizeLimit),
+	)
 	agentv1.RegisterProviderAgentServiceServer(grpcServer, fake)
 	go func() { _ = grpcServer.Serve(listener) }()
 
 	publicKey := fake.privateKey.Public().(ed25519.PublicKey)
 	providerID := "test-provider-id"
 	dashboard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"agent_endpoint": "https://" + listener.Addr().String(),
-			"public_key":     hex.EncodeToString(publicKey),
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_endpoint":         "https://" + listener.Addr().String(),
+			"public_key":             hex.EncodeToString(publicKey),
+			"bandwidth_ingress_mbps": fake.declaredIngressMbps,
+			"bandwidth_egress_mbps":  fake.declaredEgressMbps,
 		})
 	}))
 

@@ -12,6 +12,12 @@ service ProviderAgentService {
   rpc Stop(StopRequest) returns (StopResponse);
   rpc GetWorkloadStatus(GetWorkloadStatusRequest) returns (GetWorkloadStatusResponse);
   rpc StreamMetrics(StreamMetricsRequest) returns (stream StreamMetricsResponse);
+  // ADR-015: independent bandwidth throughput measurement. A dedicated RPC,
+  // deliberately not an overload of SolveChallenge's existing TYPE_NETWORK
+  // (see ADR-015 §1) -- that type is already merged and exercised by the
+  // live challenge loop (#85) with its existing small-payload liveness/
+  // correctness semantics, which this does not change.
+  rpc MeasureBandwidth(MeasureBandwidthRequest) returns (MeasureBandwidthResponse);
 }
 
 message GetAgentInfoResponse {
@@ -108,6 +114,30 @@ message StreamMetricsResponse {
   string metric_name = 1;
   double value = 2;
   int64 timestamp = 3;
+}
+
+// ADR-015 §1. Both directions share one round trip deliberately: a caller
+// that wants only one direction sets the other side's size to (near)
+// zero, avoiding the clock-skew problems of reconciling two separately
+// timed calls.
+message MeasureBandwidthRequest {
+  string probe_id = 1;
+  // Sent by the validator; its size is what's actually being measured
+  // for *ingress* (validator -> Agent). Bounded server-side by
+  // agent-api's MAX_BANDWIDTH_PROBE_BYTES.
+  bytes upload_payload = 2;
+  // Requested size of download_payload in the response, for measuring
+  // *egress* (Agent -> validator) in the same round trip. 0 means "don't
+  // bother," e.g. when a caller only wants one direction this probe.
+  uint32 requested_download_bytes = 3;
+}
+
+message MeasureBandwidthResponse {
+  string probe_id = 1;
+  bytes upload_payload_hash = 2;   // SHA256(upload_payload) -- proves full, correct receipt
+  bytes download_payload = 3;      // exactly requested_download_bytes of Agent-generated data
+  uint32 server_processing_ms = 4; // time from full request received to response ready, excluding queueing
+  bytes signature = 5;             // Ed25519 over a domain-separated construction, see agent-api's BANDWIDTH_PROBE_DOMAIN
 }
 
 message HealthCheckRequest {}

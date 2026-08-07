@@ -22,6 +22,18 @@ const endpointLookupTimeout = 5 * time.Second
 type AgentEndpoint struct {
 	AgentEndpoint string
 	PublicKey     ed25519.PublicKey
+	// DeclaredIngressMbps/DeclaredEgressMbps are ADR-015 §5's "the
+	// provider's own declared ResourceCapability.Bandwidth" -- the figure
+	// MeasureBandwidth's measured throughput is scored against. Both are
+	// 0 when the dashboard has no fresh heartbeat capability data for
+	// this provider yet (see internal/dashboard/agentendpoint.go's
+	// declaredBandwidth) -- indistinguishable here from "provider
+	// declared 0 Mbps"; MeasureBandwidth's tolerance check treats a
+	// non-positive declared figure as "nothing to verify against" either
+	// way, so this ambiguity does not silently fail a provider that
+	// simply hasn't heartbeated its capability yet.
+	DeclaredIngressMbps int32
+	DeclaredEgressMbps  int32
 }
 
 // EndpointResolver looks up a provider's Agent network address and
@@ -80,6 +92,13 @@ func (resolver *EndpointResolver) Resolve(ctx context.Context, providerID string
 	var decoded struct {
 		AgentEndpoint string `json:"agent_endpoint"`
 		PublicKey     string `json:"public_key"`
+		// Bandwidth fields are omitempty on the dashboard's side (absent
+		// entirely when it has no fresh heartbeat capability data for
+		// this provider), so they decode to their zero value here too --
+		// see AgentEndpoint's doc comment for how that ambiguity is
+		// handled downstream.
+		BandwidthIngressMbps int32 `json:"bandwidth_ingress_mbps"`
+		BandwidthEgressMbps  int32 `json:"bandwidth_egress_mbps"`
 	}
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return AgentEndpoint{}, fmt.Errorf("decode agent-endpoint response: %w", err)
@@ -91,5 +110,10 @@ func (resolver *EndpointResolver) Resolve(ctx context.Context, providerID string
 	if decoded.AgentEndpoint == "" {
 		return AgentEndpoint{}, fmt.Errorf("agent-endpoint discovery for provider %s returned an empty endpoint", providerID)
 	}
-	return AgentEndpoint{AgentEndpoint: decoded.AgentEndpoint, PublicKey: publicKey}, nil
+	return AgentEndpoint{
+		AgentEndpoint:       decoded.AgentEndpoint,
+		PublicKey:           publicKey,
+		DeclaredIngressMbps: decoded.BandwidthIngressMbps,
+		DeclaredEgressMbps:  decoded.BandwidthEgressMbps,
+	}, nil
 }

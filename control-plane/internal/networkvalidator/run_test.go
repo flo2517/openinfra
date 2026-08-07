@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/openinfra/network/internal/blockchainbridge"
+	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
 	"golang.org/x/crypto/blake2b"
 )
 
@@ -182,7 +183,8 @@ func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate agent key: %v", err)
 	}
-	harness := startTestAgentHarness(t, &fakeAgentServer{privateKey: agentPriv})
+	fake := &fakeAgentServer{privateKey: agentPriv}
+	harness := startTestAgentHarness(t, fake)
 	defer harness.close()
 
 	rpc, err := blockchainbridge.NewRPCClient(chainServer.URL, &http.Client{Timeout: 5 * time.Second})
@@ -266,6 +268,37 @@ func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
 	}
 	if evidenceCount != len(Dimensions) {
 		t.Errorf("submit_evidence called %d times, want exactly %d (once per dimension, never re-submitted)", evidenceCount, len(Dimensions))
+	}
+
+	// ADR-015: the Network dimension's evidence must come from exactly one
+	// MeasureBandwidth call, never a SolveChallenge(TYPE_NETWORK) call --
+	// and every other dimension must still go through SolveChallenge
+	// exactly once, unchanged.
+	fake.mu.Lock()
+	measureBandwidthCalls := fake.measureBandwidthCalls
+	solveChallengeTypes := append([]agentv1.SolveChallengeRequest_Type{}, fake.solveChallengeTypes...)
+	fake.mu.Unlock()
+
+	if measureBandwidthCalls != 1 {
+		t.Errorf("MeasureBandwidth called %d times, want exactly 1", measureBandwidthCalls)
+	}
+	wantSolveChallengeTypes := map[agentv1.SolveChallengeRequest_Type]int{
+		agentv1.SolveChallengeRequest_TYPE_COMPUTE:      1,
+		agentv1.SolveChallengeRequest_TYPE_STORAGE:      1,
+		agentv1.SolveChallengeRequest_TYPE_AVAILABILITY: 1,
+		agentv1.SolveChallengeRequest_TYPE_RELIABILITY:  1,
+	}
+	gotSolveChallengeTypes := map[agentv1.SolveChallengeRequest_Type]int{}
+	for _, solveChallengeType := range solveChallengeTypes {
+		gotSolveChallengeTypes[solveChallengeType]++
+	}
+	for solveChallengeType, wantCount := range wantSolveChallengeTypes {
+		if gotSolveChallengeTypes[solveChallengeType] != wantCount {
+			t.Errorf("SolveChallenge(%s) called %d times, want %d", solveChallengeType, gotSolveChallengeTypes[solveChallengeType], wantCount)
+		}
+	}
+	if count := gotSolveChallengeTypes[agentv1.SolveChallengeRequest_TYPE_NETWORK]; count != 0 {
+		t.Errorf("SolveChallenge(TYPE_NETWORK) called %d times, want 0 -- the Network dimension must use MeasureBandwidth instead (ADR-015)", count)
 	}
 }
 

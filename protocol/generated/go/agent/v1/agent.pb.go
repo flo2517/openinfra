@@ -939,6 +939,152 @@ func (x *StreamMetricsResponse) GetTimestamp() int64 {
 	return 0
 }
 
+// ADR-015 §1. Both directions share one round trip deliberately: a caller
+// that wants only one direction sets the other side's size to (near)
+// zero, avoiding the clock-skew problems of reconciling two separately
+// timed calls.
+type MeasureBandwidthRequest struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	ProbeId string                 `protobuf:"bytes,1,opt,name=probe_id,json=probeId,proto3" json:"probe_id,omitempty"`
+	// Sent by the validator; its size is what's actually being measured
+	// for *ingress* (validator -> Agent). Bounded server-side by
+	// agent-api's MAX_BANDWIDTH_PROBE_BYTES.
+	UploadPayload []byte `protobuf:"bytes,2,opt,name=upload_payload,json=uploadPayload,proto3" json:"upload_payload,omitempty"`
+	// Requested size of download_payload in the response, for measuring
+	// *egress* (Agent -> validator) in the same round trip. 0 means "don't
+	// bother," e.g. when a caller only wants one direction this probe.
+	RequestedDownloadBytes uint32 `protobuf:"varint,3,opt,name=requested_download_bytes,json=requestedDownloadBytes,proto3" json:"requested_download_bytes,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *MeasureBandwidthRequest) Reset() {
+	*x = MeasureBandwidthRequest{}
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MeasureBandwidthRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MeasureBandwidthRequest) ProtoMessage() {}
+
+func (x *MeasureBandwidthRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MeasureBandwidthRequest.ProtoReflect.Descriptor instead.
+func (*MeasureBandwidthRequest) Descriptor() ([]byte, []int) {
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *MeasureBandwidthRequest) GetProbeId() string {
+	if x != nil {
+		return x.ProbeId
+	}
+	return ""
+}
+
+func (x *MeasureBandwidthRequest) GetUploadPayload() []byte {
+	if x != nil {
+		return x.UploadPayload
+	}
+	return nil
+}
+
+func (x *MeasureBandwidthRequest) GetRequestedDownloadBytes() uint32 {
+	if x != nil {
+		return x.RequestedDownloadBytes
+	}
+	return 0
+}
+
+type MeasureBandwidthResponse struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	ProbeId            string                 `protobuf:"bytes,1,opt,name=probe_id,json=probeId,proto3" json:"probe_id,omitempty"`
+	UploadPayloadHash  []byte                 `protobuf:"bytes,2,opt,name=upload_payload_hash,json=uploadPayloadHash,proto3" json:"upload_payload_hash,omitempty"`     // SHA256(upload_payload) -- proves full, correct receipt
+	DownloadPayload    []byte                 `protobuf:"bytes,3,opt,name=download_payload,json=downloadPayload,proto3" json:"download_payload,omitempty"`             // exactly requested_download_bytes of Agent-generated data
+	ServerProcessingMs uint32                 `protobuf:"varint,4,opt,name=server_processing_ms,json=serverProcessingMs,proto3" json:"server_processing_ms,omitempty"` // time from full request received to response ready, excluding queueing
+	Signature          []byte                 `protobuf:"bytes,5,opt,name=signature,proto3" json:"signature,omitempty"`                                                // Ed25519 over a domain-separated construction, see agent-api's BANDWIDTH_PROBE_DOMAIN
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *MeasureBandwidthResponse) Reset() {
+	*x = MeasureBandwidthResponse{}
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MeasureBandwidthResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MeasureBandwidthResponse) ProtoMessage() {}
+
+func (x *MeasureBandwidthResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MeasureBandwidthResponse.ProtoReflect.Descriptor instead.
+func (*MeasureBandwidthResponse) Descriptor() ([]byte, []int) {
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *MeasureBandwidthResponse) GetProbeId() string {
+	if x != nil {
+		return x.ProbeId
+	}
+	return ""
+}
+
+func (x *MeasureBandwidthResponse) GetUploadPayloadHash() []byte {
+	if x != nil {
+		return x.UploadPayloadHash
+	}
+	return nil
+}
+
+func (x *MeasureBandwidthResponse) GetDownloadPayload() []byte {
+	if x != nil {
+		return x.DownloadPayload
+	}
+	return nil
+}
+
+func (x *MeasureBandwidthResponse) GetServerProcessingMs() uint32 {
+	if x != nil {
+		return x.ServerProcessingMs
+	}
+	return 0
+}
+
+func (x *MeasureBandwidthResponse) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
 type HealthCheckRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -947,7 +1093,7 @@ type HealthCheckRequest struct {
 
 func (x *HealthCheckRequest) Reset() {
 	*x = HealthCheckRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -959,7 +1105,7 @@ func (x *HealthCheckRequest) String() string {
 func (*HealthCheckRequest) ProtoMessage() {}
 
 func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -972,7 +1118,7 @@ func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckRequest.ProtoReflect.Descriptor instead.
 func (*HealthCheckRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{14}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{16}
 }
 
 type HealthCheckResponse struct {
@@ -985,7 +1131,7 @@ type HealthCheckResponse struct {
 
 func (x *HealthCheckResponse) Reset() {
 	*x = HealthCheckResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -997,7 +1143,7 @@ func (x *HealthCheckResponse) String() string {
 func (*HealthCheckResponse) ProtoMessage() {}
 
 func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1010,7 +1156,7 @@ func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckResponse.ProtoReflect.Descriptor instead.
 func (*HealthCheckResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{15}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *HealthCheckResponse) GetHealthy() bool {
@@ -1035,7 +1181,7 @@ type GetAgentInfoRequest struct {
 
 func (x *GetAgentInfoRequest) Reset() {
 	*x = GetAgentInfoRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1047,7 +1193,7 @@ func (x *GetAgentInfoRequest) String() string {
 func (*GetAgentInfoRequest) ProtoMessage() {}
 
 func (x *GetAgentInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1060,7 +1206,7 @@ func (x *GetAgentInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAgentInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetAgentInfoRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{18}
 }
 
 var File_openinfra_agent_v1_agent_proto protoreflect.FileDescriptor
@@ -1140,12 +1286,22 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\vmetric_name\x18\x01 \x01(\tR\n" +
 	"metricName\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x01R\x05value\x12\x1c\n" +
-	"\ttimestamp\x18\x03 \x01(\x03R\ttimestamp\"\x14\n" +
+	"\ttimestamp\x18\x03 \x01(\x03R\ttimestamp\"\x95\x01\n" +
+	"\x17MeasureBandwidthRequest\x12\x19\n" +
+	"\bprobe_id\x18\x01 \x01(\tR\aprobeId\x12%\n" +
+	"\x0eupload_payload\x18\x02 \x01(\fR\ruploadPayload\x128\n" +
+	"\x18requested_download_bytes\x18\x03 \x01(\rR\x16requestedDownloadBytes\"\xe0\x01\n" +
+	"\x18MeasureBandwidthResponse\x12\x19\n" +
+	"\bprobe_id\x18\x01 \x01(\tR\aprobeId\x12.\n" +
+	"\x13upload_payload_hash\x18\x02 \x01(\fR\x11uploadPayloadHash\x12)\n" +
+	"\x10download_payload\x18\x03 \x01(\fR\x0fdownloadPayload\x120\n" +
+	"\x14server_processing_ms\x18\x04 \x01(\rR\x12serverProcessingMs\x12\x1c\n" +
+	"\tsignature\x18\x05 \x01(\fR\tsignature\"\x14\n" +
 	"\x12HealthCheckRequest\"G\n" +
 	"\x13HealthCheckResponse\x12\x18\n" +
 	"\ahealthy\x18\x01 \x01(\bR\ahealthy\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\"\x15\n" +
-	"\x13GetAgentInfoRequest2\x9b\x06\n" +
+	"\x13GetAgentInfoRequest2\x8a\a\n" +
 	"\x14ProviderAgentService\x12a\n" +
 	"\fGetAgentInfo\x12'.openinfra.agent.v1.GetAgentInfoRequest\x1a(.openinfra.agent.v1.GetAgentInfoResponse\x12^\n" +
 	"\vHealthCheck\x12&.openinfra.agent.v1.HealthCheckRequest\x1a'.openinfra.agent.v1.HealthCheckResponse\x12a\n" +
@@ -1154,7 +1310,8 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x06Deploy\x12!.openinfra.agent.v1.DeployRequest\x1a\".openinfra.agent.v1.DeployResponse\x12I\n" +
 	"\x04Stop\x12\x1f.openinfra.agent.v1.StopRequest\x1a .openinfra.agent.v1.StopResponse\x12p\n" +
 	"\x11GetWorkloadStatus\x12,.openinfra.agent.v1.GetWorkloadStatusRequest\x1a-.openinfra.agent.v1.GetWorkloadStatusResponse\x12f\n" +
-	"\rStreamMetrics\x12(.openinfra.agent.v1.StreamMetricsRequest\x1a).openinfra.agent.v1.StreamMetricsResponse0\x01BEZCgithub.com/openinfra/network/protocol/generated/go/agent/v1;agentv1b\x06proto3"
+	"\rStreamMetrics\x12(.openinfra.agent.v1.StreamMetricsRequest\x1a).openinfra.agent.v1.StreamMetricsResponse0\x01\x12m\n" +
+	"\x10MeasureBandwidth\x12+.openinfra.agent.v1.MeasureBandwidthRequest\x1a,.openinfra.agent.v1.MeasureBandwidthResponseBEZCgithub.com/openinfra/network/protocol/generated/go/agent/v1;agentv1b\x06proto3"
 
 var (
 	file_openinfra_agent_v1_agent_proto_rawDescOnce sync.Once
@@ -1169,7 +1326,7 @@ func file_openinfra_agent_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_openinfra_agent_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_openinfra_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_openinfra_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_openinfra_agent_v1_agent_proto_goTypes = []any{
 	(SolveChallengeRequest_Type)(0),      // 0: openinfra.agent.v1.SolveChallengeRequest.Type
 	(GetWorkloadStatusResponse_State)(0), // 1: openinfra.agent.v1.GetWorkloadStatusResponse.State
@@ -1187,32 +1344,36 @@ var file_openinfra_agent_v1_agent_proto_goTypes = []any{
 	(*GetInventoryResponse)(nil),         // 13: openinfra.agent.v1.GetInventoryResponse
 	(*StreamMetricsRequest)(nil),         // 14: openinfra.agent.v1.StreamMetricsRequest
 	(*StreamMetricsResponse)(nil),        // 15: openinfra.agent.v1.StreamMetricsResponse
-	(*HealthCheckRequest)(nil),           // 16: openinfra.agent.v1.HealthCheckRequest
-	(*HealthCheckResponse)(nil),          // 17: openinfra.agent.v1.HealthCheckResponse
-	(*GetAgentInfoRequest)(nil),          // 18: openinfra.agent.v1.GetAgentInfoRequest
+	(*MeasureBandwidthRequest)(nil),      // 16: openinfra.agent.v1.MeasureBandwidthRequest
+	(*MeasureBandwidthResponse)(nil),     // 17: openinfra.agent.v1.MeasureBandwidthResponse
+	(*HealthCheckRequest)(nil),           // 18: openinfra.agent.v1.HealthCheckRequest
+	(*HealthCheckResponse)(nil),          // 19: openinfra.agent.v1.HealthCheckResponse
+	(*GetAgentInfoRequest)(nil),          // 20: openinfra.agent.v1.GetAgentInfoRequest
 }
 var file_openinfra_agent_v1_agent_proto_depIdxs = []int32{
 	0,  // 0: openinfra.agent.v1.SolveChallengeRequest.type:type_name -> openinfra.agent.v1.SolveChallengeRequest.Type
 	6,  // 1: openinfra.agent.v1.DeployRequest.limits:type_name -> openinfra.agent.v1.ResourceLimits
 	1,  // 2: openinfra.agent.v1.GetWorkloadStatusResponse.state:type_name -> openinfra.agent.v1.GetWorkloadStatusResponse.State
-	18, // 3: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
-	16, // 4: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
+	20, // 3: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
+	18, // 4: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
 	12, // 5: openinfra.agent.v1.ProviderAgentService.GetInventory:input_type -> openinfra.agent.v1.GetInventoryRequest
 	3,  // 6: openinfra.agent.v1.ProviderAgentService.SolveChallenge:input_type -> openinfra.agent.v1.SolveChallengeRequest
 	5,  // 7: openinfra.agent.v1.ProviderAgentService.Deploy:input_type -> openinfra.agent.v1.DeployRequest
 	8,  // 8: openinfra.agent.v1.ProviderAgentService.Stop:input_type -> openinfra.agent.v1.StopRequest
 	10, // 9: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:input_type -> openinfra.agent.v1.GetWorkloadStatusRequest
 	14, // 10: openinfra.agent.v1.ProviderAgentService.StreamMetrics:input_type -> openinfra.agent.v1.StreamMetricsRequest
-	2,  // 11: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
-	17, // 12: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
-	13, // 13: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
-	4,  // 14: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
-	7,  // 15: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
-	9,  // 16: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
-	11, // 17: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
-	15, // 18: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
-	11, // [11:19] is the sub-list for method output_type
-	3,  // [3:11] is the sub-list for method input_type
+	16, // 11: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:input_type -> openinfra.agent.v1.MeasureBandwidthRequest
+	2,  // 12: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
+	19, // 13: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
+	13, // 14: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
+	4,  // 15: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
+	7,  // 16: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
+	9,  // 17: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
+	11, // 18: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
+	15, // 19: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
+	17, // 20: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:output_type -> openinfra.agent.v1.MeasureBandwidthResponse
+	12, // [12:21] is the sub-list for method output_type
+	3,  // [3:12] is the sub-list for method input_type
 	3,  // [3:3] is the sub-list for extension type_name
 	3,  // [3:3] is the sub-list for extension extendee
 	0,  // [0:3] is the sub-list for field type_name
@@ -1229,7 +1390,7 @@ func file_openinfra_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_openinfra_agent_v1_agent_proto_rawDesc), len(file_openinfra_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   17,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
