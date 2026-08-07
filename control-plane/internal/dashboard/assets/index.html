@@ -39,6 +39,16 @@
       <div id="validators-warning" class="warning" hidden>Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.</div>
       <div class="table-wrap"><table><thead><tr><th>Validator</th></tr></thead><tbody id="validators"></tbody></table></div>
     </section>
+    <section class="panel" id="validator-scores-panel">
+      <div class="panel-head"><div><span class="eyebrow">VALIDATOR SCORES</span><h2>Historique des rounds de scoring</h2></div></div>
+      <p class="muted">Résultats des derniers rounds de challenge (ADR-013) pour un provider donné, par dimension. Un round sans ligne n'a simplement pas encore été clos — ce n'est pas une erreur.</p>
+      <div class="score-controls">
+        <input id="score-provider-id" type="text" placeholder="provider_id">
+        <button id="score-load" type="button">Charger</button>
+      </div>
+      <div id="score-warning" class="warning" hidden></div>
+      <div class="table-wrap"><table><thead><tr><th>Dimension</th><th>Round</th><th>Score</th><th>Précédent</th><th>Confiance</th><th>Soumissions</th><th>Statut</th><th>Bloc de clôture</th></tr></thead><tbody id="score-rows"></tbody></table></div>
+    </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">PROVIDERS</span><h2>État du réseau</h2></div><button id="refresh" type="button">Actualiser</button></div>
       <div id="warning" class="warning" hidden></div>
       <div class="table-wrap"><table><thead><tr><th>Provider</th><th>État durable</th><th>Connexion</th><th>Agent</th><th>CPU</th><th>RAM</th><th>Stockage</th><th>Bande passante</th><th>Réputation</th><th>Offre on-chain</th><th>On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>

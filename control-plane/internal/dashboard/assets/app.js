@@ -29,3 +29,39 @@ async function refresh(){
   }catch(error){if(error.name!=='AbortError'){text('sample','Indisponible');const warning=$('warning');warning.hidden=false;warning.textContent='Le dashboard ne peut pas charger les données.'}}
 }
 $('refresh').addEventListener('click',refresh);refresh();setInterval(refresh,10000);
+
+// #76 validator score history: fetched on demand for a single provider_id
+// rather than folded into refresh()'s periodic /api/v1/overview poll --
+// scanning pallet-network-validator's Rounds NMap is real per-round chain
+// I/O server-side (see internal/dashboard/validatorscores.go), so this
+// stays an explicit, infrequent action, not a background one.
+function scoreStatusLabel(status){
+  // Mirrors blockchainbridge.RoundStatus.String() -- keep in sync with
+  // internal/blockchainbridge/roundresult.go if a variant is ever added.
+  const labels={final:'clos',disputed:'contesté',dispute_upheld:'contestation retenue',dispute_rejected:'contestation rejetée'};
+  return labels[status]||status;
+}
+async function loadValidatorScores(){
+  const providerId=$('score-provider-id').value.trim();
+  const warning=$('score-warning');const rows=$('score-rows');
+  warning.hidden=true;warning.textContent='';
+  if(!providerId){warning.hidden=false;warning.textContent='Indiquez un provider_id.';return}
+  rows.replaceChildren();
+  try{
+    const response=await fetch(`/api/v1/validator-scores/${encodeURIComponent(providerId)}`);
+    if(response.status===404){warning.hidden=false;warning.textContent='Provider introuvable.';return}
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    const data=await response.json();
+    if(data.partial){warning.hidden=false;warning.textContent='Lecture partielle — certains rounds n\'ont pas pu être lus on-chain.'}
+    let any=false;
+    for(const dimension of data.dimensions||[]){
+      for(const round of dimension.rounds||[]){
+        any=true;
+        rows.append(row([dimension.dimension,round.round,(round.score_bps/100).toFixed(2)+' %',(round.previous_score_bps/100).toFixed(2)+' %',(round.confidence_bps/100).toFixed(0)+' %',`${round.submissions}/${round.committee_target}`,scoreStatusLabel(round.status),round.closed_at_block]));
+      }
+    }
+    if(!any&&!data.partial){warning.hidden=false;warning.textContent='Aucun round clos pour ce provider dans la fenêtre récente.'}
+  }catch(error){warning.hidden=false;warning.textContent='Impossible de charger l\'historique de scoring.'}
+}
+$('score-load').addEventListener('click',loadValidatorScores);
+$('score-provider-id').addEventListener('keydown',e=>{if(e.key==='Enter')loadValidatorScores()});
