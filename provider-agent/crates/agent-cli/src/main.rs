@@ -138,6 +138,7 @@ async fn handle_start(dev: bool) -> Result<()> {
         identity_manager,
         inventory_manager,
         executor,
+        bandwidth_rate_limiter: agent_api::BandwidthRateLimiter::new(),
     };
 
     let router =

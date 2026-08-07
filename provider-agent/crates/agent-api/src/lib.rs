@@ -22,8 +22,10 @@ use crate::proto::*;
 use agent_core::{identity::IdentityManager, local_state::LocalStateError, AgentConfig};
 use agent_inventory::InventoryManager;
 use async_trait::async_trait;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
@@ -44,6 +46,36 @@ fn executor_status_error(error: anyhow::Error) -> Status {
 const CHALLENGE_DOMAIN: &[u8] = b"openinfra-availability-proof-v1\0";
 const MAX_CHALLENGE_ID: usize = 128;
 const MAX_CHALLENGE_PAYLOAD: usize = 4096;
+
+// ADR-015 §1/§3: MeasureBandwidth's domain-separated signing constant and
+// its payload-size bound. Reuses MAX_CHALLENGE_ID's convention for
+// probe_id (same shape of field, same reasoning) but gets its own, much
+// larger, payload bound -- MAX_CHALLENGE_PAYLOAD (4096 bytes) exists to
+// bound a liveness/correctness proof-of-work input, not to produce a
+// meaningful throughput timing signal. 8 MiB is large enough to time
+// meaningfully even on a fast link (~7ms at 10 Gbps) and long enough to
+// resolve realistic slower tiers (~640ms at 100 Mbps) without either
+// flooding a slow link for an unreasonable duration or bounding the
+// Agent's per-request memory/CPU cost any more loosely than every other
+// Agent RPC already is bounded.
+const BANDWIDTH_PROBE_DOMAIN: &[u8] = b"openinfra-bandwidth-probe-v1\0";
+const MAX_BANDWIDTH_PROBE_BYTES: usize = 8 * 1024 * 1024;
+
+// ADR-015 §3: a per-caller rate limit scoped to just this RPC, so a
+// validator (malicious or buggy) cannot use repeated MAX_BANDWIDTH_
+// PROBE_BYTES-sized probes as a bandwidth-exhaustion vector against a
+// provider it does not like. A plain fixed-window counter (see
+// BandwidthRateLimiter below), not a token bucket -- this is an MVP abuse
+// bound, not a QoS system, and the codebase's other MVP-shortcut rate
+// limiters (e.g. control-plane/internal/ratelimit) are similarly simple.
+// 10 calls/minute per caller is generous enough that the Network
+// Validator's tick-driven retry loop (control-plane/internal/
+// networkvalidator/run.go, ~3s poll interval, retries a failed submit_
+// evidence on the next tick) is not throttled under ordinary transient
+// chain-RPC failures, while still tightly bounding one caller's
+// worst-case sustained traffic to a provider.
+const BANDWIDTH_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const BANDWIDTH_RATE_LIMIT_MAX_CALLS: u32 = 10;
 
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -80,6 +112,134 @@ pub struct AgentGrpcServer {
     pub identity_manager: Arc<dyn IdentityManager>,
     pub inventory_manager: Arc<InventoryManager>,
     pub executor: Arc<dyn Executor>,
+    pub bandwidth_rate_limiter: BandwidthRateLimiter,
+}
+
+/// Sentinel key for a MeasureBandwidth caller this handler could not
+/// identify via its mTLS certificate (peer_certs() returned nothing, or
+/// its leaf certificate isn't a parseable Ed25519 certificate). Every
+/// unidentifiable caller shares this one bucket, so it still gets rate
+/// limited rather than bypassing the limiter entirely -- not a claim that
+/// this is any real caller's identity (an all-zero byte string is not a
+/// valid Ed25519 public key any real handshake would present).
+const UNKNOWN_CALLER: [u8; 32] = [0u8; 32];
+
+/// Per-caller rate limiter for MeasureBandwidth (ADR-015 §3), keyed by
+/// the caller's raw 32-byte Ed25519 public key extracted from its mTLS
+/// leaf certificate (`caller_public_key`) -- the same identity agent-cli's
+/// `mtls.rs` allowlist verifier already establishes trust on (ADR-013
+/// §3), reused here purely as a rate-limiting key, not as a second trust
+/// decision. A plain fixed window per caller: bounded, simple, and
+/// sufficient for this MVP's "cap one caller's worst-case sustained
+/// traffic" goal -- see the constants' doc comments for the exact
+/// numbers and reasoning.
+#[derive(Default)]
+pub struct BandwidthRateLimiter {
+    windows: Mutex<HashMap<[u8; 32], (u32, Instant)>>,
+}
+
+impl BandwidthRateLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true and records one call if `key` is still under budget
+    /// for the current window; false (and records nothing) once the
+    /// window's budget is exhausted. A stale window (its start is older
+    /// than BANDWIDTH_RATE_LIMIT_WINDOW) resets rather than accumulating
+    /// forever.
+    fn allow(&self, key: [u8; 32]) -> bool {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let entry = windows.entry(key).or_insert((0, now));
+        if now.duration_since(entry.1) >= BANDWIDTH_RATE_LIMIT_WINDOW {
+            *entry = (0, now);
+        }
+        if entry.0 >= BANDWIDTH_RATE_LIMIT_MAX_CALLS {
+            return false;
+        }
+        entry.0 += 1;
+        true
+    }
+}
+
+/// Extracts the calling client's raw 32-byte Ed25519 public key from the
+/// leaf certificate of its mTLS connection, for use as
+/// `BandwidthRateLimiter`'s per-caller key. `None` when no peer
+/// certificate is available at all -- e.g. this crate exercised outside
+/// a real TLS connection (a unit test), or (defense in depth) built
+/// without tonic's "tls" feature active in this compilation unit; the
+/// caller falls back to the shared `UNKNOWN_CALLER` bucket rather than
+/// skipping rate limiting entirely. This does not perform authorization:
+/// by the time any Agent RPC handler runs, the mTLS layer (ADR-013 §3)
+/// has already decided whether to accept the connection at all.
+fn caller_public_key<T>(request: &Request<T>) -> [u8; 32] {
+    request
+        .peer_certs()
+        .and_then(|certs| certs.first().map(|cert| cert.get_ref().to_vec()))
+        .and_then(|der| extract_ed25519_raw_public_key(&der))
+        .unwrap_or(UNKNOWN_CALLER)
+}
+
+/// Parses `der` as an X.509 certificate and returns its raw 32-byte
+/// Ed25519 SubjectPublicKeyInfo, or `None` if it isn't a parseable
+/// Ed25519 certificate. Byte-for-byte the same approach as agent-cli's
+/// `mtls::extract_ed25519_raw_public_key` (duplicated rather than
+/// shared -- agent-api cannot depend on agent-cli).
+fn extract_ed25519_raw_public_key(der: &[u8]) -> Option<[u8; 32]> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(der).ok()?;
+    let spki = certificate.public_key();
+    if spki.algorithm.algorithm != x509_parser::oid_registry::OID_SIG_ED25519 {
+        return None;
+    }
+    <[u8; 32]>::try_from(spki.subject_public_key.data.as_ref()).ok()
+}
+
+/// Builds the exact byte sequence signed for a MeasureBandwidth response
+/// (ADR-015 §4), deliberately mirroring `solve_challenge`'s existing
+/// signing convention -- a domain constant, then fields in a documented,
+/// unambiguous order -- rather than inventing a second, differently
+/// shaped construction:
+///
+/// ```text
+/// BANDWIDTH_PROBE_DOMAIN
+///   ++ be_u32(len(probe_id)) ++ probe_id
+///   ++ upload_payload_hash                       (32 bytes, fixed width: SHA256 output)
+///   ++ be_u32(len(download_payload)) ++ download_payload
+///   ++ be_u32(server_processing_ms)               (4 bytes, fixed width)
+/// ```
+///
+/// `probe_id` and `download_payload` are variable-length and each get an
+/// explicit big-endian u32 length prefix (matching how `solve_challenge`
+/// frames `challenge_id`); `upload_payload_hash` is always exactly 32
+/// bytes (SHA256's fixed output size) so it needs no length prefix to
+/// stay unambiguous; `server_processing_ms` is already a fixed-width u32.
+fn bandwidth_signed_bytes(
+    probe_id: &str,
+    upload_payload_hash: &[u8],
+    download_payload: &[u8],
+    server_processing_ms: u32,
+) -> Vec<u8> {
+    let mut signed = Vec::with_capacity(
+        BANDWIDTH_PROBE_DOMAIN.len()
+            + 4
+            + probe_id.len()
+            + upload_payload_hash.len()
+            + 4
+            + download_payload.len()
+            + 4,
+    );
+    signed.extend_from_slice(BANDWIDTH_PROBE_DOMAIN);
+    signed.extend_from_slice(&(probe_id.len() as u32).to_be_bytes());
+    signed.extend_from_slice(probe_id.as_bytes());
+    signed.extend_from_slice(upload_payload_hash);
+    signed.extend_from_slice(&(download_payload.len() as u32).to_be_bytes());
+    signed.extend_from_slice(download_payload);
+    signed.extend_from_slice(&server_processing_ms.to_be_bytes());
+    signed
 }
 
 #[tonic::async_trait]
@@ -235,6 +395,71 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
         }))
     }
 
+    async fn measure_bandwidth(
+        &self,
+        request: Request<MeasureBandwidthRequest>,
+    ) -> Result<Response<MeasureBandwidthResponse>, Status> {
+        // Rate-limit before doing any real work, keyed off the caller
+        // identity extracted from the still-intact request (peer_certs()
+        // reads connection metadata that into_inner() below discards).
+        let caller = caller_public_key(&request);
+        if !self.bandwidth_rate_limiter.allow(caller) {
+            return Err(Status::resource_exhausted(
+                "MeasureBandwidth rate limit exceeded for this caller",
+            ));
+        }
+
+        let request = request.into_inner();
+        if request.probe_id.is_empty() || request.probe_id.len() > MAX_CHALLENGE_ID {
+            return Err(Status::invalid_argument("probe_id is empty or too long"));
+        }
+        if request.upload_payload.len() > MAX_BANDWIDTH_PROBE_BYTES {
+            return Err(Status::resource_exhausted("upload_payload is too large"));
+        }
+        if request.requested_download_bytes as usize > MAX_BANDWIDTH_PROBE_BYTES {
+            return Err(Status::resource_exhausted(
+                "requested_download_bytes exceeds the maximum probe size",
+            ));
+        }
+
+        // ADR-015 §1: server_processing_ms measures processing only, not
+        // request deserialization/queueing -- the clock starts here, right
+        // after into_inner(), and stops just before the response is built.
+        let started = Instant::now();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&request.upload_payload);
+        let upload_payload_hash = hasher.finalize().to_vec();
+
+        // Random, not zeroed: an all-zero download_payload would let a
+        // lazy/malicious Agent implementation skip real work (and real
+        // bytes-on-the-wire) while still satisfying a naive length check.
+        let mut download_payload = vec![0u8; request.requested_download_bytes as usize];
+        rand::thread_rng().fill_bytes(&mut download_payload);
+
+        let server_processing_ms = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+
+        let signed = bandwidth_signed_bytes(
+            &request.probe_id,
+            &upload_payload_hash,
+            &download_payload,
+            server_processing_ms,
+        );
+        let signature = self
+            .identity_manager
+            .sign(&signed)
+            .await
+            .map_err(|error| Status::internal(format!("identity signing failed: {error}")))?;
+
+        Ok(Response::new(MeasureBandwidthResponse {
+            probe_id: request.probe_id,
+            upload_payload_hash,
+            download_payload,
+            server_processing_ms,
+            signature,
+        }))
+    }
+
     async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
         let req = request.into_inner();
         info!(
@@ -302,6 +527,8 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::identity::Ed25519IdentityManager;
+    use proto::provider_agent_service_server::ProviderAgentService;
 
     #[test]
     fn missing_workload_maps_to_grpc_not_found() {
@@ -318,5 +545,312 @@ mod tests {
         let status = executor_status_error(anyhow::anyhow!("Docker unavailable"));
 
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    struct NoopExecutor;
+
+    #[async_trait]
+    impl Executor for NoopExecutor {
+        async fn deploy(&self, _req: DeployRequest) -> anyhow::Result<String> {
+            unimplemented!("not exercised by MeasureBandwidth tests")
+        }
+        async fn stop(&self, _workload_id: &str) -> anyhow::Result<()> {
+            unimplemented!("not exercised by MeasureBandwidth tests")
+        }
+        async fn get_status(&self, _workload_id: &str) -> anyhow::Result<WorkloadStatus> {
+            unimplemented!("not exercised by MeasureBandwidth tests")
+        }
+    }
+
+    /// A real generated Ed25519 identity, backed by a temp key file --
+    /// exercising the same production `IdentityManager` implementation
+    /// `solve_challenge`/`measure_bandwidth` sign through, not a fake.
+    /// The returned `TempDir` must outlive its use (the key file is read
+    /// once at generation and then held in memory, but keeping the
+    /// directory alive avoids relying on that implementation detail).
+    fn test_identity() -> (Arc<dyn IdentityManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = Ed25519IdentityManager::generate(dir.path().join("identity.key"))
+            .expect("generate identity");
+        (Arc::new(identity), dir)
+    }
+
+    fn test_server(identity_manager: Arc<dyn IdentityManager>) -> AgentGrpcServer {
+        let (event_bus, _receiver) = mpsc::channel(1);
+        AgentGrpcServer {
+            config: AgentConfig::default(),
+            event_bus,
+            identity_manager,
+            inventory_manager: Arc::new(InventoryManager::new()),
+            executor: Arc::new(NoopExecutor),
+            bandwidth_rate_limiter: BandwidthRateLimiter::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_probe_succeeds_and_hash_and_signature_verify() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity.clone());
+
+        let upload_payload = vec![7u8; 1024];
+        let request = Request::new(MeasureBandwidthRequest {
+            probe_id: "probe-1".to_string(),
+            upload_payload: upload_payload.clone(),
+            requested_download_bytes: 512,
+        });
+
+        let response = server
+            .measure_bandwidth(request)
+            .await
+            .expect("measure_bandwidth")
+            .into_inner();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&upload_payload);
+        assert_eq!(response.upload_payload_hash, hasher.finalize().to_vec());
+        assert_eq!(response.download_payload.len(), 512);
+        assert_eq!(response.probe_id, "probe-1");
+
+        let signed = bandwidth_signed_bytes(
+            &response.probe_id,
+            &response.upload_payload_hash,
+            &response.download_payload,
+            response.server_processing_ms,
+        );
+        let public_key_hex = identity.get_public_key().await.expect("public key");
+        let public_key = hex::decode(public_key_hex).expect("hex decode public key");
+        assert!(identity
+            .verify(&signed, &response.signature, &public_key)
+            .await
+            .expect("verify signature"));
+
+        // A tampered signature must not verify -- confirms the check above
+        // is actually exercising real verification, not vacuously true.
+        let mut tampered = response.signature.clone();
+        tampered[0] ^= 0xFF;
+        assert!(!identity
+            .verify(&signed, &tampered, &public_key)
+            .await
+            .expect("verify tampered signature"));
+    }
+
+    #[tokio::test]
+    async fn oversized_upload_payload_is_rejected() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity);
+
+        let request = Request::new(MeasureBandwidthRequest {
+            probe_id: "probe-oversized-upload".to_string(),
+            upload_payload: vec![0u8; MAX_BANDWIDTH_PROBE_BYTES + 1],
+            requested_download_bytes: 0,
+        });
+
+        let status = server
+            .measure_bandwidth(request)
+            .await
+            .expect_err("oversized upload_payload must be rejected");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn oversized_requested_download_bytes_is_rejected() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity);
+
+        let request = Request::new(MeasureBandwidthRequest {
+            probe_id: "probe-oversized-download".to_string(),
+            upload_payload: vec![],
+            requested_download_bytes: (MAX_BANDWIDTH_PROBE_BYTES + 1) as u32,
+        });
+
+        let status = server
+            .measure_bandwidth(request)
+            .await
+            .expect_err("oversized requested_download_bytes must be rejected");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn empty_probe_id_is_rejected() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity);
+
+        let request = Request::new(MeasureBandwidthRequest {
+            probe_id: String::new(),
+            upload_payload: vec![],
+            requested_download_bytes: 0,
+        });
+
+        let status = server
+            .measure_bandwidth(request)
+            .await
+            .expect_err("empty probe_id must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn download_payload_length_exactly_matches_the_request() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity);
+
+        let request = Request::new(MeasureBandwidthRequest {
+            probe_id: "probe-exact-length".to_string(),
+            upload_payload: vec![],
+            requested_download_bytes: 12_345,
+        });
+
+        let response = server
+            .measure_bandwidth(request)
+            .await
+            .expect("measure_bandwidth")
+            .into_inner();
+        assert_eq!(response.download_payload.len(), 12_345);
+    }
+
+    /// Two concurrent calls sharing the same probe_id must not corrupt
+    /// each other's result -- a concurrency-safety check (the handler has
+    /// no business-logic reason to reject a repeated probe_id; the server
+    /// deliberately does not enforce probe_id uniqueness).
+    #[tokio::test]
+    async fn concurrent_calls_with_the_same_probe_id_do_not_cross_talk() {
+        let (identity, _dir) = test_identity();
+        let server = Arc::new(test_server(identity));
+
+        let upload_a = vec![1u8; 4096];
+        let upload_b = vec![2u8; 8192];
+
+        let server_a = server.clone();
+        let upload_a_clone = upload_a.clone();
+        let task_a = tokio::spawn(async move {
+            let request = Request::new(MeasureBandwidthRequest {
+                probe_id: "shared-probe-id".to_string(),
+                upload_payload: upload_a_clone,
+                requested_download_bytes: 256,
+            });
+            server_a
+                .measure_bandwidth(request)
+                .await
+                .expect("measure_bandwidth a")
+                .into_inner()
+        });
+
+        let server_b = server.clone();
+        let upload_b_clone = upload_b.clone();
+        let task_b = tokio::spawn(async move {
+            let request = Request::new(MeasureBandwidthRequest {
+                probe_id: "shared-probe-id".to_string(),
+                upload_payload: upload_b_clone,
+                requested_download_bytes: 512,
+            });
+            server_b
+                .measure_bandwidth(request)
+                .await
+                .expect("measure_bandwidth b")
+                .into_inner()
+        });
+
+        let response_a = task_a.await.expect("task a joined");
+        let response_b = task_b.await.expect("task b joined");
+
+        let mut hasher_a = Sha256::new();
+        hasher_a.update(&upload_a);
+        assert_eq!(response_a.upload_payload_hash, hasher_a.finalize().to_vec());
+        assert_eq!(response_a.download_payload.len(), 256);
+
+        let mut hasher_b = Sha256::new();
+        hasher_b.update(&upload_b);
+        assert_eq!(response_b.upload_payload_hash, hasher_b.finalize().to_vec());
+        assert_eq!(response_b.download_payload.len(), 512);
+    }
+
+    #[test]
+    fn rate_limiter_blocks_a_caller_once_its_window_budget_is_exhausted() {
+        let limiter = BandwidthRateLimiter::new();
+        let caller = [7u8; 32];
+        for _ in 0..BANDWIDTH_RATE_LIMIT_MAX_CALLS {
+            assert!(
+                limiter.allow(caller),
+                "expected a call under budget to be allowed"
+            );
+        }
+        assert!(
+            !limiter.allow(caller),
+            "expected a call over budget to be rejected"
+        );
+        // A different caller has its own independent budget.
+        assert!(limiter.allow([9u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_exceeded_is_reported_as_resource_exhausted() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity);
+
+        let make_request = || {
+            Request::new(MeasureBandwidthRequest {
+                probe_id: "probe-rate-limit".to_string(),
+                upload_payload: vec![],
+                requested_download_bytes: 0,
+            })
+        };
+        for _ in 0..BANDWIDTH_RATE_LIMIT_MAX_CALLS {
+            server
+                .measure_bandwidth(make_request())
+                .await
+                .expect("call under budget must succeed");
+        }
+        let status = server
+            .measure_bandwidth(make_request())
+            .await
+            .expect_err("call over budget must be rejected");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn caller_public_key_falls_back_to_unknown_when_no_peer_certificate_is_present() {
+        let request: Request<MeasureBandwidthRequest> =
+            Request::new(MeasureBandwidthRequest::default());
+        assert_eq!(caller_public_key(&request), UNKNOWN_CALLER);
+    }
+
+    #[test]
+    fn extract_ed25519_raw_public_key_matches_a_real_self_signed_certificate() {
+        use rcgen::{CertificateParams, DnType, KeyPair, PKCS_ED25519};
+
+        let key_pair = KeyPair::generate_for(&PKCS_ED25519).expect("generate key");
+        let raw_key: [u8; 32] = key_pair
+            .public_key_raw()
+            .try_into()
+            .expect("32-byte raw key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "bandwidth-probe-test");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+
+        let extracted =
+            extract_ed25519_raw_public_key(&cert.der()[..]).expect("parse Ed25519 certificate");
+        assert_eq!(extracted, raw_key);
+    }
+
+    #[test]
+    fn bandwidth_signed_bytes_changes_when_any_field_changes() {
+        let base = bandwidth_signed_bytes("probe", &[1u8; 32], b"payload", 42);
+        assert_ne!(
+            base,
+            bandwidth_signed_bytes("other", &[1u8; 32], b"payload", 42)
+        );
+        assert_ne!(
+            base,
+            bandwidth_signed_bytes("probe", &[2u8; 32], b"payload", 42)
+        );
+        assert_ne!(
+            base,
+            bandwidth_signed_bytes("probe", &[1u8; 32], b"different", 42)
+        );
+        assert_ne!(
+            base,
+            bandwidth_signed_bytes("probe", &[1u8; 32], b"payload", 43)
+        );
     }
 }
