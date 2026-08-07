@@ -71,6 +71,83 @@ func TestValidatorLifecycleStatusString(t *testing.T) {
 	}
 }
 
+func TestEncodeSubmitEvidenceCallMatchesPalletFieldOrder(t *testing.T) {
+	var provider [32]byte
+	for i := range provider {
+		provider[i] = byte(i)
+	}
+	var payloadHash [32]byte
+	for i := range payloadHash {
+		payloadHash[i] = byte(0xF0 + i%16)
+	}
+	round := uint64(123456789)
+	dimension := DimensionReliability
+	scoreBps := uint16(9500)
+	sampleCount := uint32(1)
+
+	got := encodeSubmitEvidenceCall(provider, round, dimension, scoreBps, sampleCount, payloadHash)
+
+	want := []byte{networkValidatorPalletIndex, submitEvidenceCallIndex}
+	want = append(want, provider[:]...)
+	want = binary.LittleEndian.AppendUint64(want, round)
+	want = append(want, byte(dimension)) // ScoreDimension::Reliability == 4
+	want = binary.LittleEndian.AppendUint16(want, scoreBps)
+	want = binary.LittleEndian.AppendUint32(want, sampleCount)
+	want = append(want, payloadHash[:]...)
+
+	if string(got) != string(want) {
+		t.Fatalf("encodeSubmitEvidenceCall() = %x, want %x", got, want)
+	}
+	// Fixed total length sanity check: 2 (pallet+call) + 32 (provider) +
+	// 8 (round) + 1 (dimension tag) + 2 (score_bps) + 4 (sample_count) +
+	// 32 (payload_hash) = 81 bytes, no compact-encoding variability.
+	if len(got) != 81 {
+		t.Fatalf("encodeSubmitEvidenceCall() length = %d, want 81", len(got))
+	}
+	if got[len(got)-32-4-2-1] != byte(DimensionReliability) {
+		t.Fatalf("dimension tag byte is misplaced")
+	}
+}
+
+func TestScoreDimensionEncodesAsDeclarationOrderByte(t *testing.T) {
+	cases := []struct {
+		dimension ScoreDimension
+		want      byte
+	}{
+		{DimensionCompute, 0},
+		{DimensionStorage, 1},
+		{DimensionNetwork, 2},
+		{DimensionAvailability, 3},
+		{DimensionReliability, 4},
+	}
+	for _, c := range cases {
+		if byte(c.dimension) != c.want {
+			t.Fatalf("ScoreDimension %s encodes as %d, want %d", c.dimension, byte(c.dimension), c.want)
+		}
+	}
+}
+
+func TestEncodeCloseRoundCallMatchesPalletFieldOrder(t *testing.T) {
+	var provider [32]byte
+	provider[0] = 0xAB
+	round := uint64(42)
+	dimension := DimensionNetwork
+
+	got := encodeCloseRoundCall(provider, round, dimension)
+
+	want := []byte{networkValidatorPalletIndex, closeRoundCallIndex}
+	want = append(want, provider[:]...)
+	want = binary.LittleEndian.AppendUint64(want, round)
+	want = append(want, byte(dimension))
+
+	if string(got) != string(want) {
+		t.Fatalf("encodeCloseRoundCall() = %x, want %x", got, want)
+	}
+	if len(got) != 2+32+8+1 {
+		t.Fatalf("encodeCloseRoundCall() length = %d, want %d", len(got), 2+32+8+1)
+	}
+}
+
 func TestValidatorStorageKeyIsAPerAccountMapEntry(t *testing.T) {
 	var accountA, accountB [32]byte
 	accountA[0], accountB[0] = 1, 2

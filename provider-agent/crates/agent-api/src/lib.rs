@@ -218,6 +218,12 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
             solve_challenge_request::Type::Compute => "compute",
             solve_challenge_request::Type::Storage => "storage",
             solve_challenge_request::Type::Availability => "availability",
+            // ADR-013 slice 4 (issue #78): a Network Validator's challenge
+            // loop also scores these two dimensions. Identical logic to
+            // the three above -- this handler is generic over challenge
+            // type, only the label differs.
+            solve_challenge_request::Type::Network => "network",
+            solve_challenge_request::Type::Reliability => "reliability",
             solve_challenge_request::Type::Unspecified => unreachable!(),
         };
         Ok(Response::new(SolveChallengeResponse {

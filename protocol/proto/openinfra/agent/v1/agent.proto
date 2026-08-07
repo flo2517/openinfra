@@ -30,6 +30,12 @@ message SolveChallengeRequest {
     TYPE_COMPUTE = 1;
     TYPE_STORAGE = 2;
     TYPE_AVAILABILITY = 3;
+    // Added for ADR-013 slice 4 (issue #78): a Network Validator's
+    // challenge loop scores these two additional dimensions of
+    // pallet-network-validator's ScoreDimension enum. compute/storage/
+    // availability above predate this addition and are unchanged.
+    TYPE_NETWORK = 4;
+    TYPE_RELIABILITY = 5;
   }
   Type type = 2;
   bytes payload = 3;
