@@ -128,20 +128,34 @@ func (s *Server) authIssueAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authenticatedUserID(ctx context.Context, r *http.Request) (string, bool) {
-	const prefix = "Bearer "
-	header := r.Header.Get("Authorization")
-	if !strings.HasPrefix(header, prefix) {
-		return "", false
-	}
-	raw := strings.TrimPrefix(header, prefix)
-	if raw == "" {
-		return "", false
-	}
-	user, err := s.users.Authenticate(ctx, userauth.HashAPIKey(raw))
-	if err != nil {
+	user, ok := s.authenticatedUser(ctx, r)
+	if !ok {
 		return "", false
 	}
 	return user.UserID, true
+}
+
+// authenticatedUser is authenticatedUserID's superset: the full
+// userauth.User (including Role, ADR-016), for callers that need more
+// than just the ID -- currently only requireRole (rbac.go), which needs
+// Role. Kept as the one bearer-token-parsing implementation rather than
+// duplicating it, with authenticatedUserID as a thin wrapper so its
+// existing callers/behavior are unchanged.
+func (s *Server) authenticatedUser(ctx context.Context, r *http.Request) (userauth.User, bool) {
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, prefix) {
+		return userauth.User{}, false
+	}
+	raw := strings.TrimPrefix(header, prefix)
+	if raw == "" {
+		return userauth.User{}, false
+	}
+	user, err := s.users.Authenticate(ctx, userauth.HashAPIKey(raw))
+	if err != nil {
+		return userauth.User{}, false
+	}
+	return user, true
 }
 
 // allowRate applies the per-endpoint abuse rate limit, keyed by caller

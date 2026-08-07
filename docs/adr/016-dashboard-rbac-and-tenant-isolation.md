@@ -1,15 +1,18 @@
-# Proposal: dashboard RBAC, tenant isolation, and operator views
+# ADR-016: Dashboard RBAC, tenant isolation, and operator views
 
 ## Status
 
-**Proposed — not accepted.** Unlike ADR-013/014/015 this session, this one is deliberately left
-for explicit human review before implementation starts: it changes who can see which tenant's
-data, which is a real security boundary, not a narrower technical decision. If accepted, it
-becomes an ADR under `docs/adr/` at whatever number is next free at acceptance time (see
-ADR-012's "Consequences" section on why this repository assigns ADR numbers at acceptance, not
-in advance). Written to unblock issue #76's largest remaining item: "RBAC and tenant isolation on
-the dashboard itself (today: no auth at all)," plus the user- and operator-view items that depend
-on it.
+Accepted (by the repository owner, explicitly — this proposal was deliberately left unaccepted by
+Claude Code when first written, unlike ADR-013/014/015 this session, since it decides who can see
+which tenant's data: a real security boundary, not a narrower technical decision).
+
+**Implementation note:** §7's three open questions are **not** all resolved by acceptance —
+acceptance authorizes slice 1 (§ Sequencing: schema + grant path, no tenant-private data exposed
+yet) to proceed immediately. Slice 2 (tenant workload views, which first exposes
+`workload.definition`) still needs §7 questions 1 and 2 answered before it ships, exactly as
+§ Consequences already said. Written to unblock issue #76's largest remaining item: "RBAC and
+tenant isolation on the dashboard itself (today: no auth at all)," plus the user- and
+operator-view items that depend on it.
 
 ## Context
 

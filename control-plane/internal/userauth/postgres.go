@@ -17,7 +17,11 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 }
 
 func (r *PostgresRepository) CreateUser(ctx context.Context, displayName string) (User, error) {
-	user := User{UserID: uuid.NewString(), DisplayName: displayName, CreatedAt: time.Now().UTC()}
+	// Role is not in the INSERT column list -- the migration's
+	// DEFAULT 'tenant' applies, and Role is set explicitly here to match
+	// it, rather than left as Go's zero-value "" (which is not a valid
+	// role per ValidRole).
+	user := User{UserID: uuid.NewString(), DisplayName: displayName, CreatedAt: time.Now().UTC(), Role: RoleTenant}
 	if _, err := r.pool.Exec(ctx, `INSERT INTO users (user_id, display_name, created_at) VALUES ($1,$2,$3)`, user.UserID, user.DisplayName, user.CreatedAt); err != nil {
 		return User{}, err
 	}
@@ -54,8 +58,8 @@ func (r *PostgresRepository) Authenticate(ctx context.Context, hash [32]byte) (U
 		  AND api_keys.revoked_at IS NULL
 		  AND (api_keys.expires_at IS NULL OR api_keys.expires_at > now())
 		  AND users.user_id = api_keys.user_id
-		RETURNING users.user_id, users.display_name, users.created_at
-	`, hash[:]).Scan(&user.UserID, &user.DisplayName, &user.CreatedAt)
+		RETURNING users.user_id, users.display_name, users.created_at, users.role
+	`, hash[:]).Scan(&user.UserID, &user.DisplayName, &user.CreatedAt, &user.Role)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrInvalidKey
 	}
@@ -72,6 +76,24 @@ func (r *PostgresRepository) RevokeAPIKey(ctx context.Context, keyID string) err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrInvalidKey
+	}
+	return nil
+}
+
+// SetRole does not itself validate role against ValidRole -- the CHECK
+// constraint on users.role (migrations/000012_user_roles.sql) is the
+// actual, authoritative enforcement, so an invalid value fails this
+// query rather than silently writing something the constraint would
+// have rejected anyway. Callers still validate up front (see
+// cmd/controlplane-admin's grant-role) purely to give an operator a
+// clear CLI error instead of a raw Postgres constraint-violation message.
+func (r *PostgresRepository) SetRole(ctx context.Context, userID string, role string) error {
+	command, err := r.pool.Exec(ctx, `UPDATE users SET role = $1 WHERE user_id = $2`, role, userID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrUserNotFound
 	}
 	return nil
 }

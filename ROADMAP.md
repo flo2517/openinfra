@@ -52,7 +52,7 @@ Progressively remove centralized frontend, database, scheduler, and operational 
 | Issue | Gate |
 |---|---|
 | #32 — decentralization roadmap and trust boundaries | ADR-012 (accepted) |
-| #33 — replicated off-chain data plane | ADR-016 |
+| #33 — replicated off-chain data plane | ADR-024 |
 | #34 — multiple Control Planes and scheduling relays | ADR-017 |
 | #35 — content-addressed frontend distribution | ADR-021 |
 | #36 — decentralized identity, governance, validator operations | ADR-023 |

@@ -164,3 +164,104 @@ func TestAuthenticateIsUnaffectedByAnotherKeysHash(t *testing.T) {
 		t.Fatalf("Authenticate(keyB) = %+v, %v, want user %q", gotB, err, userB.UserID)
 	}
 }
+
+// TestCreateUserDefaultsToTenantRole pins ADR-016's fail-closed default:
+// a brand new user (created via controlplane-admin, or -- though not
+// exercised by this test directly -- auto-provisioned by wallet login,
+// which shares the same DEFAULT 'tenant' at the schema level) never
+// starts as an operator.
+func TestCreateUserDefaultsToTenantRole(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	user, err := repository.CreateUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Role != userauth.RoleTenant {
+		t.Fatalf("CreateUser().Role = %q, want %q", user.Role, userauth.RoleTenant)
+	}
+
+	// Confirm the persisted row agrees with CreateUser's own return value
+	// -- not just that the Go struct says "tenant", but that Authenticate
+	// (a separate query, going through the actual users.role column) also
+	// reports it.
+	key, err := repository.CreateAPIKey(ctx, user.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticated, err := repository.Authenticate(ctx, userauth.HashAPIKey(key.Raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authenticated.Role != userauth.RoleTenant {
+		t.Fatalf("Authenticate().Role = %q, want %q", authenticated.Role, userauth.RoleTenant)
+	}
+}
+
+func TestSetRoleGrantsAndRevokesOperator(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	user, err := repository.CreateUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := repository.CreateAPIKey(ctx, user.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repository.SetRole(ctx, user.UserID, userauth.RoleOperator); err != nil {
+		t.Fatalf("SetRole(operator): %v", err)
+	}
+	promoted, err := repository.Authenticate(ctx, userauth.HashAPIKey(key.Raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.Role != userauth.RoleOperator {
+		t.Fatalf("Role after grant = %q, want %q", promoted.Role, userauth.RoleOperator)
+	}
+
+	// The grant path is also the revoke path -- setting back to tenant
+	// is not a separate method, matching ADR-016 §4's
+	// `grant-role <user-id> tenant` CLI usage.
+	if err := repository.SetRole(ctx, user.UserID, userauth.RoleTenant); err != nil {
+		t.Fatalf("SetRole(tenant): %v", err)
+	}
+	demoted, err := repository.Authenticate(ctx, userauth.HashAPIKey(key.Raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if demoted.Role != userauth.RoleTenant {
+		t.Fatalf("Role after revoke = %q, want %q", demoted.Role, userauth.RoleTenant)
+	}
+}
+
+func TestSetRoleReportsUserNotFoundForAnUnknownUserID(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	err := repository.SetRole(ctx, uuid.NewString(), userauth.RoleOperator)
+	if err != userauth.ErrUserNotFound {
+		t.Fatalf("SetRole() for an unknown user = %v, want ErrUserNotFound", err)
+	}
+}
+
+// TestSetRoleRejectsAnInvalidRoleAtTheDatabaseConstraint proves the CHECK
+// constraint is the real backstop (SetRole's own doc comment says it
+// deliberately does not duplicate ValidRole's check) -- an invalid value
+// must fail loudly, not silently write something the schema doesn't
+// allow.
+func TestSetRoleRejectsAnInvalidRoleAtTheDatabaseConstraint(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	user, err := repository.CreateUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SetRole(ctx, user.UserID, "admin"); err == nil {
+		t.Fatal("expected SetRole with an invalid role to fail against the CHECK constraint")
+	}
+}
