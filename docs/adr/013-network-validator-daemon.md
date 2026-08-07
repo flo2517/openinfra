@@ -4,6 +4,27 @@
 
 Accepted.
 
+**Implementation status (post-acceptance):** all five slices from §3 are
+now implemented. Slice 5 (round closing/disputes) split across two
+binaries by necessity, not by choice: `dispute_round` is directly signed
+by the disputing validator's own account (`cmd/networkvalidator dispute`,
+alongside slices 1/4's other directly-signed calls), but
+`resolve_dispute` is `SuspensionOrigin`-gated (`EnsureRoot` in this
+runtime) -- only the Control Plane's own bridge/sudo account can call it,
+so it lives in `cmd/controlplane-admin resolve-dispute` instead, sudo-
+wrapped the same way provider registration's `EnsureActive` already is.
+`dispute_round` is deliberately a manual CLI action, never triggered by
+the challenge loop itself (§9's own reasoning: an automated dispute on
+every disagreement would just move the trust problem, not solve it). The
+pallet's dispute_round also authorizes the scored *provider* to dispute,
+not only a committee validator -- that path is real on-chain but not yet
+reachable by any tool in this MVP, since a provider has no independent
+chain-signing path (AGENTS.md's frozen rule: the Provider Agent never
+talks to the chain directly). A future Control-Plane-proxied
+`dispute_round_for`, mirroring `register_provider_for`'s already-accepted
+delegation pattern, is the natural way to close that gap -- not attempted
+here since it wasn't asked for.
+
 ## Context
 
 ADR-011 accepted the Network Validator *protocol* (identity, stake, committee

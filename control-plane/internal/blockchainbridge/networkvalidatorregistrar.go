@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
@@ -18,6 +19,8 @@ const (
 	withdrawUnbondedCallIndex   = 2
 	submitEvidenceCallIndex     = 5
 	closeRoundCallIndex         = 6
+	disputeRoundCallIndex       = 7
+	resolveDisputeCallIndex     = 8
 )
 
 // ScoreDimension mirrors pallet-network-validator::ScoreDimension
@@ -37,6 +40,26 @@ const (
 	DimensionAvailability
 	DimensionReliability
 )
+
+// ParseScoreDimension is String's inverse, for CLI tools that take a
+// dimension name as an argument (cmd/networkvalidator's dispute,
+// cmd/controlplane-admin's resolve-dispute).
+func ParseScoreDimension(name string) (ScoreDimension, error) {
+	switch name {
+	case "compute":
+		return DimensionCompute, nil
+	case "storage":
+		return DimensionStorage, nil
+	case "network":
+		return DimensionNetwork, nil
+	case "availability":
+		return DimensionAvailability, nil
+	case "reliability":
+		return DimensionReliability, nil
+	default:
+		return 0, fmt.Errorf("unknown score dimension %q (want compute, storage, network, availability, or reliability)", name)
+	}
+}
 
 func (d ScoreDimension) String() string {
 	switch d {
@@ -141,6 +164,110 @@ func encodeCloseRoundCall(provider [32]byte, round uint64, dimension ScoreDimens
 	call = binary.LittleEndian.AppendUint64(call, round)
 	call = append(call, byte(dimension))
 	return call
+}
+
+// DisputeRound submits dispute_round (call_index 7), directly signed by
+// this Registrar's own account -- never sudo-wrapped, the pallet itself
+// authorizes the caller (the scored provider, or a validator who sat on
+// that round's committee; verified directly against
+// blockchain/pallets/network-validator/src/lib.rs's dispute_round). ADR-
+// 013 §9 deliberately makes this a manual, explicit CLI action rather
+// than something the challenge loop triggers automatically: a validator
+// disputing algorithmically on every disagreement would just move the
+// trust problem, not solve it -- a dispute is a deliberate, attributable
+// human decision in this MVP, not machine-automated policy. In this
+// architecture only a validator can practically exercise this call today
+// (a provider has no independent chain-signing path -- the Provider Agent
+// never talks to the chain directly, AGENTS.md's frozen rule -- so the
+// provider side of dispute_round's authorization is real on-chain but not
+// yet reachable by any tool in this MVP; a future CP-proxied
+// "dispute_round_for" delegation, mirroring register_provider_for's
+// existing pattern, is the natural way to close that gap, not attempted
+// here since it wasn't asked for).
+func (r *Registrar) DisputeRound(ctx context.Context, provider [32]byte, round uint64, dimension ScoreDimension) error {
+	return r.SubmitDirect(ctx, encodeDisputeRoundCall(provider, round, dimension))
+}
+
+func encodeDisputeRoundCall(provider [32]byte, round uint64, dimension ScoreDimension) []byte {
+	call := []byte{networkValidatorPalletIndex, disputeRoundCallIndex}
+	call = append(call, provider[:]...)
+	call = binary.LittleEndian.AppendUint64(call, round)
+	call = append(call, byte(dimension))
+	return call
+}
+
+// ResolveDispute submits resolve_dispute (call_index 8), settling a
+// dispute by upholding (keep the rollback to the round's previous score)
+// or rejecting (re-apply the round's aggregate) it. Unlike every other
+// method on this type, this call is SuspensionOrigin-gated in the runtime
+// (blockchain/runtime/src/lib.rs: SuspensionOrigin = EnsureRoot) -- full
+// on-chain adjudication is deferred per ADR-011 §5, so for the MVP a
+// governance/root origin decides, the same trust boundary
+// provider-registration's EnsureActive already uses. This Registrar must
+// therefore be the Control Plane's own bridge/sudo account to call this
+// successfully, never an ordinary validator's account -- sudo-wrapped,
+// unlike DisputeRound/SubmitEvidence/CloseRound/RegisterValidator, which
+// are all deliberately direct-signed to keep validators independent of
+// the bridge.
+func (r *Registrar) ResolveDispute(ctx context.Context, provider [32]byte, round uint64, dimension ScoreDimension, uphold bool) error {
+	return r.SubmitSudo(ctx, encodeResolveDisputeCall(provider, round, dimension, uphold))
+}
+
+func encodeResolveDisputeCall(provider [32]byte, round uint64, dimension ScoreDimension, uphold bool) []byte {
+	call := []byte{networkValidatorPalletIndex, resolveDisputeCallIndex}
+	call = append(call, provider[:]...)
+	call = binary.LittleEndian.AppendUint64(call, round)
+	call = append(call, byte(dimension))
+	// bool's SCALE encoding is a single byte: 0 = false, 1 = true.
+	if uphold {
+		call = append(call, 1)
+	} else {
+		call = append(call, 0)
+	}
+	return call
+}
+
+// SubmitSudo signs and submits call wrapped in Sudo::sudo, using this
+// Registrar's own account as the sudo key -- SubmitDirect's sibling for
+// the SuspensionOrigin/EnsureRoot-gated calls this package needs
+// (ResolveDispute today), mirroring the exact sudo-wrapping
+// EnsureActive/EnsureLeaseActive already use, just factored out instead
+// of inlined per multi-step call site.
+func (r *Registrar) SubmitSudo(ctx context.Context, call []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	version, err := r.rpc.RuntimeVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if version.SpecVersion != supportedSpecVersion || version.TransactionVersion != supportedTransactionVersion {
+		return fmt.Errorf("unsupported runtime version spec=%d transaction=%d", version.SpecVersion, version.TransactionVersion)
+	}
+	genesisHex, err := r.rpc.BlockHash(ctx, 0)
+	if err != nil {
+		return err
+	}
+	genesis, err := fixedHash(genesisHex)
+	if err != nil {
+		return err
+	}
+	nonce, err := r.finalizedAccountNonce(ctx)
+	if err != nil {
+		return err
+	}
+	extrinsic, hash, err := r.signSudo(call, nonce, version, genesis)
+	if err != nil {
+		return err
+	}
+	submitted, err := r.rpc.SubmitExtrinsic(ctx, "0x"+hex.EncodeToString(extrinsic))
+	if err != nil {
+		return err
+	}
+	if submitted != "0x"+hex.EncodeToString(hash[:]) {
+		return errors.New("Substrate returned an unexpected extrinsic hash")
+	}
+	return nil
 }
 
 // SubmitDirect signs and submits an arbitrary call with this Registrar's

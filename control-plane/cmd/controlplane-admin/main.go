@@ -1,21 +1,40 @@
-// Command controlplane-admin is operator tooling for issue #12: there is
-// deliberately no self-service user registration RPC (that would be a much
-// larger surface -- verification, abuse prevention -- out of scope for a
-// tenancy MVP), so creating a user and issuing their first API key is a
-// local/offline operation against the same Postgres the Control Plane uses.
+// Command controlplane-admin is operator tooling for two unrelated
+// privileged actions that both need the Control Plane's own credentials
+// rather than an ordinary user's or validator's:
 //
-// The raw API key is printed exactly once, to stdout, and never persisted
-// anywhere (only its SHA-256 hash lives in Postgres) -- copy it immediately;
-// there is no way to recover it later, only to revoke it and issue a new one.
+//   - User/API-key management (issue #12): there is deliberately no
+//     self-service user registration RPC (that would be a much larger
+//     surface -- verification, abuse prevention -- out of scope for a
+//     tenancy MVP), so creating a user and issuing their first API key is
+//     a local/offline Postgres operation. The raw API key is printed
+//     exactly once, to stdout, and never persisted anywhere (only its
+//     SHA-256 hash lives in Postgres) -- copy it immediately; there is no
+//     way to recover it later, only to revoke it and issue a new one.
+//   - resolve-dispute (ADR-013 slice 5, issue #78): pallet-network-
+//     validator's resolve_dispute extrinsic is SuspensionOrigin-gated
+//     (EnsureRoot in this runtime) -- only the Control Plane's own
+//     bridge/sudo account can call it, the same governance trust
+//     boundary provider registration's EnsureActive already uses. This is
+//     why it lives here and not in cmd/networkvalidator, which
+//     deliberately only ever signs with an ordinary validator's own
+//     account.
+//
+// Each subcommand only connects to the credential store it actually
+// needs -- user/API-key commands never touch the chain, resolve-dispute
+// never touches Postgres.
 package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/migrations"
 )
@@ -31,11 +50,23 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return usageError()
 	}
+	ctx := context.Background()
+
+	switch args[0] {
+	case "create-user", "issue-key", "revoke-key":
+		return runUserCommand(ctx, args)
+	case "resolve-dispute":
+		return runResolveDispute(ctx, args)
+	default:
+		return usageError()
+	}
+}
+
+func runUserCommand(ctx context.Context, args []string) error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		return errors.New("DATABASE_URL is required")
 	}
-	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return fmt.Errorf("configure PostgreSQL: %w", err)
@@ -66,9 +97,8 @@ func run(args []string) error {
 		}
 		fmt.Println("revoked")
 		return nil
-	default:
-		return usageError()
 	}
+	return usageError()
 }
 
 func createUser(ctx context.Context, repository *userauth.PostgresRepository, displayName string) error {
@@ -90,6 +120,82 @@ func issueKey(ctx context.Context, repository *userauth.PostgresRepository, user
 	return nil
 }
 
+// runResolveDispute settles a dispute pallet-network-validator's
+// resolve_dispute -- see the package doc comment for why this, uniquely
+// among this session's Network Validator tooling, must run with the
+// Control Plane's own bridge/sudo credentials rather than a validator's.
+func runResolveDispute(ctx context.Context, args []string) error {
+	if len(args) != 5 {
+		return errors.New("usage: controlplane-admin resolve-dispute <provider-hex> <round> <dimension> <uphold|reject>")
+	}
+	rpcURL := os.Getenv("SUBSTRATE_RPC_URL")
+	if rpcURL == "" {
+		return errors.New("SUBSTRATE_RPC_URL is required")
+	}
+	signerKeyFile := os.Getenv("SUBSTRATE_SIGNER_KEY_FILE")
+	if signerKeyFile == "" {
+		return errors.New("SUBSTRATE_SIGNER_KEY_FILE is required (the Control Plane's own bridge/sudo key -- resolve_dispute is SuspensionOrigin-gated, an ordinary validator's key cannot call it)")
+	}
+	provider, err := parseAccountHex(args[1])
+	if err != nil {
+		return fmt.Errorf("parse provider: %w", err)
+	}
+	round, err := strconv.ParseUint(args[2], 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse round: %w", err)
+	}
+	dimension, err := blockchainbridge.ParseScoreDimension(args[3])
+	if err != nil {
+		return err
+	}
+	uphold, err := parseUpholdOrReject(args[4])
+	if err != nil {
+		return err
+	}
+
+	chain, err := blockchainbridge.NewRPCClient(rpcURL, &http.Client{})
+	if err != nil {
+		return fmt.Errorf("configure Substrate RPC client: %w", err)
+	}
+	registrar, err := blockchainbridge.NewRegistrarFromPKCS8File(chain, signerKeyFile)
+	if err != nil {
+		return fmt.Errorf("configure bridge signer: %w", err)
+	}
+	if err := registrar.ResolveDispute(ctx, provider, round, dimension, uphold); err != nil {
+		return fmt.Errorf("resolve_dispute: %w", err)
+	}
+	verb := "rejected (round's aggregate re-applied)"
+	if uphold {
+		verb = "upheld (rollback to the pre-round score kept)"
+	}
+	fmt.Printf("resolve_dispute submitted for provider=%s round=%d dimension=%s: %s\n", args[1], round, dimension, verb)
+	return nil
+}
+
+func parseAccountHex(value string) ([32]byte, error) {
+	var account [32]byte
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return account, fmt.Errorf("%q is not valid hex: %w", value, err)
+	}
+	if len(decoded) != 32 {
+		return account, fmt.Errorf("%q decodes to %d bytes, want 32", value, len(decoded))
+	}
+	copy(account[:], decoded)
+	return account, nil
+}
+
+func parseUpholdOrReject(value string) (bool, error) {
+	switch value {
+	case "uphold":
+		return true, nil
+	case "reject":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%q must be exactly \"uphold\" or \"reject\"", value)
+	}
+}
+
 func usageError() error {
-	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id>>")
+	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject>>")
 }

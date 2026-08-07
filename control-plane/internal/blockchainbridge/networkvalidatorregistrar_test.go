@@ -159,3 +159,67 @@ func TestValidatorStorageKeyIsAPerAccountMapEntry(t *testing.T) {
 		t.Fatal("expected a deterministic storage key for the same account")
 	}
 }
+
+func TestEncodeDisputeRoundCallMatchesPalletFieldOrder(t *testing.T) {
+	var provider [32]byte
+	provider[0] = 0xCD
+	round := uint64(99)
+	dimension := DimensionAvailability
+
+	got := encodeDisputeRoundCall(provider, round, dimension)
+
+	want := []byte{networkValidatorPalletIndex, disputeRoundCallIndex}
+	want = append(want, provider[:]...)
+	want = binary.LittleEndian.AppendUint64(want, round)
+	want = append(want, byte(dimension))
+
+	if string(got) != string(want) {
+		t.Fatalf("encodeDisputeRoundCall() = %x, want %x", got, want)
+	}
+	if len(got) != 2+32+8+1 {
+		t.Fatalf("encodeDisputeRoundCall() length = %d, want %d", len(got), 2+32+8+1)
+	}
+}
+
+func TestEncodeResolveDisputeCallMatchesPalletFieldOrder(t *testing.T) {
+	var provider [32]byte
+	provider[0] = 0xEF
+	round := uint64(7)
+	dimension := DimensionCompute
+
+	for _, uphold := range []bool{true, false} {
+		got := encodeResolveDisputeCall(provider, round, dimension, uphold)
+
+		want := []byte{networkValidatorPalletIndex, resolveDisputeCallIndex}
+		want = append(want, provider[:]...)
+		want = binary.LittleEndian.AppendUint64(want, round)
+		want = append(want, byte(dimension))
+		if uphold {
+			want = append(want, 1)
+		} else {
+			want = append(want, 0)
+		}
+
+		if string(got) != string(want) {
+			t.Fatalf("encodeResolveDisputeCall(uphold=%v) = %x, want %x", uphold, got, want)
+		}
+		if len(got) != 2+32+8+1+1 {
+			t.Fatalf("encodeResolveDisputeCall() length = %d, want %d", len(got), 2+32+8+1+1)
+		}
+	}
+
+	// The only byte difference between the two calls must be the final
+	// uphold flag -- proves the bool encodes as exactly one trailing byte,
+	// not e.g. a compact-prefixed or multi-byte value.
+	uphold := encodeResolveDisputeCall(provider, round, dimension, true)
+	reject := encodeResolveDisputeCall(provider, round, dimension, false)
+	if len(uphold) != len(reject) {
+		t.Fatalf("uphold/reject encodings differ in length: %d vs %d", len(uphold), len(reject))
+	}
+	if string(uphold[:len(uphold)-1]) != string(reject[:len(reject)-1]) {
+		t.Fatal("uphold/reject encodings differ before the final byte")
+	}
+	if uphold[len(uphold)-1] != 1 || reject[len(reject)-1] != 0 {
+		t.Fatalf("final byte = %d/%d, want 1/0", uphold[len(uphold)-1], reject[len(reject)-1])
+	}
+}
