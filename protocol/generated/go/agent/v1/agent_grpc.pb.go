@@ -27,6 +27,7 @@ const (
 	ProviderAgentService_Stop_FullMethodName              = "/openinfra.agent.v1.ProviderAgentService/Stop"
 	ProviderAgentService_GetWorkloadStatus_FullMethodName = "/openinfra.agent.v1.ProviderAgentService/GetWorkloadStatus"
 	ProviderAgentService_StreamMetrics_FullMethodName     = "/openinfra.agent.v1.ProviderAgentService/StreamMetrics"
+	ProviderAgentService_MeasureBandwidth_FullMethodName  = "/openinfra.agent.v1.ProviderAgentService/MeasureBandwidth"
 )
 
 // ProviderAgentServiceClient is the client API for ProviderAgentService service.
@@ -41,6 +42,12 @@ type ProviderAgentServiceClient interface {
 	Stop(ctx context.Context, in *StopRequest, opts ...grpc.CallOption) (*StopResponse, error)
 	GetWorkloadStatus(ctx context.Context, in *GetWorkloadStatusRequest, opts ...grpc.CallOption) (*GetWorkloadStatusResponse, error)
 	StreamMetrics(ctx context.Context, in *StreamMetricsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamMetricsResponse], error)
+	// ADR-015: independent bandwidth throughput measurement. A dedicated RPC,
+	// deliberately not an overload of SolveChallenge's existing TYPE_NETWORK
+	// (see ADR-015 §1) -- that type is already merged and exercised by the
+	// live challenge loop (#85) with its existing small-payload liveness/
+	// correctness semantics, which this does not change.
+	MeasureBandwidth(ctx context.Context, in *MeasureBandwidthRequest, opts ...grpc.CallOption) (*MeasureBandwidthResponse, error)
 }
 
 type providerAgentServiceClient struct {
@@ -140,6 +147,16 @@ func (c *providerAgentServiceClient) StreamMetrics(ctx context.Context, in *Stre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ProviderAgentService_StreamMetricsClient = grpc.ServerStreamingClient[StreamMetricsResponse]
 
+func (c *providerAgentServiceClient) MeasureBandwidth(ctx context.Context, in *MeasureBandwidthRequest, opts ...grpc.CallOption) (*MeasureBandwidthResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MeasureBandwidthResponse)
+	err := c.cc.Invoke(ctx, ProviderAgentService_MeasureBandwidth_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ProviderAgentServiceServer is the server API for ProviderAgentService service.
 // All implementations must embed UnimplementedProviderAgentServiceServer
 // for forward compatibility.
@@ -152,6 +169,12 @@ type ProviderAgentServiceServer interface {
 	Stop(context.Context, *StopRequest) (*StopResponse, error)
 	GetWorkloadStatus(context.Context, *GetWorkloadStatusRequest) (*GetWorkloadStatusResponse, error)
 	StreamMetrics(*StreamMetricsRequest, grpc.ServerStreamingServer[StreamMetricsResponse]) error
+	// ADR-015: independent bandwidth throughput measurement. A dedicated RPC,
+	// deliberately not an overload of SolveChallenge's existing TYPE_NETWORK
+	// (see ADR-015 §1) -- that type is already merged and exercised by the
+	// live challenge loop (#85) with its existing small-payload liveness/
+	// correctness semantics, which this does not change.
+	MeasureBandwidth(context.Context, *MeasureBandwidthRequest) (*MeasureBandwidthResponse, error)
 	mustEmbedUnimplementedProviderAgentServiceServer()
 }
 
@@ -185,6 +208,9 @@ func (UnimplementedProviderAgentServiceServer) GetWorkloadStatus(context.Context
 }
 func (UnimplementedProviderAgentServiceServer) StreamMetrics(*StreamMetricsRequest, grpc.ServerStreamingServer[StreamMetricsResponse]) error {
 	return status.Error(codes.Unimplemented, "method StreamMetrics not implemented")
+}
+func (UnimplementedProviderAgentServiceServer) MeasureBandwidth(context.Context, *MeasureBandwidthRequest) (*MeasureBandwidthResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MeasureBandwidth not implemented")
 }
 func (UnimplementedProviderAgentServiceServer) mustEmbedUnimplementedProviderAgentServiceServer() {}
 func (UnimplementedProviderAgentServiceServer) testEmbeddedByValue()                              {}
@@ -344,6 +370,24 @@ func _ProviderAgentService_StreamMetrics_Handler(srv interface{}, stream grpc.Se
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ProviderAgentService_StreamMetricsServer = grpc.ServerStreamingServer[StreamMetricsResponse]
 
+func _ProviderAgentService_MeasureBandwidth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MeasureBandwidthRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProviderAgentServiceServer).MeasureBandwidth(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProviderAgentService_MeasureBandwidth_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProviderAgentServiceServer).MeasureBandwidth(ctx, req.(*MeasureBandwidthRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ProviderAgentService_ServiceDesc is the grpc.ServiceDesc for ProviderAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -378,6 +422,10 @@ var ProviderAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetWorkloadStatus",
 			Handler:    _ProviderAgentService_GetWorkloadStatus_Handler,
+		},
+		{
+			MethodName: "MeasureBandwidth",
+			Handler:    _ProviderAgentService_MeasureBandwidth_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
