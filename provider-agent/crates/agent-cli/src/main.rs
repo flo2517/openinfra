@@ -141,8 +141,16 @@ async fn handle_start(dev: bool) -> Result<()> {
         bandwidth_rate_limiter: agent_api::BandwidthRateLimiter::new(),
     };
 
-    let router =
-        tonic::transport::Server::builder().add_service(ProviderAgentServiceServer::new(server));
+    // tonic's default per-message limit (4 MiB, both directions) predates
+    // MeasureBandwidth (ADR-015) and would reject its whole premise --
+    // agent_api::MAX_BANDWIDTH_PROBE_BYTES (8 MiB) plus a fixed margin for
+    // protobuf/gRPC framing overhead beyond the raw payload bytes.
+    const BANDWIDTH_MESSAGE_SIZE_LIMIT: usize = agent_api::MAX_BANDWIDTH_PROBE_BYTES + 64 * 1024;
+    let router = tonic::transport::Server::builder().add_service(
+        ProviderAgentServiceServer::new(server)
+            .max_decoding_message_size(BANDWIDTH_MESSAGE_SIZE_LIMIT)
+            .max_encoding_message_size(BANDWIDTH_MESSAGE_SIZE_LIMIT),
+    );
     if dev {
         if !addr.ip().is_loopback() {
             anyhow::bail!("plaintext development Agent requires a loopback listen address")

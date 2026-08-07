@@ -59,7 +59,13 @@ const MAX_CHALLENGE_PAYLOAD: usize = 4096;
 // Agent's per-request memory/CPU cost any more loosely than every other
 // Agent RPC already is bounded.
 const BANDWIDTH_PROBE_DOMAIN: &[u8] = b"openinfra-bandwidth-probe-v1\0";
-const MAX_BANDWIDTH_PROBE_BYTES: usize = 8 * 1024 * 1024;
+// pub: agent-cli's server setup needs this value too, to raise tonic's
+// default 4 MiB gRPC message-size limit (which would otherwise reject
+// this RPC's whole premise) -- see main.rs's ProviderAgentServiceServer
+// construction. Keeping one definition, referenced from both places,
+// instead of a second hard-coded number that could silently drift from
+// this one.
+pub const MAX_BANDWIDTH_PROBE_BYTES: usize = 8 * 1024 * 1024;
 
 // ADR-015 §3: a per-caller rate limit scoped to just this RPC, so a
 // validator (malicious or buggy) cannot use repeated MAX_BANDWIDTH_

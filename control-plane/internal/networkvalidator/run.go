@@ -173,7 +173,18 @@ func challengeAndSubmit(ctx context.Context, cfg LoopConfig, key roundKey, done 
 	logger := cfg.Logger.With("provider_id", providerID, "round", key.round, "dimension", key.dimension.String())
 	logger.Info("networkvalidator: assigned, challenging")
 
-	result, err := cfg.Challenger.Challenge(ctx, providerID, key.dimension)
+	// ADR-015: the Network dimension's evidence changes from a generic
+	// SolveChallenge liveness/correctness check to a real MeasureBandwidth
+	// throughput probe -- run instead of, not in addition to,
+	// Challenge()'s SolveChallenge call. Every other dimension is
+	// unchanged.
+	var result ChallengeResult
+	var err error
+	if key.dimension == blockchainbridge.DimensionNetwork {
+		result, err = cfg.Challenger.MeasureBandwidth(ctx, providerID)
+	} else {
+		result, err = cfg.Challenger.Challenge(ctx, providerID, key.dimension)
+	}
 	if err != nil {
 		// Discovery/setup could not even be attempted (e.g. dashboard
 		// unreachable) -- do not mark done, so a later tick this same
