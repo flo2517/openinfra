@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"crypto/ed25519"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -31,6 +32,7 @@ type Server struct {
 
 type Provider struct {
 	fullID       string
+	publicKey    []byte  // raw 32-byte on-chain key; reputation/offer lookups only, never serialized
 	ProviderID   string  `json:"provider_id"`
 	Status       string  `json:"status"`
 	Liveness     string  `json:"liveness"`
@@ -39,7 +41,47 @@ type Provider struct {
 	HeartbeatAge *int64  `json:"heartbeat_age_seconds,omitempty"`
 	CPUAvailable float32 `json:"cpu_available"`
 	MemoryMB     int64   `json:"memory_available_mb"`
-	ChainState   string  `json:"chain_state"`
+	// StorageAvailableGB/StorageTotalGB and IngressMbps/EgressMbps were
+	// already decoded off every heartbeat (ResourceCapability carries
+	// them) but never surfaced -- part of #14's "hardware/resource
+	// inventory" provider view.
+	StorageAvailableGB int64  `json:"storage_available_gb"`
+	StorageTotalGB     int64  `json:"storage_total_gb"`
+	IngressMbps        int32  `json:"bandwidth_ingress_mbps,omitempty"`
+	EgressMbps         int32  `json:"bandwidth_egress_mbps,omitempty"`
+	ChainState         string `json:"chain_state"`
+	// Reputation/Offer are nil when not yet read (chain unavailable) --
+	// see ReputationSummary/OfferSummary for the "no record yet" vs
+	// "read failed" distinction within each.
+	Reputation *ReputationSummary `json:"reputation,omitempty"`
+	Offer      *OfferSummary      `json:"offer,omitempty"`
+}
+
+// ReputationSummary mirrors blockchainbridge.ReputationVector for display.
+// Available is false when the provider has no on-chain reputation record
+// yet (a normal, common state for a freshly joined provider) -- distinct
+// from a read failure, which leaves Reputation nil on the Provider instead
+// of fabricating an Available:true, all-zero record that would look like a
+// proven-bad score.
+type ReputationSummary struct {
+	Available    bool   `json:"available"`
+	Compute      uint32 `json:"compute"`
+	Storage      uint32 `json:"storage"`
+	Network      uint32 `json:"network"`
+	Availability uint32 `json:"availability"`
+	Reliability  uint32 `json:"reliability"`
+	Global       uint32 `json:"global"`
+}
+
+// OfferSummary mirrors blockchainbridge.ResourceOffer for display. Found
+// is false when pallet-resource-market has no finalized offer for this
+// provider yet (e.g. the reconciler's first pass hasn't run) -- distinct
+// from a read failure, which leaves Offer nil on the Provider.
+type OfferSummary struct {
+	Found         bool   `json:"found"`
+	CPUMillicores uint32 `json:"cpu_millicores,omitempty"`
+	RAMMB         uint64 `json:"ram_mb,omitempty"`
+	StorageGB     uint64 `json:"storage_gb,omitempty"`
 }
 
 type Overview struct {
@@ -131,7 +173,7 @@ func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
 		ValidatorsActive: -1,
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT p.provider_id, p.status, p.agent_version, p.registered_at,
+		SELECT p.provider_id, p.public_key, p.status, p.agent_version, p.registered_at,
 		       COALESCE(c.state, 'UNKNOWN')
 		FROM providers p LEFT JOIN provider_chain_registrations c USING (provider_id)
 		ORDER BY p.registered_at DESC LIMIT 500`)
@@ -143,7 +185,7 @@ func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
 		var p Provider
 		var status int16
 		var registered time.Time
-		if err := rows.Scan(&p.ProviderID, &status, &p.AgentVersion, &registered, &p.ChainState); err != nil {
+		if err := rows.Scan(&p.ProviderID, &p.publicKey, &status, &p.AgentVersion, &registered, &p.ChainState); err != nil {
 			return Overview{}, err
 		}
 		p.fullID = p.ProviderID
@@ -221,6 +263,12 @@ func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
 			result.Providers[index].MemoryMB = memory
 			result.CPUAvailable += float64(cpu)
 			result.MemoryMB += memory
+			result.Providers[index].StorageAvailableGB = payload.Capabilities.StorageAvailableGb
+			result.Providers[index].StorageTotalGB = payload.Capabilities.StorageTotalGb
+			if bandwidth := payload.Capabilities.Bandwidth; bandwidth != nil {
+				result.Providers[index].IngressMbps = bandwidth.IngressMbps
+				result.Providers[index].EgressMbps = bandwidth.EgressMbps
+			}
 		}
 		result.ProvidersFresh++
 	}
@@ -255,6 +303,43 @@ func (s *Server) loadOverview(ctx context.Context) (Overview, error) {
 	for _, account := range validators {
 		result.Validators = append(result.Validators, abbreviate(hex.EncodeToString(account[:])))
 	}
+
+	// Per-provider chain reads (reputation vector, finalized resource-market
+	// offer) all snapshot the same finalHash resolved above, so every
+	// provider in one response reflects the same block -- not a race
+	// between whichever block happened to be finalized when each read
+	// fired. A single provider's read failing degrades only that
+	// provider's Reputation/Offer to nil (and sets Partial), not the
+	// whole response -- unlike the chain-wide health/validators checks
+	// above, this is closer in spirit to the per-provider Redis
+	// liveness loop than to a global precondition.
+	for index := range result.Providers {
+		key := result.Providers[index].publicKey
+		if len(key) != ed25519.PublicKeySize {
+			continue
+		}
+		var account [32]byte
+		copy(account[:], key)
+
+		if vector, found, err := s.chain.ProviderReputationVector(chainCtx, account, finalHash); err != nil {
+			result.Partial = true
+			appendError(&result, "provider reputation unavailable")
+		} else {
+			result.Providers[index].Reputation = &ReputationSummary{
+				Available: found,
+				Compute:   vector.Compute, Storage: vector.Storage, Network: vector.Network,
+				Availability: vector.Availability, Reliability: vector.Reliability, Global: vector.Global,
+			}
+		}
+
+		if offer, found, err := s.chain.FinalizedOffer(chainCtx, account, finalHash); err != nil {
+			result.Partial = true
+			appendError(&result, "provider offer unavailable")
+		} else {
+			result.Providers[index].Offer = &OfferSummary{Found: found, CPUMillicores: offer.CPUMillicores, RAMMB: offer.RAMMB, StorageGB: offer.StorageGB}
+		}
+	}
+
 	return result, nil
 }
 
