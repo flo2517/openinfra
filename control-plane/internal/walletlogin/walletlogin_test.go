@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	schnorrkel "github.com/ChainSafe/go-schnorrkel"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/walletlogin"
 )
@@ -154,12 +155,45 @@ func TestLoginRejectsAnUnsupportedScheme(t *testing.T) {
 		t.Fatal(err)
 	}
 	var account [32]byte
-	_, err = service.Login(context.Background(), challenge.ChallengeID, account, walletlogin.SchemeSr25519, make([]byte, ed25519.SignatureSize))
+	// Neither SchemeEd25519 (0) nor SchemeSr25519 (1) -- a genuinely
+	// unrecognized scheme byte, the only case ErrSchemeNotSupported
+	// still covers now that both real schemes are verifiable.
+	_, err = service.Login(context.Background(), challenge.ChallengeID, account, walletlogin.Scheme(2), make([]byte, ed25519.SignatureSize))
 	if err != walletlogin.ErrSchemeNotSupported {
 		t.Fatalf("Login() error = %v, want ErrSchemeNotSupported", err)
 	}
 	if repository.consumeCalls != 0 {
 		t.Fatal("an unsupported scheme must be rejected before touching the challenge at all")
+	}
+}
+
+func TestLoginSucceedsWithASr25519Signature(t *testing.T) {
+	repository := newFakeRepository()
+	keys := &fakeKeyMinter{}
+	service := walletlogin.NewService(repository, keys)
+	challenge, err := service.NewChallenge(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretKey, publicKey, err := schnorrkel.GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := append([]byte("openinfra-dashboard-login-v1\x00"), challenge.Nonce[:]...)
+	transcript := schnorrkel.NewSigningContext([]byte("substrate"), message)
+	signature, err := secretKey.Sign(transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedSignature := signature.Encode()
+	account := publicKey.Encode()
+
+	session, err := service.Login(context.Background(), challenge.ChallengeID, account, walletlogin.SchemeSr25519, encodedSignature[:])
+	if err != nil {
+		t.Fatalf("Login() with a genuine Sr25519 signature: %v", err)
+	}
+	if session.APIKey == "" {
+		t.Fatal("expected a populated session")
 	}
 }
 

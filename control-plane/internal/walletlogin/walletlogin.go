@@ -27,18 +27,30 @@ const (
 	sessionTTL   = 24 * time.Hour
 )
 
-// Scheme identifies a wallet account's signature algorithm. Defined now
-// (matching wallet_accounts.scheme) so the schema never needs a later
-// migration, even though Login only accepts Ed25519 until a later slice
-// adds Schnorrkel (Sr25519) verification -- see ADR-014 §3/§7: most real
-// Polkadot.js-generated accounts default to Sr25519, so this is a real,
-// tracked gap, not a hypothetical one.
+// Scheme identifies a wallet account's signature algorithm -- matches
+// wallet_accounts.scheme exactly. Both are verifiable: Ed25519 via Go's
+// standard library, Sr25519 via Schnorrkel (see sr25519.go) since that is
+// what a real Polkadot.js-generated account defaults to (ADR-014 §3).
 type Scheme byte
 
 const (
 	SchemeEd25519 Scheme = 0
 	SchemeSr25519 Scheme = 1
 )
+
+// verifySignature dispatches to the scheme-appropriate verification.
+// Login has already rejected anything other than SchemeEd25519/
+// SchemeSr25519 before this is called.
+func verifySignature(scheme Scheme, account [32]byte, message, signature []byte) bool {
+	switch scheme {
+	case SchemeEd25519:
+		return ed25519.Verify(account[:], message, signature)
+	case SchemeSr25519:
+		return verifySr25519(account, message, signature)
+	default:
+		return false
+	}
+}
 
 var (
 	ErrChallengeNotFound  = errors.New("challenge not found, expired, or already used")
@@ -118,7 +130,7 @@ func (s *Service) NewChallenge(ctx context.Context) (Challenge, error) {
 // scheme, and on success mints a session key for the (possibly newly
 // created) user that account belongs to.
 func (s *Service) Login(ctx context.Context, challengeID string, account [32]byte, scheme Scheme, signature []byte) (Session, error) {
-	if scheme != SchemeEd25519 {
+	if scheme != SchemeEd25519 && scheme != SchemeSr25519 {
 		return Session{}, ErrSchemeNotSupported
 	}
 	nonce, err := s.repository.LiveChallengeNonce(ctx, challengeID)
@@ -126,7 +138,7 @@ func (s *Service) Login(ctx context.Context, challengeID string, account [32]byt
 		return Session{}, err
 	}
 	message := append([]byte(loginDomain), nonce[:]...)
-	if !ed25519.Verify(account[:], message, signature) {
+	if !verifySignature(scheme, account, message, signature) {
 		return Session{}, ErrInvalidSignature
 	}
 	if err := s.repository.ConsumeChallenge(ctx, challengeID); err != nil {

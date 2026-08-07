@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	schnorrkel "github.com/ChainSafe/go-schnorrkel"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/ratelimit"
@@ -184,11 +185,58 @@ func TestLoginRejectsAnUnsupportedSchemeOverHTTP(t *testing.T) {
 	recorder := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", loginRequest{
 		ChallengeID: challenge.ChallengeID,
 		Account:     strings.Repeat("00", 32),
-		Scheme:      1, // Sr25519 -- not yet supported (ADR-014 §3)
+		Scheme:      2, // neither Ed25519 (0) nor Sr25519 (1) -- both are supported now
 		Signature:   strings.Repeat("00", 64),
 	})
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestChallengeThenSr25519LoginSucceedsEndToEnd(t *testing.T) {
+	_, server, _ := newAuthTestServer(t)
+	handler := server.Handler()
+
+	challengeRecorder := doJSON(t, handler, http.MethodPost, "/api/v1/auth/challenge", nil)
+	var challenge challengeResponse
+	if err := json.Unmarshal(challengeRecorder.Body.Bytes(), &challenge); err != nil {
+		t.Fatal(err)
+	}
+	nonce, err := hex.DecodeString(challenge.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secretKey, publicKey, err := schnorrkel.GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := append([]byte("openinfra-dashboard-login-v1\x00"), nonce...)
+	transcript := schnorrkel.NewSigningContext([]byte("substrate"), message)
+	signature, err := secretKey.Sign(transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedSignature := signature.Encode()
+	account := publicKey.Encode()
+
+	loginRecorder := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", loginRequest{
+		ChallengeID: challenge.ChallengeID,
+		Account:     hex.EncodeToString(account[:]),
+		Scheme:      1, // Sr25519
+		Signature:   hex.EncodeToString(encodedSignature[:]),
+	})
+	if loginRecorder.Code != http.StatusOK {
+		t.Fatalf("login status = %d, body = %s", loginRecorder.Code, loginRecorder.Body.String())
+	}
+	var login struct {
+		SessionKey string `json:"session_key"`
+	}
+	if err := json.Unmarshal(loginRecorder.Body.Bytes(), &login); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(login.SessionKey, "oiu_") {
+		t.Fatalf("session_key = %q, expected an oiu_-prefixed API key", login.SessionKey)
 	}
 }
 

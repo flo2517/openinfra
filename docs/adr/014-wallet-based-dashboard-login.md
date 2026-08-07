@@ -4,6 +4,19 @@
 
 Accepted.
 
+**Implementation note (post-acceptance):** §3's Sr25519 verification gap
+closed shortly after the first slice landed -- `internal/walletlogin`
+verifies both Ed25519 and Sr25519 signatures now (via
+`github.com/ChainSafe/go-schnorrkel`, Substrate's standard `b"substrate"`
+signing context). The browser UI still only offers the Ed25519 local-key
+fallback from §7 -- Sr25519 verification has no client yet, since that
+needs wallet-extension integration (§7's still-deferred piece), not just
+server-side support. The signing-context constant is Substrate's
+well-established public convention and has been proven correct against
+`go-schnorrkel`'s own sign/verify round trip, but -- like the Ed25519
+browser path before it -- has not been cross-checked against a signature
+actually produced by a real wallet extension in this sandbox.
+
 ## Context
 
 Issue #12 gave end users an authenticated identity, but only for machine
