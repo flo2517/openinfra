@@ -189,6 +189,32 @@ func (c *ChallengeClient) Challenge(ctx context.Context, providerID string, dime
 // authentication, and is called out here loudly per this task's explicit
 // instructions rather than shipped silently.
 func (c *ChallengeClient) callSolveChallenge(ctx context.Context, endpoint AgentEndpoint, challengeID string, challengeType agentv1.SolveChallengeRequest_Type, payload []byte) (*agentv1.SolveChallengeResponse, error) {
+	connection, err := c.dial(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Close()
+
+	client := agentv1.NewProviderAgentServiceClient(connection)
+	requestCtx, requestCancel := context.WithTimeout(ctx, c.config.ChallengeTimeout)
+	defer requestCancel()
+	response, err := client.SolveChallenge(requestCtx, &agentv1.SolveChallengeRequest{
+		ChallengeId: challengeID,
+		Type:        challengeType,
+		Payload:     payload,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("SolveChallenge RPC: %w", err)
+	}
+	return response, nil
+}
+
+// dial establishes the mTLS gRPC connection callSolveChallenge and (ADR-
+// 015) callMeasureBandwidth both dial identically -- factored out purely
+// to avoid duplicating the trust-model logic documented above between
+// the two call sites; the security discussion in callSolveChallenge's
+// doc comment applies unchanged to every caller of dial.
+func (c *ChallengeClient) dial(ctx context.Context, endpoint AgentEndpoint) (*grpc.ClientConn, error) {
 	parsed, err := url.Parse(endpoint.AgentEndpoint)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
 		return nil, fmt.Errorf("agent endpoint %q is not a valid https address", endpoint.AgentEndpoint)
@@ -208,24 +234,27 @@ func (c *ChallengeClient) callSolveChallenge(ctx context.Context, endpoint Agent
 
 	dialCtx, cancel := context.WithTimeout(ctx, c.config.DialTimeout)
 	defer cancel()
-	connection, err := grpc.DialContext(dialCtx, parsed.Host, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)), grpc.WithBlock())
+	connection, err := grpc.DialContext(
+		dialCtx, parsed.Host,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		grpc.WithBlock(),
+		// grpc-go's default per-message limit (4 MiB, both directions)
+		// predates MeasureBandwidth (ADR-015) and would reject its whole
+		// premise -- applied here (not just on the MeasureBandwidth call
+		// site) since one dialed connection is shared by every RPC this
+		// client issues, and every other RPC's messages are far smaller
+		// than this limit regardless. Matches agent-api's own raised
+		// server-side limit exactly (see agent-cli/src/main.rs's
+		// BANDWIDTH_MESSAGE_SIZE_LIMIT).
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(bandwidthMessageSizeLimit),
+			grpc.MaxCallSendMsgSize(bandwidthMessageSizeLimit),
+		),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("dial agent %s: %w", parsed.Host, err)
 	}
-	defer connection.Close()
-
-	client := agentv1.NewProviderAgentServiceClient(connection)
-	requestCtx, requestCancel := context.WithTimeout(ctx, c.config.ChallengeTimeout)
-	defer requestCancel()
-	response, err := client.SolveChallenge(requestCtx, &agentv1.SolveChallengeRequest{
-		ChallengeId: challengeID,
-		Type:        challengeType,
-		Payload:     payload,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("SolveChallenge RPC: %w", err)
-	}
-	return response, nil
+	return connection, nil
 }
 
 // signedChallengeBytes reproduces exactly what agent-api's solve_challenge

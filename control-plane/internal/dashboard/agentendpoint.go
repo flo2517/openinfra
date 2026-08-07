@@ -55,5 +55,64 @@ func (s *Server) agentEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider has no advertised agent endpoint"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"agent_endpoint": endpoint, "public_key": hex.EncodeToString(publicKey)})
+	response := agentEndpointResponse{AgentEndpoint: endpoint, PublicKey: hex.EncodeToString(publicKey)}
+	if ingressMbps, egressMbps, ok := s.declaredBandwidth(ctx, providerID); ok {
+		response.BandwidthIngressMbps = ingressMbps
+		response.BandwidthEgressMbps = egressMbps
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// agentEndpointResponse is GET /api/v1/agent-endpoint/{provider_id}'s
+// response shape. The bandwidth fields are ADR-015 §5's "the provider's
+// own declared ResourceCapability.Bandwidth," added for the Network
+// Validator's MeasureBandwidth probe to score against -- omitempty (and
+// therefore simply absent, not zero-valued) when declaredBandwidth has
+// no fresh capability data for this provider, so a caller can tell
+// "nothing to compare against yet" apart from "provider declared 0
+// Mbps" (see networkvalidator.AgentEndpoint's doc comment for how the
+// caller-side type handles that same distinction).
+type agentEndpointResponse struct {
+	AgentEndpoint        string `json:"agent_endpoint"`
+	PublicKey            string `json:"public_key"`
+	BandwidthIngressMbps int32  `json:"bandwidth_ingress_mbps,omitempty"`
+	BandwidthEgressMbps  int32  `json:"bandwidth_egress_mbps,omitempty"`
+}
+
+// declaredBandwidth reads a provider's most recently heartbeated declared
+// bandwidth capacity (ResourceCapability.Bandwidth) from the same Redis
+// heartbeat cache the overview endpoint's per-provider capability display
+// already reads (openinfra:heartbeat:<provider_id>, decoded via the same
+// structHeartbeat this package already uses) -- ADR-015 §5 calls for
+// reading "the same live directory data the scheduler already uses," and
+// agentmanager's live provider directory (what the scheduler reads) is
+// itself backed by this identical heartbeat cache (see
+// internal/agentmanager/directory.go's heartbeatKeyPrefix). Deliberately
+// does not check the cache entry's TTL/freshness the way the overview
+// endpoint's liveness display does: a declared capacity is closer to a
+// slow-changing configuration value than a liveness signal, so serving a
+// slightly stale declared figure is an acceptable simplification here,
+// not a correctness bug -- ok is false only when there is no cached
+// capability data to read at all.
+func (s *Server) declaredBandwidth(ctx context.Context, providerID string) (ingressMbps, egressMbps int32, ok bool) {
+	if s.redis == nil {
+		return 0, 0, false
+	}
+	key := "openinfra:heartbeat:" + providerID
+	values, err := s.redis.HMGet(ctx, key, "payload").Result()
+	if err != nil || len(values) != 1 || values[0] == nil {
+		return 0, 0, false
+	}
+	payloadBytes, isString := values[0].(string)
+	if !isString {
+		return 0, 0, false
+	}
+	var payload structHeartbeat
+	if err := payload.Unmarshal([]byte(payloadBytes)); err != nil || payload.ProviderID != providerID {
+		return 0, 0, false
+	}
+	if payload.Capabilities == nil || payload.Capabilities.Bandwidth == nil {
+		return 0, 0, false
+	}
+	return payload.Capabilities.Bandwidth.IngressMbps, payload.Capabilities.Bandwidth.EgressMbps, true
 }

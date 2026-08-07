@@ -10,15 +10,20 @@ dependencies = [
  "agent-inventory",
  "anyhow",
  "async-trait",
+ "hex",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rand",
+ "rcgen",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
