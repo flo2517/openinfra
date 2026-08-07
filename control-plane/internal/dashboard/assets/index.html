@@ -9,6 +9,21 @@
 <body>
   <header><div><span class="eyebrow">OPENINFRA NETWORK</span><h1>Network operations</h1></div><div id="sample" class="sample">Connexion…</div></header>
   <main>
+    <section class="panel" id="auth-panel">
+      <div class="panel-head"><div><span class="eyebrow">COMPTE</span><h2>Connexion par portefeuille</h2></div></div>
+      <div id="auth-unsupported" class="warning" hidden>Ce navigateur ne prend pas en charge Ed25519 via WebCrypto — la connexion par portefeuille n'est pas disponible ici.</div>
+      <div id="auth-logged-out">
+        <p class="muted">Une clé locale (Ed25519, générée dans ce navigateur) sert d'identité — voir ADR-014. Aucune extension de portefeuille requise pour cette première version.</p>
+        <p class="account-line">Compte local : <code id="auth-account">—</code></p>
+        <button id="auth-connect" type="button">Se connecter</button>
+      </div>
+      <div id="auth-logged-in" hidden>
+        <p class="muted">Connecté en tant que <code id="auth-connected-account"></code>. Session valable jusqu'à <span id="auth-session-expiry"></span>.</p>
+        <button id="auth-issue-key" type="button">Générer une clé API longue durée</button>
+        <button id="auth-logout" type="button">Se déconnecter</button>
+        <p id="auth-issued-key" class="warning" hidden></p>
+      </div>
+    </section>
     <section class="cards">
       <article><span>Agents connectés</span><strong id="fresh">—</strong><small id="total">— enregistrés</small></article>
       <article><span>CPU disponible</span><strong id="cpu">—</strong><small>cœurs annoncés actifs</small></article>
@@ -29,6 +44,7 @@
       <div class="table-wrap"><table><thead><tr><th>Provider</th><th>État durable</th><th>Connexion</th><th>Agent</th><th>CPU</th><th>RAM</th><th>Stockage</th><th>Bande passante</th><th>Réputation</th><th>Offre on-chain</th><th>On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>
     </section>
   </main>
+  <script src="auth.js" defer></script>
   <script src="app.js" defer></script>
 </body>
 </html>

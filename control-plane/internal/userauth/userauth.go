@@ -78,12 +78,22 @@ func HashAPIKey(raw string) [32]byte {
 }
 
 // Repository is the persistence surface userauth needs. CreateUser and
-// CreateAPIKey are admin operations (see cmd/controlplane-admin), not
-// exposed over gRPC in the MVP -- there is no self-service registration
-// RPC, matching the "no PKI redesign" scope boundary above.
+// CreateAPIKey are admin operations (see cmd/controlplane-admin) for a
+// user who reaches the system without a wallet; a user who logs in via a
+// wallet (ADR-014, package walletlogin) is instead auto-provisioned on
+// first successful login -- that self-service path lives in walletlogin,
+// not here, to keep this package's own scope at "authenticate a bearer
+// key," not "every way a user identity can come to exist."
 type Repository interface {
 	CreateUser(ctx context.Context, displayName string) (User, error)
 	CreateAPIKey(ctx context.Context, userID string) (APIKey, error)
+	// CreateAPIKeyWithExpiry is CreateAPIKey with an explicit expiry (nil
+	// means no expiry, identical to CreateAPIKey). Used by wallet login
+	// (ADR-014) to mint short-lived session keys without needing a
+	// separate revocation mechanism -- an expired session key simply
+	// stops authenticating, the same check every key already goes
+	// through in Authenticate.
+	CreateAPIKeyWithExpiry(ctx context.Context, userID string, expiresAt *time.Time) (APIKey, error)
 	// Authenticate resolves a raw key's hash to its owning user, or
 	// ErrInvalidKey if the key is unknown, revoked, or expired. On
 	// success it best-effort records last_used_at; a failure to do so

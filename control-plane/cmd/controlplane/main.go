@@ -26,6 +26,7 @@ import (
 	"github.com/openinfra/network/internal/resourcemarket"
 	"github.com/openinfra/network/internal/scheduler"
 	"github.com/openinfra/network/internal/userauth"
+	"github.com/openinfra/network/internal/walletlogin"
 	"github.com/openinfra/network/internal/wireguard"
 	"github.com/openinfra/network/internal/workloadapi"
 	"github.com/openinfra/network/migrations"
@@ -182,8 +183,15 @@ func run() error {
 		return err
 	}
 	defer httpListener.Close()
+	// ADR-014: wallet-based dashboard login. authLimiter is deliberately
+	// tighter and separate from the gRPC user API's limiter above -- these
+	// endpoints are unauthenticated by definition and each does real work
+	// (a Postgres write, or a signature verification) per request.
+	walletService := walletlogin.NewService(walletlogin.NewPostgresRepository(pool), userRepository)
+	authRateLimit := envIntOrDefault("DASHBOARD_AUTH_RATE_LIMIT_PER_MINUTE", 10)
+	authLimiter := ratelimit.NewRedisLimiter(redisClient, authRateLimit, 60)
 	httpServer := &http.Server{
-		Handler:           dashboard.New(pool, redisClient, chainClient).Handler(),
+		Handler:           dashboard.New(pool, redisClient, chainClient, walletService, userRepository, authLimiter).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

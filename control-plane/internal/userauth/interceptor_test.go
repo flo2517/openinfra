@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/openinfra/network/internal/userauth"
 	"google.golang.org/grpc"
@@ -19,6 +20,9 @@ type fakeRepository struct {
 
 func (r fakeRepository) CreateUser(context.Context, string) (userauth.User, error) { panic("unused") }
 func (r fakeRepository) CreateAPIKey(context.Context, string) (userauth.APIKey, error) {
+	panic("unused")
+}
+func (r fakeRepository) CreateAPIKeyWithExpiry(context.Context, string, *time.Time) (userauth.APIKey, error) {
 	panic("unused")
 }
 func (r fakeRepository) RevokeAPIKey(context.Context, string) error { panic("unused") }
