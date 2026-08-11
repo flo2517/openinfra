@@ -45,6 +45,12 @@ type fakeAgentServer struct {
 	// MeasureBandwidth responses (ADR-015).
 	tamperBandwidthSignature  bool
 	tamperBandwidthUploadHash bool
+	// tamperBandwidthOnCall, if non-zero, tampers the signature only on
+	// the Nth MeasureBandwidth call (1-indexed) -- ADR-025 §1's
+	// multi-probe tests use this to prove one bad probe among several
+	// good ones still fails the whole round, not just an
+	// always-bad/always-good server.
+	tamperBandwidthOnCall int
 	// declaredIngressMbps/declaredEgressMbps feed the fake dashboard's
 	// agent-endpoint response (see startTestAgentHarness) -- the
 	// "provider's own declared bandwidth" ADR-015 §5's tolerance check
@@ -89,6 +95,7 @@ func (s *fakeAgentServer) SolveChallenge(_ context.Context, req *agentv1.SolveCh
 func (s *fakeAgentServer) MeasureBandwidth(_ context.Context, req *agentv1.MeasureBandwidthRequest) (*agentv1.MeasureBandwidthResponse, error) {
 	s.mu.Lock()
 	s.measureBandwidthCalls++
+	callNumber := s.measureBandwidthCalls
 	s.mu.Unlock()
 
 	sum := sha256.Sum256(req.UploadPayload)
@@ -104,7 +111,7 @@ func (s *fakeAgentServer) MeasureBandwidth(_ context.Context, req *agentv1.Measu
 		uploadPayloadHash = append([]byte{}, uploadPayloadHash...)
 		uploadPayloadHash[0] ^= 0xFF
 	}
-	if s.tamperBandwidthSignature {
+	if s.tamperBandwidthSignature || (s.tamperBandwidthOnCall != 0 && callNumber == s.tamperBandwidthOnCall) {
 		signature = append([]byte{}, signature...)
 		signature[0] ^= 0xFF
 	}

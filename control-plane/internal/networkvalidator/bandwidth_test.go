@@ -153,6 +153,87 @@ func TestMeasureBandwidthReportsFailureForUnreachableAgent(t *testing.T) {
 	}
 }
 
+// newChallengeClientWithProbes is newChallengeClient plus an explicit
+// BandwidthProbesPerRound, for ADR-025 §1's multi-probe tests -- kept
+// separate from newChallengeClient so every other test in this package
+// keeps exercising the default probe count unchanged.
+func newChallengeClientWithProbes(t *testing.T, harness *testAgentHarness, probes int) *ChallengeClient {
+	t.Helper()
+	resolver, err := NewEndpointResolver(harness.dashboard.URL)
+	if err != nil {
+		t.Fatalf("new endpoint resolver: %v", err)
+	}
+	return NewChallengeClient(ChallengeClientConfig{
+		Resolver:                resolver,
+		ClientCertificate:       testValidatorClientCert(t),
+		AgentServerCAPool:       nil,
+		DialTimeout:             2 * time.Second,
+		ChallengeTimeout:        2 * time.Second,
+		BandwidthProbesPerRound: probes,
+	})
+}
+
+// TestMeasureBandwidthRunsExactlyConfiguredProbeCount pins ADR-025 §1's
+// core behavior change: MeasureBandwidth is no longer a single round trip.
+func TestMeasureBandwidthRunsExactlyConfiguredProbeCount(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{privateKey: agentPriv, declaredIngressMbps: 1, declaredEgressMbps: 1}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClientWithProbes(t, harness, 5)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.ScoreBps != passingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d (reason=%q)", result.ScoreBps, passingScoreBps, result.Reason)
+	}
+	fake.mu.Lock()
+	calls := fake.measureBandwidthCalls
+	fake.mu.Unlock()
+	if calls != 5 {
+		t.Fatalf("measureBandwidthCalls = %d, want 5 (BandwidthProbesPerRound)", calls)
+	}
+}
+
+// TestMeasureBandwidthFailsTheWholeRoundIfAnySingleProbeFails is ADR-025
+// §1's anti-gaming property made concrete: a provider that sustains
+// bandwidth for most probes but fails even one must not pass overall --
+// there is no valid measurement to take a minimum over for that probe.
+func TestMeasureBandwidthFailsTheWholeRoundIfAnySingleProbeFails(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey:            agentPriv,
+		declaredIngressMbps:   1,
+		declaredEgressMbps:    1,
+		tamperBandwidthOnCall: 2, // the middle of 3 probes
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClientWithProbes(t, harness, 3)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.ScoreBps != failingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d when probe 2/3 fails signature verification", result.ScoreBps, failingScoreBps)
+	}
+	fake.mu.Lock()
+	calls := fake.measureBandwidthCalls
+	fake.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("measureBandwidthCalls = %d, want 2 (stops at the first failing probe, does not run probe 3)", calls)
+	}
+}
+
 // passesBandwidthTolerance and estimateThroughputMbps are pure and cheap
 // to unit-test directly, independent of any real network round trip.
 func TestPassesBandwidthToleranceTreatsNonPositiveDeclaredAsAutoPass(t *testing.T) {
