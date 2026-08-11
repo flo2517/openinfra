@@ -2,10 +2,8 @@
 
 ## Status
 
-Proposed (left unaccepted by Claude Code, deliberately — like ADR-016, this decides when the
-protocol may destroy a participant's bonded funds: a real, partly irreversible economic boundary,
-not a narrower technical decision. Needs the repository owner's explicit acceptance before
-implementation starts, exactly as ADR-016 §Status describes for its own case).
+Accepted (by the repository owner, explicitly, relayed in-session — same standard ADR-016 was held
+to before its slice 1 proceeded).
 
 **Scope note:** this ADR only settles the piece issue #29 needs: slashing a Network Validator's
 own bonded stake for a provably wrong submission. It deliberately does **not** attempt provider
