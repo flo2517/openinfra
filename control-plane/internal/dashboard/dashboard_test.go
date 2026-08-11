@@ -34,7 +34,7 @@ func TestAbbreviateProviderIdentity(t *testing.T) {
 // chain read (ADR-011). This pins the JSON contract so a refactor can't
 // silently drop the sentinel back to Go's int zero value.
 func TestOverviewReportsUnavailableValidatorSetDistinctlyFromZero(t *testing.T) {
-	degraded := Overview{ValidatorsActive: -1, Providers: []Provider{}, Workloads: []Workload{}}
+	degraded := Overview{ValidatorsActive: -1, Providers: []Provider{}, WorkloadsByState: emptyWorkloadStateCounts()}
 	encoded, err := json.Marshal(degraded)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -51,7 +51,7 @@ func TestOverviewReportsUnavailableValidatorSetDistinctlyFromZero(t *testing.T) 
 		t.Fatalf("validators_active = %v, want -1", got)
 	}
 
-	healthy := Overview{ValidatorsActive: 0, Providers: []Provider{}, Workloads: []Workload{}}
+	healthy := Overview{ValidatorsActive: 0, Providers: []Provider{}, WorkloadsByState: emptyWorkloadStateCounts()}
 	encoded, err = json.Marshal(healthy)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -104,5 +104,56 @@ func TestProviderReputationAndOfferDistinguishUnavailableFromNoRecordYet(t *test
 	offer, ok := decoded["offer"].(map[string]any)
 	if !ok || offer["found"] != false {
 		t.Fatalf("expected offer.found=false, got %v", decoded["offer"])
+	}
+}
+
+// TestOverviewNeverSerializesPerWorkloadDetail pins ADR-016 §3's actual
+// security property, not just its field rename: the Public-tier overview
+// must expose no per-workload identifier at all. A future change that
+// re-adds a workload list (or leaks one through a differently-named
+// field) has to fail this test rather than quietly reopening the
+// "which tenants are using this network, and when" signal.
+func TestOverviewNeverSerializesPerWorkloadDetail(t *testing.T) {
+	overview := Overview{
+		Providers:        []Provider{},
+		WorkloadsByState: map[string]int{"RUNNING": 3},
+		WorkloadsTotal:   3,
+		ValidatorsActive: 0,
+	}
+	encoded, err := json.Marshal(overview)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, forbidden := range []string{"workloads", "workload_id", "lease_id"} {
+		if _, present := decoded[forbidden]; present {
+			t.Fatalf("the public overview must not carry %q; per-workload detail belongs behind /api/v1/my/workloads", forbidden)
+		}
+	}
+	byState, ok := decoded["workloads_by_state"].(map[string]any)
+	if !ok {
+		t.Fatal("expected workloads_by_state in the public overview")
+	}
+	if byState["RUNNING"] != float64(3) {
+		t.Fatalf("workloads_by_state[RUNNING] = %v, want 3", byState["RUNNING"])
+	}
+}
+
+// TestEmptyWorkloadStateCountsCoversEveryKnownState guards the honest-zero
+// property: a state with no rows must report 0 rather than be absent, so a
+// client can distinguish "none right now" from "this build doesn't know
+// about that state".
+func TestEmptyWorkloadStateCountsCoversEveryKnownState(t *testing.T) {
+	counts := emptyWorkloadStateCounts()
+	for _, state := range operatorWorkloadStates {
+		if _, present := counts[state]; !present {
+			t.Fatalf("state %q missing from the seeded counts", state)
+		}
+	}
+	if len(counts) != len(operatorWorkloadStates) {
+		t.Fatalf("seeded %d states, want exactly %d", len(counts), len(operatorWorkloadStates))
 	}
 }

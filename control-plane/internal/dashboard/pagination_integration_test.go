@@ -50,7 +50,7 @@ func TestLoadOverviewPagesProvidersAgainstALiveDatabase(t *testing.T) {
 	// last inserted (page-test-c) sorts first.
 	wantDescOrder := []string{"page-test-c", "page-test-b", "page-test-a"}
 
-	firstPage, err := server.loadOverview(ctx, overviewPagination{ProvidersLimit: 2, ProvidersOffset: 0, WorkloadsLimit: 100})
+	firstPage, err := server.loadOverview(ctx, overviewPagination{ProvidersLimit: 2, ProvidersOffset: 0})
 	if err != nil {
 		t.Fatalf("load first page: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestLoadOverviewPagesProvidersAgainstALiveDatabase(t *testing.T) {
 		}
 	}
 
-	secondPage, err := server.loadOverview(ctx, overviewPagination{ProvidersLimit: 2, ProvidersOffset: 2, WorkloadsLimit: 100})
+	secondPage, err := server.loadOverview(ctx, overviewPagination{ProvidersLimit: 2, ProvidersOffset: 2})
 	if err != nil {
 		t.Fatalf("load second page: %v", err)
 	}

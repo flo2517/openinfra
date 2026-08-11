@@ -13,8 +13,9 @@ function bandwidthCell(p){return(p.bandwidth_ingress_mbps||p.bandwidth_egress_mb
 function reputationCell(p){if(!p.reputation)return'—';return p.reputation.available?String(p.reputation.global):'pas encore noté'}
 function offerCell(p){if(!p.offer)return'—';return p.offer.found?`${(p.offer.cpu_millicores/1000).toFixed(1)} vCPU / ${p.offer.ram_mb} Mo`:'aucune offre'}
 // #76 pagination: providersOffset is the only piece of paging state kept
-// client-side (workloads/validators stay unpaginated in the UI for now --
-// their tables are far smaller in practice); refresh() always re-reads it
+// client-side (validators stay unpaginated in the UI for now -- that
+// table is far smaller in practice, and workloads are now a fixed-size
+// per-state aggregate); refresh() always re-reads it
 // so prev/next just mutate this and re-fetch, no separate code path.
 let providersOffset=0,providersLimit=500;
 async function refresh(){
@@ -28,7 +29,10 @@ async function refresh(){
     text('validator-count',data.validators_active<0?'—':data.validators_active);
     text('sample',new Date(data.generated_at).toLocaleTimeString());
     const providers=$('providers');providers.replaceChildren();for(const p of data.providers){const tr=row([p.provider_id,p.status,'',p.agent_version,p.cpu_available.toFixed(1),`${Math.round(p.memory_available_mb/1024)} GiB`,storageCell(p),bandwidthCell(p),reputationCell(p),offerCell(p),p.chain_state]);tr.children[2].append(status(p.liveness));providers.append(tr)}
-    const workloads=$('workloads');workloads.replaceChildren();for(const w of data.workloads)workloads.append(row([w.workload_id,w.state,w.provider_id||'—',w.lease_id||'—',new Date(w.created_at).toLocaleString()]));
+    // ADR-016 §3: this public endpoint no longer returns per-workload
+    // rows, only counts by state. Per-workload detail lives behind
+    // /api/v1/my/workloads, scoped to the authenticated owner.
+    const workloads=$('workloads');workloads.replaceChildren();const byState=data.workloads_by_state||{};for(const state of Object.keys(byState).sort())workloads.append(row([state,byState[state]]));
     const validators=$('validators');validators.replaceChildren();for(const v of data.validators||[])validators.append(row([v]));
     $('validators-warning').hidden=data.validators_active>=0;
     const warning=$('warning');warning.hidden=!data.partial;warning.textContent=data.partial?'Certaines sources sont momentanément indisponibles. Les données affichées restent partielles.':'';

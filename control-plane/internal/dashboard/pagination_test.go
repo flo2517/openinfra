@@ -32,13 +32,14 @@ func TestBoundedQueryIntClampsToRange(t *testing.T) {
 
 // TestParseOverviewPaginationDefaultsMatchThePrePaginationBehavior pins
 // this endpoint's backward-compatibility guarantee: a caller that never
-// sends providers_limit/providers_offset/workloads_limit/workloads_offset
-// must see the exact same page shape as before pagination existed
-// (LIMIT 500 / LIMIT 100, offset 0).
+// sends providers_limit/providers_offset must see the exact same page
+// shape as before pagination existed (LIMIT 500, offset 0). The
+// workloads_limit/workloads_offset params are gone with the per-workload
+// list itself (ADR-016 §3) and are now simply ignored.
 func TestParseOverviewPaginationDefaultsMatchThePrePaginationBehavior(t *testing.T) {
 	request := httptest.NewRequest("GET", "/api/v1/overview", nil)
 	got := parseOverviewPagination(request)
-	want := overviewPagination{ProvidersLimit: 500, ProvidersOffset: 0, WorkloadsLimit: 100, WorkloadsOffset: 0}
+	want := overviewPagination{ProvidersLimit: 500, ProvidersOffset: 0}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
@@ -47,7 +48,9 @@ func TestParseOverviewPaginationDefaultsMatchThePrePaginationBehavior(t *testing
 func TestParseOverviewPaginationHonorsExplicitBoundedValues(t *testing.T) {
 	request := httptest.NewRequest("GET", "/api/v1/overview?providers_limit=10&providers_offset=20&workloads_limit=5&workloads_offset=15", nil)
 	got := parseOverviewPagination(request)
-	want := overviewPagination{ProvidersLimit: 10, ProvidersOffset: 20, WorkloadsLimit: 5, WorkloadsOffset: 15}
+	// workloads_limit/workloads_offset are still present in the URL and
+	// must be ignored rather than rejected -- a stale client keeps working.
+	want := overviewPagination{ProvidersLimit: 10, ProvidersOffset: 20}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
@@ -58,8 +61,5 @@ func TestParseOverviewPaginationClampsOversizedLimits(t *testing.T) {
 	got := parseOverviewPagination(request)
 	if got.ProvidersLimit != maxProvidersLimit {
 		t.Fatalf("providers_limit = %d, want clamped to %d", got.ProvidersLimit, maxProvidersLimit)
-	}
-	if got.WorkloadsLimit != maxWorkloadsLimit {
-		t.Fatalf("workloads_limit = %d, want clamped to %d", got.WorkloadsLimit, maxWorkloadsLimit)
 	}
 }
