@@ -25,21 +25,21 @@
         <p id="auth-issued-key" class="warning" role="status" hidden></p>
       </div>
     </section>
-    <section class="cards">
-      <article><span>Agents connectés</span><strong id="fresh">—</strong><small id="total">— enregistrés</small></article>
-      <article><span>CPU disponible</span><strong id="cpu">—</strong><small>cœurs annoncés actifs</small></article>
-      <article><span>Mémoire disponible</span><strong id="memory">—</strong><small>sur heartbeats frais</small></article>
-      <article><span>Blockchain</span><strong id="block">—</strong><small id="chain">tête finalisée</small></article>
-      <article><span>Workloads</span><strong id="workload-count">—</strong><small>persistés dans PostgreSQL</small></article>
-      <article><span>Network Validators</span><strong id="validator-count">—</strong><small>actifs on-chain</small></article>
-    </section>
+    <dl class="cards">
+      <div><dt>Agents connectés</dt><dd><strong id="fresh">—</strong><small id="total">— enregistrés</small></dd></div>
+      <div><dt>CPU disponible</dt><dd><strong id="cpu">—</strong><small>cœurs annoncés actifs</small></dd></div>
+      <div><dt>Mémoire disponible</dt><dd><strong id="memory">—</strong><small>sur heartbeats frais</small></dd></div>
+      <div><dt>Blockchain</dt><dd><strong id="block">—</strong><small id="chain">tête finalisée</small></dd></div>
+      <div><dt>Workloads</dt><dd><strong id="workload-count">—</strong><small>persistés dans PostgreSQL</small></dd></div>
+      <div><dt>Network Validators</dt><dd><strong id="validator-count">—</strong><small>actifs on-chain</small></dd></div>
+    </dl>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">WORKLOADS</span><h2>Orchestration durable</h2></div></div>
-      <div class="table-wrap"><table><caption class="sr-only">Nombre de workloads par état</caption><thead><tr><th scope="col">État</th><th scope="col">Nombre</th></tr></thead><tbody id="workloads"></tbody></table></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Nombre de workloads par état (zone défilable)"><table><caption class="sr-only">Nombre de workloads par état</caption><thead><tr><th scope="col">État</th><th scope="col">Nombre</th></tr></thead><tbody id="workloads"></tbody></table></div>
       <p class="muted">Vue publique : uniquement des totaux par état. Le détail par workload est réservé à son propriétaire, après authentification.</p>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">VALIDATORS</span><h2>Scoring décentralisé</h2></div></div>
       <div id="validators-warning" class="warning" role="alert" hidden>Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.</div>
-      <div class="table-wrap"><table><caption class="sr-only">Network Validators actuellement actifs on-chain</caption><thead><tr><th scope="col">Validator</th></tr></thead><tbody id="validators"></tbody></table></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Network Validators actifs (zone défilable)"><table><caption class="sr-only">Network Validators actuellement actifs on-chain</caption><thead><tr><th scope="col">Validator</th></tr></thead><tbody id="validators"></tbody></table></div>
     </section>
     <section class="panel" id="validator-scores-panel">
       <div class="panel-head"><div><span class="eyebrow">VALIDATOR SCORES</span><h2>Historique des rounds de scoring</h2></div></div>
@@ -49,12 +49,12 @@
         <input id="score-provider-id" type="text" placeholder="provider_id">
         <button id="score-load" type="button">Charger</button>
       </div>
-      <div id="score-warning" class="warning" role="alert" aria-live="polite" hidden></div>
-      <div class="table-wrap"><table><caption class="sr-only">Historique des rounds de scoring pour le provider recherché, par dimension</caption><thead><tr><th scope="col">Dimension</th><th scope="col">Round</th><th scope="col">Score</th><th scope="col">Précédent</th><th scope="col">Confiance</th><th scope="col">Soumissions</th><th scope="col">Statut</th><th scope="col">Bloc de clôture</th></tr></thead><tbody id="score-rows"></tbody></table></div>
+      <div id="score-warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Historique des rounds de scoring (zone défilable)"><table><caption class="sr-only">Historique des rounds de scoring pour le provider recherché, par dimension</caption><thead><tr><th scope="col">Dimension</th><th scope="col">Round</th><th scope="col">Score</th><th scope="col">Précédent</th><th scope="col">Confiance</th><th scope="col">Soumissions</th><th scope="col">Statut</th><th scope="col">Bloc de clôture</th></tr></thead><tbody id="score-rows"></tbody></table></div>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">PROVIDERS</span><h2>État du réseau</h2></div><button id="refresh" type="button">Actualiser</button></div>
       <div id="warning" class="warning" role="alert" hidden></div>
-      <div class="table-wrap"><table><caption class="sr-only">Providers enregistrés, les plus récents en premier</caption><thead><tr><th scope="col">Provider</th><th scope="col">État durable</th><th scope="col">Connexion</th><th scope="col">Agent</th><th scope="col">CPU</th><th scope="col">RAM</th><th scope="col">Stockage</th><th scope="col">Bande passante</th><th scope="col">Réputation</th><th scope="col">Offre on-chain</th><th scope="col">On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Providers enregistrés (zone défilable)"><table><caption class="sr-only">Providers enregistrés, les plus récents en premier</caption><thead><tr><th scope="col">Provider</th><th scope="col">État durable</th><th scope="col">Connexion</th><th scope="col">Agent</th><th scope="col">CPU</th><th scope="col">RAM</th><th scope="col">Stockage</th><th scope="col">Bande passante</th><th scope="col">Réputation</th><th scope="col">Offre on-chain</th><th scope="col">On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>
       <div class="pagination">
         <button id="providers-prev" type="button">← Précédent</button>
         <span id="providers-range" aria-live="polite">—</span>
