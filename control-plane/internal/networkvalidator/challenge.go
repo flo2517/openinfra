@@ -84,6 +84,13 @@ type ChallengeClientConfig struct {
 	AgentServerCAPool *x509.CertPool
 	DialTimeout       time.Duration
 	ChallengeTimeout  time.Duration
+	// BandwidthProbesPerRound is ADR-025 §1's multi-point defense against
+	// a provider that detects a single probe and temporarily boosts
+	// bandwidth for its duration: MeasureBandwidth runs this many
+	// independent probes and scores the minimum measured throughput
+	// across all of them, not just one sample. Defaults to
+	// DefaultBandwidthProbesPerRound.
+	BandwidthProbesPerRound int
 }
 
 // ChallengeClient calls an Agent's SolveChallenge RPC over mTLS and
@@ -98,6 +105,9 @@ func NewChallengeClient(config ChallengeClientConfig) *ChallengeClient {
 	}
 	if config.ChallengeTimeout == 0 {
 		config.ChallengeTimeout = DefaultChallengeTimeout
+	}
+	if config.BandwidthProbesPerRound == 0 {
+		config.BandwidthProbesPerRound = DefaultBandwidthProbesPerRound
 	}
 	return &ChallengeClient{config: config}
 }

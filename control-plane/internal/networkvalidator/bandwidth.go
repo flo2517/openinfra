@@ -55,26 +55,90 @@ const bandwidthMessageSizeLimit = bandwidthProbeBytes + 64*1024
 // explicit bar (ADR-015 §5's "honest caveat") -- not a precise SLA check.
 const bandwidthToleranceBps = 7000
 
+// DefaultBandwidthProbesPerRound is ADR-025 §1's default probe count.
+// Small enough to keep the challenge loop's per-round latency budget for
+// the Network dimension bounded (each probe is a full
+// bandwidthProbeBytes-sized round trip), large enough that a provider
+// cannot simply sustain a boosted link for one probe's duration and pass.
+const DefaultBandwidthProbesPerRound = 3
+
+// bandwidthProbeOutcome is one probe's result: either a verified
+// measurement (failed == false) or the reason it wasn't (failed == true,
+// mirroring MeasureBandwidth's own convention of never returning a
+// non-nil error for an attempted-but-failed probe).
+type bandwidthProbeOutcome struct {
+	ingressMbps, egressMbps float64
+	payloadHash             [32]byte
+	failed                  bool
+	reason                  string
+}
+
 // MeasureBandwidth is ADR-015's replacement for a generic SolveChallenge
-// call on the Network dimension: one round trip that sends and requests a
-// large random payload in both directions, verifies the Agent's signed
-// response, estimates ingress/egress throughput, and scores pass/fail
-// against the provider's own declared ResourceCapability.Bandwidth
-// (endpoint.DeclaredIngressMbps/DeclaredEgressMbps, sourced from the
-// dashboard's agent-endpoint discovery response). Like Challenge, a
-// non-nil error means discovery/probe construction could not even be
-// attempted; every attempted-but-failed outcome (unreachable Agent, bad
-// hash, bad signature, under-tolerance measurement) is a ChallengeResult
-// with ScoreBps == 0 and a human-readable Reason, never a non-nil error.
+// call on the Network dimension, extended by ADR-025 §1 to run
+// config.BandwidthProbesPerRound independent probes and score the
+// *minimum* measured throughput across all of them in each direction --
+// a provider that detects and rides out one probe still has to sustain
+// every other one. Like Challenge, a non-nil error means discovery could
+// not even be attempted; every attempted-but-failed outcome (unreachable
+// Agent, bad hash, bad signature, under-tolerance measurement -- in any
+// single probe) is a ChallengeResult with ScoreBps == 0 and a
+// human-readable Reason, never a non-nil error. One failed probe fails
+// the whole round: a minimum is meaningless over a set that includes a
+// probe with no valid measurement at all.
 func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID string) (ChallengeResult, error) {
 	endpoint, err := c.config.Resolver.Resolve(ctx, providerID)
 	if err != nil {
 		return ChallengeResult{}, fmt.Errorf("resolve agent endpoint for provider %s: %w", providerID, err)
 	}
 
+	probes := c.config.BandwidthProbesPerRound
+	if probes <= 0 {
+		probes = DefaultBandwidthProbesPerRound
+	}
+
+	var minIngress, minEgress float64
+	var lastPayloadHash [32]byte
+	for i := 0; i < probes; i++ {
+		outcome, err := c.runOneBandwidthProbe(ctx, endpoint)
+		if err != nil {
+			return ChallengeResult{}, err
+		}
+		lastPayloadHash = outcome.payloadHash
+		if outcome.failed {
+			return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: outcome.payloadHash, Reason: fmt.Sprintf("probe %d/%d: %s", i+1, probes, outcome.reason)}, nil
+		}
+		if i == 0 || outcome.ingressMbps < minIngress {
+			minIngress = outcome.ingressMbps
+		}
+		if i == 0 || outcome.egressMbps < minEgress {
+			minEgress = outcome.egressMbps
+		}
+	}
+
+	ingressPasses := passesBandwidthTolerance(minIngress, endpoint.DeclaredIngressMbps)
+	egressPasses := passesBandwidthTolerance(minEgress, endpoint.DeclaredEgressMbps)
+	if !ingressPasses || !egressPasses {
+		reason := fmt.Sprintf(
+			"minimum across %d probes below tolerance: ingress=%.1fMbps (declared %dMbps), egress=%.1fMbps (declared %dMbps)",
+			probes, minIngress, endpoint.DeclaredIngressMbps, minEgress, endpoint.DeclaredEgressMbps,
+		)
+		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: lastPayloadHash, Reason: reason}, nil
+	}
+	return ChallengeResult{
+		ScoreBps: passingScoreBps, SampleCount: 1, PayloadHash: lastPayloadHash,
+		Reason: fmt.Sprintf("ok: min-of-%d ingress=%.1fMbps egress=%.1fMbps", probes, minIngress, minEgress),
+	}, nil
+}
+
+// runOneBandwidthProbe is a single ADR-015 round trip: send and request a
+// large random payload, verify the Agent's signed response, and estimate
+// this probe's ingress/egress throughput. Factored out of MeasureBandwidth
+// so ADR-025 §1 can run several independently without duplicating the
+// verification logic.
+func (c *ChallengeClient) runOneBandwidthProbe(ctx context.Context, endpoint AgentEndpoint) (bandwidthProbeOutcome, error) {
 	uploadPayload := make([]byte, bandwidthProbeBytes)
 	if _, err := rand.Read(uploadPayload); err != nil {
-		return ChallengeResult{}, fmt.Errorf("generate bandwidth probe payload: %w", err)
+		return bandwidthProbeOutcome{}, fmt.Errorf("generate bandwidth probe payload: %w", err)
 	}
 	uploadPayloadHash := sha256.Sum256(uploadPayload)
 	probeID := uuid.NewString()
@@ -89,7 +153,7 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 		// back to a hash of what this validator sent so a failed attempt
 		// still carries *some* addressable evidence, not an all-zero
 		// hash.
-		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: uploadPayloadHash, Reason: err.Error()}, nil
+		return bandwidthProbeOutcome{payloadHash: uploadPayloadHash, failed: true, reason: err.Error()}, nil
 	}
 
 	// ADR-015 §5's payload_hash formula is response-dependent (it hashes
@@ -100,36 +164,24 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 	payloadHash := sha256.Sum256(append(append([]byte{}, response.UploadPayloadHash...), response.DownloadPayload...))
 
 	if response.ProbeId != probeID {
-		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: payloadHash, Reason: "response probe_id does not match the request"}, nil
+		return bandwidthProbeOutcome{payloadHash: payloadHash, failed: true, reason: "response probe_id does not match the request"}, nil
 	}
 	if len(response.UploadPayloadHash) != sha256.Size {
-		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: payloadHash, Reason: "response upload_payload_hash has an unexpected length"}, nil
+		return bandwidthProbeOutcome{payloadHash: payloadHash, failed: true, reason: "response upload_payload_hash has an unexpected length"}, nil
 	}
 	if !bytes.Equal(response.UploadPayloadHash, uploadPayloadHash[:]) {
-		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: payloadHash, Reason: "response upload_payload_hash does not match SHA256(upload_payload)"}, nil
+		return bandwidthProbeOutcome{payloadHash: payloadHash, failed: true, reason: "response upload_payload_hash does not match SHA256(upload_payload)"}, nil
 	}
 	if len(response.DownloadPayload) != bandwidthProbeBytes {
-		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: payloadHash, Reason: "response download_payload length does not match requested_download_bytes"}, nil
+		return bandwidthProbeOutcome{payloadHash: payloadHash, failed: true, reason: "response download_payload length does not match requested_download_bytes"}, nil
 	}
 	signed := bandwidthSignedBytes(response.ProbeId, response.UploadPayloadHash, response.DownloadPayload, response.ServerProcessingMs)
 	if !ed25519.Verify(endpoint.PublicKey, signed, response.Signature) {
-		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: payloadHash, Reason: "signature verification failed"}, nil
+		return bandwidthProbeOutcome{payloadHash: payloadHash, failed: true, reason: "signature verification failed"}, nil
 	}
 
 	ingressMbps, egressMbps := estimateThroughputMbps(elapsed, response.ServerProcessingMs, len(uploadPayload), len(response.DownloadPayload))
-	ingressPasses := passesBandwidthTolerance(ingressMbps, endpoint.DeclaredIngressMbps)
-	egressPasses := passesBandwidthTolerance(egressMbps, endpoint.DeclaredEgressMbps)
-	if !ingressPasses || !egressPasses {
-		reason := fmt.Sprintf(
-			"measured throughput below tolerance: ingress=%.1fMbps (declared %dMbps), egress=%.1fMbps (declared %dMbps)",
-			ingressMbps, endpoint.DeclaredIngressMbps, egressMbps, endpoint.DeclaredEgressMbps,
-		)
-		return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: payloadHash, Reason: reason}, nil
-	}
-	return ChallengeResult{
-		ScoreBps: passingScoreBps, SampleCount: 1, PayloadHash: payloadHash,
-		Reason: fmt.Sprintf("ok: ingress=%.1fMbps egress=%.1fMbps", ingressMbps, egressMbps),
-	}, nil
+	return bandwidthProbeOutcome{ingressMbps: ingressMbps, egressMbps: egressMbps, payloadHash: payloadHash}, nil
 }
 
 // callMeasureBandwidth dials endpoint.AgentEndpoint (same mTLS trust
