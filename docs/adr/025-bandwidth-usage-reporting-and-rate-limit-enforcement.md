@@ -2,10 +2,15 @@
 
 ## Status
 
-Proposed (left unaccepted by Claude Code, deliberately, like ADR-016 and ADR-018: §2 asks the
-Agent process to run host-level `tc` commands outside any workload container's own namespace — a
-new operational privilege for the Agent, not a narrower technical decision. Needs the repository
-owner's explicit acceptance before implementation starts.)
+Accepted (by the repository owner, explicitly, relayed in-session — including §3's `CAP_NET_ADMIN`
+grant to the Agent process, the reason this was held for explicit sign-off rather than
+self-accepted).
+
+**Implementation status:** §1 (multi-probe measurement) is implemented — it needed no new
+privilege and no proto change, so it lands first. §2 (signed usage summaries over the heartbeat)
+and §3 (host-side `tc` enforcement, the `CAP_NET_ADMIN` part) are separate, larger slices: §2
+changes `protocol/proto` and therefore needs the consumer analysis `AGENTS.md` requires, and §3
+changes what the packaged Agent deployment is allowed to do. Sequenced, not skipped.
 
 ## Context
 

@@ -270,17 +270,19 @@ func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
 		t.Errorf("submit_evidence called %d times, want exactly %d (once per dimension, never re-submitted)", evidenceCount, len(Dimensions))
 	}
 
-	// ADR-015: the Network dimension's evidence must come from exactly one
-	// MeasureBandwidth call, never a SolveChallenge(TYPE_NETWORK) call --
+	// ADR-015: the Network dimension's evidence must come from
+	// MeasureBandwidth calls, never a SolveChallenge(TYPE_NETWORK) call --
 	// and every other dimension must still go through SolveChallenge
-	// exactly once, unchanged.
+	// exactly once, unchanged. ADR-025 §1 then made the Network dimension
+	// multi-probe: one round now issues DefaultBandwidthProbesPerRound
+	// MeasureBandwidth calls (scored on their minimum), not one.
 	fake.mu.Lock()
 	measureBandwidthCalls := fake.measureBandwidthCalls
 	solveChallengeTypes := append([]agentv1.SolveChallengeRequest_Type{}, fake.solveChallengeTypes...)
 	fake.mu.Unlock()
 
-	if measureBandwidthCalls != 1 {
-		t.Errorf("MeasureBandwidth called %d times, want exactly 1", measureBandwidthCalls)
+	if measureBandwidthCalls != DefaultBandwidthProbesPerRound {
+		t.Errorf("MeasureBandwidth called %d times, want exactly %d (ADR-025 §1's per-round probe count)", measureBandwidthCalls, DefaultBandwidthProbesPerRound)
 	}
 	wantSolveChallengeTypes := map[agentv1.SolveChallengeRequest_Type]int{
 		agentv1.SolveChallengeRequest_TYPE_COMPUTE:      1,
