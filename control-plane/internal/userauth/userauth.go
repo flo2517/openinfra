@@ -51,39 +51,47 @@ type User struct {
 	DisplayName string
 	CreatedAt   time.Time
 	// Role is ADR-016's dashboard-authorization tier: RoleTenant (the
-	// default for every user, existing or new) or RoleOperator (only
-	// reachable via an explicit controlplane-admin grant-role). Distinct
-	// from anything about API-key scoping -- this field governs what a
-	// browser dashboard session may see, not what the gRPC user-facing
-	// API already scopes by owner_id.
+	// default for every user, existing or new), RoleOperatorReadOnly, or
+	// RoleOperatorAdmin (both only reachable via an explicit
+	// controlplane-admin grant-role). Distinct from anything about
+	// API-key scoping -- this field governs what a browser dashboard
+	// session may see, not what the gRPC user-facing API already scopes
+	// by owner_id.
 	Role string
 }
 
-// RoleTenant and RoleOperator are the only two values users.role's CHECK
-// constraint (migrations/000012_user_roles.sql) allows -- ADR-016 §1
-// deliberately keeps this to one column, two values, rather than a
-// many-to-many roles table the MVP doesn't need yet.
+// RoleTenant, RoleOperatorReadOnly, and RoleOperatorAdmin are the only
+// three values users.role's CHECK constraint
+// (migrations/000013_operator_role_levels.sql) allows. ADR-016 §1
+// originally assumed a single operator tier was enough for the MVP;
+// §7 question 3 resolved that a read-only/admin split was needed instead
+// (grant-any-visibility vs. grant-destructive-action, e.g. stop-any-
+// workload or revoke-any-key, are different trust levels worth granting
+// separately) before slice 4's operator views ship.
 const (
-	RoleTenant   = "tenant"
-	RoleOperator = "operator"
+	RoleTenant           = "tenant"
+	RoleOperatorReadOnly = "operator_readonly"
+	RoleOperatorAdmin    = "operator_admin"
 )
 
-// ValidRole reports whether role is one of the two roles this system
+// ValidRole reports whether role is one of the roles this system
 // recognizes -- used by both SetRole implementations and
 // cmd/controlplane-admin's grant-role argument parsing, so "reject an
 // unknown role" is defined exactly once.
 func ValidRole(role string) bool {
-	return role == RoleTenant || role == RoleOperator
+	return role == RoleTenant || role == RoleOperatorReadOnly || role == RoleOperatorAdmin
 }
 
 // roleRank orders roles for internal/dashboard's requireRole check:
-// higher ranks satisfy lower-or-equal requirements (an operator may reach
-// a tenant-tier endpoint; a tenant may never reach an operator-tier one).
-// Unexported here deliberately -- RoleSatisfies below is the only
-// intended way to compare roles, so the ranking itself can be
-// restructured later (e.g. a third tier) without every caller needing to
-// know it's backed by integers.
-var roleRank = map[string]int{RoleTenant: 1, RoleOperator: 2}
+// higher ranks satisfy lower-or-equal requirements (an operator-admin may
+// reach a tenant- or operator-readonly-tier endpoint; an operator-
+// readonly may reach a tenant-tier endpoint but never an operator-admin
+// one; a tenant may never reach either operator tier). Unexported here
+// deliberately -- RoleSatisfies below is the only intended way to
+// compare roles, so the ranking itself can be restructured later (e.g. a
+// fourth tier) without every caller needing to know it's backed by
+// integers.
+var roleRank = map[string]int{RoleTenant: 1, RoleOperatorReadOnly: 2, RoleOperatorAdmin: 3}
 
 // RoleSatisfies reports whether actual is at least as privileged as
 // required. An unrecognized actual role (should not happen once

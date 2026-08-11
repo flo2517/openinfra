@@ -6,14 +6,21 @@ import (
 	"github.com/openinfra/network/internal/userauth"
 )
 
-func TestValidRoleAcceptsExactlyTenantAndOperator(t *testing.T) {
+func TestValidRoleAcceptsExactlyTenantAndTheTwoOperatorLevels(t *testing.T) {
 	if !userauth.ValidRole(userauth.RoleTenant) {
 		t.Fatal("expected RoleTenant to be valid")
 	}
-	if !userauth.ValidRole(userauth.RoleOperator) {
-		t.Fatal("expected RoleOperator to be valid")
+	if !userauth.ValidRole(userauth.RoleOperatorReadOnly) {
+		t.Fatal("expected RoleOperatorReadOnly to be valid")
 	}
-	for _, bad := range []string{"", "admin", "Tenant", "operator "} {
+	if !userauth.ValidRole(userauth.RoleOperatorAdmin) {
+		t.Fatal("expected RoleOperatorAdmin to be valid")
+	}
+	// "operator" (the pre-ADR-016-§7-resolution single-tier name) is
+	// deliberately no longer valid -- migrations/000013 promoted every
+	// existing row off it, so a caller passing the old value should fail
+	// closed, not be silently accepted as something.
+	for _, bad := range []string{"", "admin", "Tenant", "operator", "operator "} {
 		if userauth.ValidRole(bad) {
 			t.Fatalf("expected %q to be invalid", bad)
 		}
@@ -26,9 +33,14 @@ func TestRoleSatisfiesOrdering(t *testing.T) {
 		want             bool
 	}{
 		{userauth.RoleTenant, userauth.RoleTenant, true},
-		{userauth.RoleOperator, userauth.RoleTenant, true},
-		{userauth.RoleOperator, userauth.RoleOperator, true},
-		{userauth.RoleTenant, userauth.RoleOperator, false},
+		{userauth.RoleOperatorReadOnly, userauth.RoleTenant, true},
+		{userauth.RoleOperatorReadOnly, userauth.RoleOperatorReadOnly, true},
+		{userauth.RoleTenant, userauth.RoleOperatorReadOnly, false},
+		{userauth.RoleOperatorAdmin, userauth.RoleTenant, true},
+		{userauth.RoleOperatorAdmin, userauth.RoleOperatorReadOnly, true},
+		{userauth.RoleOperatorAdmin, userauth.RoleOperatorAdmin, true},
+		{userauth.RoleOperatorReadOnly, userauth.RoleOperatorAdmin, false},
+		{userauth.RoleTenant, userauth.RoleOperatorAdmin, false},
 		// An unrecognized role (should never happen once ValidRole is
 		// enforced at every write path, but RoleSatisfies must still
 		// fail closed rather than panic on a corrupt/future value) ranks
