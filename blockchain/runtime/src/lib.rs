@@ -114,6 +114,11 @@ parameter_types! {
     // ~30 minutes at 6s blocks to contest a closed round.
     pub const ValidatorDisputeWindow: u32 = 300;
     pub const ValidatorPointsPerAcceptedSubmission: u64 = 10;
+    // ADR-018 §3: bounded per-incident slash, deliberately a fraction of
+    // MinValidatorStake (10%) rather than the whole bond -- repeated
+    // upheld disputes compound instead of one governance call being able
+    // to destroy a participant's entire stake at once.
+    pub const ValidatorSlashAmount: u64 = 100;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -325,6 +330,7 @@ impl pallet_network_validator::Config for Runtime {
     type MaxValidators = MaxNetworkValidators;
     type DisputeWindow = ValidatorDisputeWindow;
     type PointsPerAcceptedSubmission = ValidatorPointsPerAcceptedSubmission;
+    type SlashAmount = ValidatorSlashAmount;
     type WeightInfo = ();
 }
 

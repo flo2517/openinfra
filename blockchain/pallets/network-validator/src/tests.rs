@@ -127,6 +127,11 @@ parameter_types! {
     pub const MaxValidators: u32 = 16;
     pub const DisputeWindow: u64 = 20;
     pub const PointsPerAcceptedSubmission: u64 = 7;
+    // Deliberately less than MinStake (100): a single upheld dispute must
+    // not be able to wipe a validator's whole bond in one call (ADR-018
+    // §3), and tests below rely on being able to observe partial slashes
+    // across more than one incident.
+    pub const SlashAmount: u64 = 40;
 }
 
 impl crate::Config for Test {
@@ -142,6 +147,7 @@ impl crate::Config for Test {
     type MaxValidators = MaxValidators;
     type DisputeWindow = DisputeWindow;
     type PointsPerAcceptedSubmission = PointsPerAcceptedSubmission;
+    type SlashAmount = SlashAmount;
     type WeightInfo = ();
 }
 
@@ -869,6 +875,178 @@ fn rejecting_a_dispute_reapplies_the_aggregate() {
             crate::Rounds::<Test>::get((PROVIDER, ROUND, ScoreDimension::Compute)).expect("round");
         assert_eq!(result.status, crate::RoundStatus::DisputeRejected);
         assert_eq!(current_score(PROVIDER, ScoreDimension::Compute), 9_000);
+    });
+}
+
+// ADR-018: upholding a dispute slashes exactly the validators whose
+// submission was counted into the wrong aggregate -- not every committee
+// member, and never more than what was actually reserved.
+#[test]
+fn upholding_a_dispute_slashes_only_the_considered_validators() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        let assigned = close_round_at(ScoreDimension::Compute, 9_000);
+        let considered =
+            crate::RoundSubmitters::<Test>::get((PROVIDER, ROUND, ScoreDimension::Compute));
+        // close_round_at submits identical scores from exactly 3
+        // committee members (MinQuorum), so trimmed() -- which discards
+        // one lowest and one highest -- keeps exactly the middle one.
+        assert_eq!(considered.len(), 1, "exactly one submission survives trimming with 3 identical scores");
+        let slashed_validator = considered[0];
+        let untouched: Vec<u64> = assigned
+            .iter()
+            .take(3)
+            .copied()
+            .filter(|member| *member != slashed_validator)
+            .collect();
+        assert_eq!(untouched.len(), 2);
+
+        let issuance_before = <Balances as frame_support::traits::Currency<u64>>::total_issuance();
+        let reserved_before = Balances::reserved_balance(slashed_validator);
+
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute
+        ));
+        assert_ok!(NetworkValidator::resolve_dispute(
+            RuntimeOrigin::root(),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute,
+            true
+        ));
+
+        assert_eq!(
+            Balances::reserved_balance(slashed_validator),
+            reserved_before - SlashAmount::get(),
+            "the considered validator's reserved stake must drop by exactly SlashAmount"
+        );
+        assert_eq!(
+            crate::Validators::<Test>::get(slashed_validator).expect("still registered").stake,
+            100 - SlashAmount::get(),
+            "ValidatorRecord.stake bookkeeping must track the real reserved balance, or withdraw_unbonded would later try to unreserve too much"
+        );
+        for other in untouched {
+            assert_eq!(
+                Balances::reserved_balance(other),
+                100,
+                "a validator trimmed as an outlier (not in RoundSubmitters) must not be slashed"
+            );
+        }
+        assert_eq!(
+            <Balances as frame_support::traits::Currency<u64>>::total_issuance(),
+            issuance_before - SlashAmount::get(),
+            "slashed funds are burned (ADR-018 §3), not paid to the disputer or the provider"
+        );
+    });
+}
+
+#[test]
+fn rejecting_a_dispute_slashes_no_one() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        register_validators(6);
+        close_round_at(ScoreDimension::Compute, 9_000);
+        assert_ok!(NetworkValidator::dispute_round(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute
+        ));
+        assert_ok!(NetworkValidator::resolve_dispute(
+            RuntimeOrigin::root(),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Compute,
+            false
+        ));
+        for validator in 10u64..16 {
+            assert_eq!(
+                Balances::reserved_balance(validator),
+                100,
+                "rejecting a dispute must leave every validator's stake untouched"
+            );
+        }
+    });
+}
+
+// A slash that exhausts a validator's reserved stake must force-suspend
+// them -- otherwise a zero-stake validator would keep collecting
+// committee assignments until someone notices and calls `suspend`
+// manually (ADR-018 §3).
+#[test]
+fn a_slash_that_exhausts_stake_force_suspends_the_validator() {
+    new_test_ext().execute_with(|| {
+        clear_recorded();
+        System::set_block_number(1);
+        let validators = register_validators(6);
+        // Two upheld disputes at SlashAmount=40 against a stake of 100
+        // leaves 20; a third removes exactly what's left and must zero
+        // the stake and force-suspend, not underflow or error.
+        for round in [7u64, 8u64, 9u64] {
+            let assigned = NetworkValidator::committee(&PROVIDER, round);
+            for member in assigned.iter().take(3) {
+                assert_ok!(NetworkValidator::submit_evidence(
+                    RuntimeOrigin::signed(*member),
+                    PROVIDER,
+                    round,
+                    ScoreDimension::Compute,
+                    9_000,
+                    10,
+                    [1; 32]
+                ));
+            }
+            assert_ok!(NetworkValidator::close_round(
+                RuntimeOrigin::signed(assigned[0]),
+                PROVIDER,
+                round,
+                ScoreDimension::Compute
+            ));
+            assert_ok!(NetworkValidator::dispute_round(
+                RuntimeOrigin::signed(PROVIDER),
+                PROVIDER,
+                round,
+                ScoreDimension::Compute
+            ));
+            assert_ok!(NetworkValidator::resolve_dispute(
+                RuntimeOrigin::root(),
+                PROVIDER,
+                round,
+                ScoreDimension::Compute,
+                true
+            ));
+        }
+
+        // Every validator that was ever the trimmed-mean's sole survivor
+        // across the three rounds must now be suspended if its stake hit
+        // zero -- assert on the set, since which single member survives
+        // trimming each round is a deterministic function of the
+        // committee's account-id ordering, not chosen by this test.
+        let mut any_suspended = false;
+        for validator in &validators {
+            let record = crate::Validators::<Test>::get(validator).expect("still registered");
+            if record.stake == 0 {
+                assert_eq!(
+                    record.status,
+                    crate::ValidatorStatus::Suspended,
+                    "a validator slashed to zero stake must be force-suspended"
+                );
+                assert!(
+                    !crate::ActiveValidatorSet::<Test>::get().contains(validator),
+                    "a force-suspended validator must leave the active set (no further committee assignments)"
+                );
+                any_suspended = true;
+            }
+        }
+        assert!(
+            any_suspended,
+            "three upheld disputes against a stake of 100 at SlashAmount=40 must zero out someone's stake"
+        );
     });
 }
 
