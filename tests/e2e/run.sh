@@ -38,3 +38,16 @@ ttl="$("${compose[@]}" exec -T redis redis-cli PTTL "openinfra:heartbeat:$provid
 (( ttl > 0 ))
 
 echo "E2E Provider Join + Heartbeat passed for $provider_id"
+
+# ADR-016 slice 6 (issue #76): dashboard RBAC and tenant isolation,
+# driven against this same running stack through the real mTLS gRPC API
+# and the real dashboard HTTP API. Build-tagged `e2e` so it stays out of
+# `go test ./...`; see control-plane/internal/dashboard/e2e_rbac_test.go
+# for why these scenarios cannot be covered by that package's unit tests.
+cd "$repo_root/control-plane"
+E2E_DASHBOARD_URL="${E2E_DASHBOARD_URL:-http://127.0.0.1:8080}" \
+E2E_GRPC_ADDR="${CONTROL_PLANE_GRPC_ADDR:-127.0.0.1:50051}" \
+E2E_COMPOSE="${compose[*]}" \
+  go test -tags e2e -count=1 -timeout 10m -run 'TestE2E' ./internal/dashboard/
+
+echo "E2E Dashboard RBAC + tenant isolation passed"
