@@ -205,8 +205,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/validator-scores/{provider_id}", s.validatorScores)
 	mux.HandleFunc("GET /api/v1/my/workloads", s.requireRole(userauth.RoleTenant, s.myWorkloads))
 	mux.HandleFunc("GET /api/v1/my/workloads/{workload_id}", s.requireRole(userauth.RoleTenant, s.myWorkload))
+	mux.HandleFunc("POST /api/v1/my/workloads/{workload_id}/stop", s.requireRole(userauth.RoleTenant, s.stopMyWorkload))
 	mux.HandleFunc("GET /api/v1/operator/queue", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorQueue))
 	mux.HandleFunc("GET /api/v1/operator/workers", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorWorkers))
+	mux.HandleFunc("GET /api/v1/operator/audit", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorAudit))
 	mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(static))))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
