@@ -17,7 +17,11 @@ operator-view items that depend on it.
 **§7 resolved (repository owner, direct answer, not re-derived):**
 
 1. `workload.definition`'s env values are **never** shown verbatim, to anyone, including the
-   owning tenant — the safer default this proposal already assumed. Key names only.
+   owning tenant — the safer default this proposal already assumed. **Moot as literally posed:**
+   implementing slice 2 established that there are no env values in `workload.definition` at all
+   (see §6's corrected row) — the question rested on a false premise in §6. The answer's
+   conservative intent is honored anyway: slice 2 returns named decoded fields, never raw
+   `definition` bytes.
 2. `last_error`/`error_code` **are** shown to the owning tenant on their own workload (Tenant
    tier), while staying withheld from Operator-tier's cross-tenant queue view for the
    secret-leakage reason §6 already flags — the redaction rule is role-*and*-ownership-dependent,
@@ -178,7 +182,7 @@ currently or newly proposed to cross the dashboard boundary:
 |---|---|---|
 | Provider public keys, endpoints, capabilities | Yes, public | No — these are the provider's own on-chain-public identity/advertisement. |
 | Workload `image`, `state`, timestamps | Yes, public today; moving to Tenant-only detail (§3) | No secrets in these fields themselves. |
-| Workload `definition` (raw bytes, includes env vars per `WorkloadDefinition` in `shared.proto`) | **Not currently exposed anywhere in the dashboard** — `loadOverview` never selects the `definition` column. | **Yes, potentially** — a tenant's `env` map is exactly where a workload's secrets live (API keys, DB passwords for the deployed app). This must **never** be returned verbatim by `GET /api/v1/my/workloads/{workload_id}` — needs an explicit redaction pass (e.g. key names only, values withheld) before that endpoint ships, not an oversight to catch later. |
+| Workload `definition` (raw bytes: a marshalled `WorkloadDefinition`) | Not exposed as raw bytes anywhere — `loadOverview` never selected the column; slice 2's tenant detail view returns only named decoded fields. | **No — this row's original claim was wrong and is corrected here.** It asserted the definition "includes env vars", which is false: `WorkloadDefinition` (`shared.proto`) carries only `workload_id`, `profile`, `requirements`, `constraints`, `duration_seconds`, and `DeployRequest` (`agent.proto`) only `workload_id`, `lease_id`, `image`, `limits`. There is no `env` map anywhere in the protocol and never has been (checked to the initial commit). No tenant secret lives in this column. Slice 2 still returns only named decoded fields rather than raw bytes, so a field added to `WorkloadDefinition` later cannot start leaking through by accident — but that is defence in depth, not redaction of a known secret. |
 | Session API keys / raw keys | Never re-exposed after creation (ADR-014 §5/§6, unchanged) | N/A, already correctly handled |
 | Container `last_error`/`error_code` | Not currently exposed; proposed for operator queue view and the owning tenant's own workload detail | Possible secret leakage if an application error message embeds a credential (e.g. a failed DB connection string in a stack trace) — resolved in §7 below: shown to the owning tenant, withheld from Operator-tier's cross-tenant queue view. |
 
@@ -192,7 +196,9 @@ looks the way it does:
 1. Does `workload.definition`'s env redaction need to be configurable per-tenant (some tenants
    may want their own values visible to themselves, just not to operators), or withheld from
    *everyone including the owning tenant* on principle? **Resolved: withheld from everyone,
-   including the owner** — this proposal's safer-default assumption stands.
+   including the owner** — and then found moot: there are no env values in the definition to
+   withhold (§6, corrected). Slice 2 returns named decoded fields only, which satisfies the
+   answer's intent without a redaction mechanism for a field that does not exist.
 2. Should `last_error`/`error_code` be shown to the *owning tenant* (Tenant tier, their own
    workload) even though they're withheld from Operator-tier's cross-tenant queue view for the
    secret-leakage reason above? **Resolved: yes, shown to the owning tenant** — the redaction rule
