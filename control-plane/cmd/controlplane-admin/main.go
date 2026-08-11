@@ -103,7 +103,7 @@ func runUserCommand(ctx context.Context, args []string) error {
 		return nil
 	case "grant-role":
 		if len(args) != 3 {
-			return errors.New("usage: controlplane-admin grant-role <user-id> <tenant|operator>")
+			return errors.New("usage: controlplane-admin grant-role <user-id> <tenant|operator_readonly|operator_admin>")
 		}
 		return grantRole(ctx, repository, args[1], args[2])
 	}
@@ -137,7 +137,7 @@ func issueKey(ctx context.Context, repository *userauth.PostgresRepository, user
 // else.
 func grantRole(ctx context.Context, repository *userauth.PostgresRepository, userID, role string) error {
 	if !userauth.ValidRole(role) {
-		return fmt.Errorf("%q must be exactly %q or %q", role, userauth.RoleTenant, userauth.RoleOperator)
+		return fmt.Errorf("%q must be exactly %q, %q, or %q", role, userauth.RoleTenant, userauth.RoleOperatorReadOnly, userauth.RoleOperatorAdmin)
 	}
 	if err := repository.SetRole(ctx, userID, role); err != nil {
 		return fmt.Errorf("grant role: %w", err)
@@ -223,5 +223,5 @@ func parseUpholdOrReject(value string) (bool, error) {
 }
 
 func usageError() error {
-	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject>>")
+	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator_readonly|operator_admin> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject>>")
 }

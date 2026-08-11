@@ -14,6 +14,23 @@ yet) to proceed immediately. Slice 2 (tenant workload views, which first exposes
 tenant isolation on the dashboard itself (today: no auth at all)," plus the user- and
 operator-view items that depend on it.
 
+**§7 resolved (repository owner, direct answer, not re-derived):**
+
+1. `workload.definition`'s env values are **never** shown verbatim, to anyone, including the
+   owning tenant — the safer default this proposal already assumed. Key names only.
+2. `last_error`/`error_code` **are** shown to the owning tenant on their own workload (Tenant
+   tier), while staying withheld from Operator-tier's cross-tenant queue view for the
+   secret-leakage reason §6 already flags — the redaction rule is role-*and*-ownership-dependent,
+   as this section anticipated it might need to be.
+3. A single `operator` role is **not** enough — the repository owner chose a two-level split:
+   `operator_readonly` (visibility: queue, workers, audit) and `operator_admin` (destructive
+   actions: stop-any-workload, revoke-any-key), in addition to `operator_readonly`'s own
+   visibility. Implemented in `migrations/000013_operator_role_levels.sql` and
+   `internal/userauth`'s `roleRank`, which §1's original table already anticipated restructuring
+   ("Unexported here deliberately... so the ranking itself can be restructured later (e.g. a third
+   tier)"). §1's role table and §4's grant syntax below are updated in place to match, rather than
+   left describing the superseded one-tier design.
+
 ## Context
 
 Three things already exist, independently, and this proposal's whole job is wiring them together
@@ -48,8 +65,16 @@ detail).
 ### 1. Three roles, one column
 
 ```sql
+-- Slice 1 (migrations/000012_user_roles.sql), superseded by §7 question 3's
+-- resolution:
 ALTER TABLE users ADD COLUMN role text NOT NULL DEFAULT 'tenant'
     CHECK (role IN ('tenant', 'operator'));
+
+-- migrations/000013_operator_role_levels.sql, current:
+UPDATE users SET role = 'operator_admin' WHERE role = 'operator';
+ALTER TABLE users DROP CONSTRAINT users_role_check;
+ALTER TABLE users ADD CONSTRAINT users_role_check
+    CHECK (role IN ('tenant', 'operator_readonly', 'operator_admin'));
 ```
 
 Deliberately **not** a `user_roles` many-to-many table. Every real actor in this system today
@@ -59,14 +84,21 @@ that flexibility now is speculative complexity this proposal doesn't need to car
 becomes real, migrating `role text` to a join table is a normal, additive schema change — nothing
 built on top of this proposal has to be designed around it in advance.
 
-Three effective access levels, not two, because "operator" and "authenticated tenant" alone don't
-cover what's public today:
+`operator_readonly` and `operator_admin` are still one linearly-ranked column, not a second
+dimension — `operator_admin` satisfies every `operator_readonly` gate too (`internal/userauth`'s
+`roleRank`), matching how §7 question 3 was posed ("read-only vs. admin actions" as a hierarchy, an
+admin can do everything a read-only viewer can) rather than as two unrelated permission sets.
+
+Four effective access levels, not two, because "operator" and "authenticated tenant" alone don't
+cover what's public today, and (§7 question 3) "operator" alone doesn't distinguish visibility from
+destructive action:
 
 | Level | Who | Determined by |
 |---|---|---|
 | **Public** | Anyone who can reach the listener, no session | No `Authorization` header |
 | **Tenant** | A logged-in user, `role = 'tenant'` (the default) | Valid session/API key, `users.role` |
-| **Operator** | A logged-in user, `role = 'operator'` | Valid session/API key, `users.role`, explicitly granted (see §4) |
+| **Operator (read-only)** | A logged-in user, `role = 'operator_readonly'` or higher | Valid session/API key, `users.role`, explicitly granted (see §4) |
+| **Operator (admin)** | A logged-in user, `role = 'operator_admin'` | Valid session/API key, `users.role`, explicitly granted (see §4) |
 
 **Network Validators are not a fourth dashboard role.** A validator authenticates to the *Agent*
 over mTLS (ADR-013 §3) and to the *chain* by signing extrinsics directly — it has no reason to
@@ -92,9 +124,9 @@ separate design exercise per endpoint.
 | `GET /api/v1/my/workloads` *(new)* | Tenant | Own workloads only, `WHERE owner_id = $session_user_id`. Replaces reading workload detail out of `/api/v1/overview`. |
 | `GET /api/v1/my/workloads/{workload_id}` *(new)* | Tenant | 404 (not 403) for a workload that exists but isn't the caller's — matches `internal/workloadapi`'s existing "ownership check via the query itself" pattern, not a separate authorization branch that could be gotten wrong independently. |
 | `POST /api/v1/my/workloads/{workload_id}/stop` *(new)* | Tenant | Thin HTTP wrapper over the same `StopWorkload` path `internal/workloadapi` already exposes over gRPC — no new business logic, just a browser-reachable entry point with the same ownership check. |
-| `GET /api/v1/operator/queue` *(new)* | Operator | Counts of workloads by `state`, oldest `next_attempt_at` per state, `attempt_count` distribution — all already-existing columns (`migrations/000004_workloads.sql`, `000006`, `000007`), no new schema needed. |
-| `GET /api/v1/operator/workers` *(new)* | Operator | Distinct `worker_id`/`worker_lease_until` currently holding a claim (`workloads.worker_id`) cross-referenced with `internal/agentmanager`'s live connection state. |
-| `GET /api/v1/operator/audit` *(new, later slice)* | Operator | No audit log exists yet — this is new work, not a read of existing data. Flagged as its own slice in §5, not assumed free. |
+| `GET /api/v1/operator/queue` *(new)* | Operator (`operator_readonly`) | Counts of workloads by `state`, oldest `next_attempt_at` per state, `attempt_count` distribution — all already-existing columns (`migrations/000004_workloads.sql`, `000006`, `000007`), no new schema needed. |
+| `GET /api/v1/operator/workers` *(new)* | Operator (`operator_readonly`) | Distinct `worker_id`/`worker_lease_until` currently holding a claim (`workloads.worker_id`) cross-referenced with `internal/agentmanager`'s live connection state. |
+| `GET /api/v1/operator/audit` *(new, later slice)* | Operator (`operator_readonly`) | No audit log exists yet — this is new work, not a read of existing data. Flagged as its own slice in §5, not assumed free. |
 | Dashboard static assets (`/dashboard/*`) | Public | Unchanged — the HTML/JS shell itself carries no data; per-role content is fetched by the JS after login, same SPA-shell pattern already in place for the auth panel. |
 
 ### 3. `/api/v1/overview`'s workload list must shrink for public callers
@@ -111,7 +143,7 @@ replacement: `Overview` keeps `WorkloadsTotal` and a **count-by-state** breakdow
 PR description calling that out explicitly, the same care given to every other behavior change to
 shipped code this session (e.g. #90's Network-dimension evidence change).
 
-### 4. Granting the operator role
+### 4. Granting an operator role
 
 Mirrors the existing `controlplane-admin` break-glass pattern (`cmd/controlplane-admin`'s
 `create-user`/`issue-key`/`revoke-key`) rather than inventing a self-service path — becoming an
@@ -119,7 +151,8 @@ operator is not something a user should be able to grant themselves, unlike ADR-
 self-service API keys.
 
 ```
-controlplane-admin grant-role <user-id> operator
+controlplane-admin grant-role <user-id> operator_readonly
+controlplane-admin grant-role <user-id> operator_admin
 controlplane-admin grant-role <user-id> tenant   # revoke back to default
 ```
 
@@ -147,27 +180,29 @@ currently or newly proposed to cross the dashboard boundary:
 | Workload `image`, `state`, timestamps | Yes, public today; moving to Tenant-only detail (§3) | No secrets in these fields themselves. |
 | Workload `definition` (raw bytes, includes env vars per `WorkloadDefinition` in `shared.proto`) | **Not currently exposed anywhere in the dashboard** — `loadOverview` never selects the `definition` column. | **Yes, potentially** — a tenant's `env` map is exactly where a workload's secrets live (API keys, DB passwords for the deployed app). This must **never** be returned verbatim by `GET /api/v1/my/workloads/{workload_id}` — needs an explicit redaction pass (e.g. key names only, values withheld) before that endpoint ships, not an oversight to catch later. |
 | Session API keys / raw keys | Never re-exposed after creation (ADR-014 §5/§6, unchanged) | N/A, already correctly handled |
-| Container `last_error`/`error_code` | Not currently exposed; proposed for operator queue view | Possible secret leakage if an application error message embeds a credential (e.g. a failed DB connection string in a stack trace) — operator-tier only (not public), which bounds but does not eliminate this; flagged as a real, open question in §7, not resolved here. |
+| Container `last_error`/`error_code` | Not currently exposed; proposed for operator queue view and the owning tenant's own workload detail | Possible secret leakage if an application error message embeds a credential (e.g. a failed DB connection string in a stack trace) — resolved in §7 below: shown to the owning tenant, withheld from Operator-tier's cross-tenant queue view. |
 
-### 7. Open questions for the accepting reviewer
+### 7. Open questions for the accepting reviewer — resolved
 
-Not resolved by this proposal — need an explicit answer before implementation, listed rather than
-guessed at:
+Originally not resolved by this proposal; answered directly by the repository owner (see the
+Status section's "§7 resolved" note for the verbatim answers). Kept here for the original framing
+rather than deleted, since the reasoning each question raised still explains *why* the resolution
+looks the way it does:
 
 1. Does `workload.definition`'s env redaction need to be configurable per-tenant (some tenants
    may want their own values visible to themselves, just not to operators), or withheld from
-   *everyone including the owning tenant* on principle? This proposal's table above assumes the
-   latter (never verbatim, to anyone, including the owner) is the safer default, but that's a
-   product decision, not a purely technical one.
+   *everyone including the owning tenant* on principle? **Resolved: withheld from everyone,
+   including the owner** — this proposal's safer-default assumption stands.
 2. Should `last_error`/`error_code` be shown to the *owning tenant* (Tenant tier, their own
    workload) even though they're withheld from Operator-tier's cross-tenant queue view for the
-   secret-leakage reason above? Plausibly yes (a tenant needs to know why their own workload
-   failed) — but that means the redaction rule is role-*and*-ownership-dependent, not just
-   role-dependent, which is more logic than §5's `requireRole` wrapper alone covers.
+   secret-leakage reason above? **Resolved: yes, shown to the owning tenant** — the redaction rule
+   is role-*and*-ownership-dependent, as anticipated; `GET /api/v1/my/workloads/{workload_id}`
+   (Tenant tier, ownership-scoped by its own query) includes it, the Operator-tier queue view does
+   not.
 3. Is a single global `operator` role sufficient, or does this need read-only-operator vs.
-   operator-with-admin-actions (stop-any-workload, revoke-any-key) as separate levels? This
-   proposal assumes one level is enough for the MVP's likely-single-operator deployment reality,
-   but that assumption should be stated and confirmed, not silently baked in.
+   operator-with-admin-actions (stop-any-workload, revoke-any-key) as separate levels? **Resolved:
+   two separate levels** — `operator_readonly` and `operator_admin`, implemented in
+   `migrations/000013_operator_role_levels.sql`.
 
 ## Sequencing
 
@@ -184,14 +219,18 @@ testable, and does not block on a later slice existing.
    ships, not deferred past it, since it's this slice that first exposes `definition`.
 3. **`/api/v1/overview` breaking change**: §3's workload-list removal, its own PR with an explicit
    "behavior change to shipped code" callout and updated dashboard JS/HTML.
-4. **Operator queue/worker views**: read-only, all from already-existing columns — the
-   lowest-risk slice, could plausibly land before or in parallel with slice 2 if the accepting
-   reviewer wants operator visibility sooner.
+4. **Operator queue/worker views**: read-only, gated `operator_readonly` (satisfied by
+   `operator_admin` too, per §1's ranking), all from already-existing columns — the lowest-risk
+   slice, could plausibly land before or in parallel with slice 2 if the accepting reviewer wants
+   operator visibility sooner.
 5. **Operator audit log**: new schema (an append-only `audit_events` table logging every
    Tenant/Operator-tier write action), its own slice — genuinely new work, not a read of existing
-   data, sized separately.
+   data, sized separately. Read access is `operator_readonly`; nothing in slice 5 itself needs
+   `operator_admin` unless a future slice adds destructive operator actions (stop-any-workload,
+   revoke-any-key) that the audit log then needs to record — those actions themselves would be
+   gated `operator_admin`.
 6. **E2E tests** (#76's own separate item): once slices 1-4 exist, a real end-to-end test
-   (login as tenant A, submit a workload, confirm tenant B's session cannot see it; login as
+   (login as tenant A, submit a workload, confirm tenant B's session cannot see it; login as an
    operator, confirm queue view works; confirm an unauthenticated caller gets exactly Public-tier
    data) becomes possible to write meaningfully — attempting it earlier would just be testing
    individual pieces already covered by their own slice's unit tests.
@@ -202,11 +241,11 @@ testable, and does not block on a later slice existing.
   dashboard's own `app.js`) must be updated in the same PR as §3's slice.
 - A user's role becomes a real, persistent piece of authorization state for the first time in this
   codebase — `controlplane-admin grant-role` needs the same operational care (who has access to
-  run it, is it logged) as `issue-key` already gets, since granting `operator` is granting
-  cross-tenant visibility.
-- Slice 2 cannot ship honestly without §7 question 1 and 2 being answered first — this is called
-  out explicitly in §5's sequencing so "we'll figure out redaction later" cannot quietly become
-  the default via merge-order accident.
+  run it, is it logged) as `issue-key` already gets, since granting `operator_readonly` is granting
+  cross-tenant visibility and granting `operator_admin` additionally grants destructive
+  cross-tenant action (stop-any-workload, revoke-any-key) once those actions exist.
+- §7 is now resolved (see Status), which unblocks slice 2 and slice 4 alike — "we'll figure out
+  redaction/role-granularity later" is no longer a live risk for either.
 - This proposal does not attempt multi-role users, fine-grained per-resource ACLs beyond
   ownership, or SSO/external-IdP integration — all plausible future needs, none required by #76's
   actual acceptance criteria, and adding any of them now would be exactly the kind of speculative

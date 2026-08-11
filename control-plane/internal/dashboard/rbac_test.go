@@ -73,7 +73,7 @@ func TestRequireRoleRejectsATenantAtAnOperatorGate(t *testing.T) {
 	_, server, _ := newAuthTestServer(t)
 	rawKey := issueSessionKey(t, server, userauth.RoleTenant)
 
-	handler := server.requireRole(userauth.RoleOperator, func(w http.ResponseWriter, r *http.Request) {
+	handler := server.requireRole(userauth.RoleOperatorReadOnly, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("the wrapped handler must not run for an under-privileged caller")
 	})
 
@@ -90,9 +90,9 @@ func TestRequireRoleRejectsATenantAtAnOperatorGate(t *testing.T) {
 	}
 }
 
-func TestRequireRoleAllowsAnOperatorThroughATenantGate(t *testing.T) {
+func TestRequireRoleAllowsAnOperatorReadOnlyThroughATenantGate(t *testing.T) {
 	_, server, _ := newAuthTestServer(t)
-	rawKey := issueSessionKey(t, server, userauth.RoleOperator)
+	rawKey := issueSessionKey(t, server, userauth.RoleOperatorReadOnly)
 
 	ran := false
 	handler := server.requireRole(userauth.RoleTenant, func(w http.ResponseWriter, r *http.Request) {
@@ -106,19 +106,19 @@ func TestRequireRoleAllowsAnOperatorThroughATenantGate(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 
 	if !ran {
-		t.Fatal("expected an operator to satisfy a tenant-tier gate too (ADR-016 §1's ranked roles)")
+		t.Fatal("expected an operator-readonly to satisfy a tenant-tier gate too (ADR-016 §1's ranked roles)")
 	}
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
 }
 
-func TestRequireRoleAllowsAnOperatorThroughAnOperatorGate(t *testing.T) {
+func TestRequireRoleAllowsAnOperatorReadOnlyThroughAnOperatorReadOnlyGate(t *testing.T) {
 	_, server, _ := newAuthTestServer(t)
-	rawKey := issueSessionKey(t, server, userauth.RoleOperator)
+	rawKey := issueSessionKey(t, server, userauth.RoleOperatorReadOnly)
 
 	ran := false
-	handler := server.requireRole(userauth.RoleOperator, func(w http.ResponseWriter, r *http.Request) {
+	handler := server.requireRole(userauth.RoleOperatorReadOnly, func(w http.ResponseWriter, r *http.Request) {
 		ran = true
 		w.WriteHeader(http.StatusOK)
 	})
@@ -129,10 +129,58 @@ func TestRequireRoleAllowsAnOperatorThroughAnOperatorGate(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 
 	if !ran {
-		t.Fatal("expected an operator to satisfy an operator-tier gate")
+		t.Fatal("expected an operator-readonly to satisfy an operator-readonly-tier gate")
 	}
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+}
+
+// TestRequireRoleRejectsAnOperatorReadOnlyAtAnOperatorAdminGate is ADR-016
+// §7 question 3's resolution made concrete: read-only visibility and
+// destructive admin actions (stop-any-workload, revoke-any-key) are
+// different trust levels, so an operator_readonly session must not reach
+// an operator_admin-gated route.
+func TestRequireRoleRejectsAnOperatorReadOnlyAtAnOperatorAdminGate(t *testing.T) {
+	_, server, _ := newAuthTestServer(t)
+	rawKey := issueSessionKey(t, server, userauth.RoleOperatorReadOnly)
+
+	handler := server.requireRole(userauth.RoleOperatorAdmin, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("the wrapped handler must not run for an operator-readonly caller at an operator-admin gate")
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+}
+
+func TestRequireRoleAllowsAnOperatorAdminThroughEveryGate(t *testing.T) {
+	_, server, _ := newAuthTestServer(t)
+	rawKey := issueSessionKey(t, server, userauth.RoleOperatorAdmin)
+
+	for _, gate := range []string{userauth.RoleTenant, userauth.RoleOperatorReadOnly, userauth.RoleOperatorAdmin} {
+		ran := false
+		handler := server.requireRole(gate, func(w http.ResponseWriter, r *http.Request) {
+			ran = true
+			w.WriteHeader(http.StatusOK)
+		})
+
+		request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+
+		if !ran {
+			t.Fatalf("expected an operator-admin to satisfy a %q gate", gate)
+		}
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("gate %q: status = %d, want 200", gate, recorder.Code)
+		}
 	}
 }
 

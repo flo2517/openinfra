@@ -212,15 +212,15 @@ func TestSetRoleGrantsAndRevokesOperator(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := repository.SetRole(ctx, user.UserID, userauth.RoleOperator); err != nil {
-		t.Fatalf("SetRole(operator): %v", err)
+	if err := repository.SetRole(ctx, user.UserID, userauth.RoleOperatorAdmin); err != nil {
+		t.Fatalf("SetRole(operator_admin): %v", err)
 	}
 	promoted, err := repository.Authenticate(ctx, userauth.HashAPIKey(key.Raw))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if promoted.Role != userauth.RoleOperator {
-		t.Fatalf("Role after grant = %q, want %q", promoted.Role, userauth.RoleOperator)
+	if promoted.Role != userauth.RoleOperatorAdmin {
+		t.Fatalf("Role after grant = %q, want %q", promoted.Role, userauth.RoleOperatorAdmin)
 	}
 
 	// The grant path is also the revoke path -- setting back to tenant
@@ -242,7 +242,7 @@ func TestSetRoleReportsUserNotFoundForAnUnknownUserID(t *testing.T) {
 	ctx, pool := newTestPool(t)
 	repository := userauth.NewPostgresRepository(pool)
 
-	err := repository.SetRole(ctx, uuid.NewString(), userauth.RoleOperator)
+	err := repository.SetRole(ctx, uuid.NewString(), userauth.RoleOperatorAdmin)
 	if err != userauth.ErrUserNotFound {
 		t.Fatalf("SetRole() for an unknown user = %v, want ErrUserNotFound", err)
 	}
