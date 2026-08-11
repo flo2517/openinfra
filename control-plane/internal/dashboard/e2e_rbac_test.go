@@ -147,12 +147,15 @@ func (e e2eEnv) submitWorkload(t *testing.T, apiKey string) string {
 	defer connection.Close()
 
 	authed := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+apiKey)
+	// The client supplies definition.workload_id; the server validates it
+	// is a UUID (workloadapi.validateSubmission) rather than minting one.
 	response, err := controlplanev1.NewControlPlaneServiceClient(connection).SubmitWorkload(authed,
 		&controlplanev1.SubmitWorkloadRequest{
 			RequestId: uuid.NewString(),
 			Image:     "example.invalid/e2e@sha256:" + strings.Repeat("a", 64),
 			Definition: &sharedv1.WorkloadDefinition{
-				Profile: sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE,
+				WorkloadId: uuid.NewString(),
+				Profile:    sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE,
 				Requirements: &sharedv1.ResourceRequirements{
 					Cpu: 1, RamMb: 256, StorageGb: 1,
 				},
