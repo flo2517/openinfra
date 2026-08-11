@@ -101,9 +101,15 @@ func TestOperatorWorkersReportsClaimsAndExpiredLeases(t *testing.T) {
 	ctx, server, pool := newAuthTestServer(t)
 	future := time.Now().Add(time.Hour)
 	past := time.Now().Add(-time.Hour)
+	// REQUESTED/SCHEDULING only: workloads' CHECK constraints require a
+	// provider_id for LEASE_PENDING and above, and a lease_id for LEASED
+	// and above (migrations/000004_workloads.sql). This view only cares
+	// about worker_id/worker_lease_until, which every state carries, so
+	// the fixture stays on the two states that need no provider or lease
+	// rather than inventing them just to satisfy a constraint.
 	insertMinimalWorkload(t, ctx, pool, "SCHEDULING", 0, strPtr("worker-a"), &future)
-	insertMinimalWorkload(t, ctx, pool, "DEPLOYING", 0, strPtr("worker-a"), &future)
-	insertMinimalWorkload(t, ctx, pool, "LEASE_PENDING", 0, strPtr("worker-b"), &past)
+	insertMinimalWorkload(t, ctx, pool, "SCHEDULING", 0, strPtr("worker-a"), &future)
+	insertMinimalWorkload(t, ctx, pool, "REQUESTED", 0, strPtr("worker-b"), &past)
 	insertMinimalWorkload(t, ctx, pool, "REQUESTED", 0, nil, nil) // unclaimed, must not appear
 
 	rawKey := issueSessionKey(t, server, userauth.RoleOperatorAdmin) // admin satisfies a readonly gate too

@@ -203,6 +203,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/api-keys", s.authIssueAPIKey)
 	mux.HandleFunc("GET /api/v1/agent-endpoint/{provider_id}", s.agentEndpoint)
 	mux.HandleFunc("GET /api/v1/validator-scores/{provider_id}", s.validatorScores)
+	mux.HandleFunc("GET /api/v1/my/workloads", s.requireRole(userauth.RoleTenant, s.myWorkloads))
+	mux.HandleFunc("GET /api/v1/my/workloads/{workload_id}", s.requireRole(userauth.RoleTenant, s.myWorkload))
 	mux.HandleFunc("GET /api/v1/operator/queue", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorQueue))
 	mux.HandleFunc("GET /api/v1/operator/workers", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorWorkers))
 	mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(static))))
