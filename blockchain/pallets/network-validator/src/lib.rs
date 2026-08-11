@@ -16,17 +16,19 @@
 //!    [`ReputationUpdater`], and submitters that survived trimming accrue
 //!    Reward Points through [`ValidatorRewards`]. Closed rounds can be
 //!    contested within a bounded window, which rolls the dimension back
-//!    pending governance resolution.
+//!    pending governance resolution. An upheld dispute (ADR-018) also
+//!    slashes the bonded stake of every validator whose submission
+//!    survived trimming into the wrong aggregate -- see
+//!    [`Pallet::resolve_dispute`] and [`RoundSubmitters`].
 //!
-//! Still open per ADR-011: slashing (penalties beyond earning nothing for
-//! a round), and unpredictable (VRF-backed) committee entropy -- see
-//! [`Pallet::committee`] for why assignment is currently predictable.
+//! Still open per ADR-011: unpredictable (VRF-backed) committee entropy --
+//! see [`Pallet::committee`] for why assignment is currently predictable.
 
 extern crate alloc;
 
 use frame_support::{
     pallet_prelude::*,
-    sp_runtime::traits::Saturating,
+    sp_runtime::traits::{Saturating, Zero},
     traits::{Currency, EnsureOrigin, Get, ReservableCurrency},
     weights::Weight,
     Hashable,
@@ -198,6 +200,15 @@ pub mod pallet {
         /// Reward Points credited per submission that survived trimming.
         #[pallet::constant]
         type PointsPerAcceptedSubmission: Get<u64>;
+        /// ADR-018: bonded stake slashed, per responsible validator, when a
+        /// dispute is upheld (`resolve_dispute(uphold: true)`). A bounded
+        /// per-incident amount, not the validator's full stake -- a single
+        /// governance call should not be able to destroy 100% of a bond on
+        /// one adjudicated incident (see ADR-018 §3). Capped at whatever
+        /// the validator currently has reserved: `slash_reserved` cannot
+        /// slash more than that regardless of this value.
+        #[pallet::constant]
+        type SlashAmount: Get<BalanceOf<Self>>;
         type WeightInfo: WeightInfo;
     }
 
@@ -327,6 +338,27 @@ pub mod pallet {
         OptionQuery,
     >;
 
+    /// The validators whose submission survived outlier trimming into a
+    /// closed round's aggregate (ADR-018 §2) -- a separate storage item
+    /// from [`Rounds`], not a field on [`RoundResult`], so `RoundResult`'s
+    /// existing fixed-width SCALE layout (already decoded byte-for-byte by
+    /// `control-plane/internal/blockchainbridge/roundresult.go`) stays
+    /// unchanged; only `resolve_dispute` ever reads this map. Written
+    /// alongside `Rounds` at `close_round` time; kept for the same
+    /// lifetime `Rounds` itself already is (this pallet does not prune
+    /// closed rounds today, ADR-018 does not change that).
+    #[pallet::storage]
+    pub type RoundSubmitters<T: Config> = StorageNMap<
+        _,
+        (
+            NMapKey<Blake2_128Concat, T::AccountId>,
+            NMapKey<Twox64Concat, u64>,
+            NMapKey<Twox64Concat, ScoreDimension>,
+        ),
+        BoundedVec<T::AccountId, T::MaxSubmissionsPerRound>,
+        ValueQuery,
+    >;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -379,6 +411,19 @@ pub mod pallet {
             dimension: ScoreDimension,
             upheld: bool,
             effective_score_bps: u16,
+        },
+        /// ADR-018: a validator whose submission was counted into a round
+        /// that governance upheld a dispute against. `amount` is what was
+        /// actually removed (never more than the validator's reserved
+        /// balance, regardless of `SlashAmount`). `force_suspended` is
+        /// true when this slash brought the validator's stake to zero.
+        ValidatorSlashed {
+            validator: T::AccountId,
+            provider: T::AccountId,
+            round: u64,
+            dimension: ScoreDimension,
+            amount: BalanceOf<T>,
+            force_suspended: bool,
         },
     }
 
@@ -671,6 +716,20 @@ pub mod pallet {
                     status: RoundStatus::Final,
                 },
             );
+            // ADR-018: record who is responsible for this aggregate,
+            // should governance later uphold a dispute against it.
+            // Bounded by construction (accepted.len() <= submissions.len()
+            // <= MaxSubmissionsPerRound already, via Evidence's own
+            // bound), so truncate_from never actually truncates.
+            RoundSubmitters::<T>::insert(
+                (&provider, round, dimension),
+                BoundedVec::truncate_from(
+                    accepted
+                        .iter()
+                        .map(|entry| entry.validator.clone())
+                        .collect::<alloc::vec::Vec<_>>(),
+                ),
+            );
             // Raw submissions are no longer needed once the aggregate is
             // committed; the off-chain evidence remains addressable by
             // each submission's payload_hash in the emitted events.
@@ -748,8 +807,10 @@ pub mod pallet {
 
         /// Settle a dispute. `SuspensionOrigin`-gated: full on-chain
         /// adjudication is deferred (ADR-011 §5), so for the MVP a
-        /// governance origin decides. Upholding keeps the rollback;
-        /// rejecting re-applies the round's aggregate.
+        /// governance origin decides. Upholding keeps the rollback and
+        /// slashes (ADR-018) every validator whose submission survived
+        /// trimming into the round's wrong aggregate; rejecting re-applies
+        /// the round's aggregate and slashes no one.
         #[pallet::call_index(8)]
         #[pallet::weight(T::WeightInfo::resolve_dispute())]
         pub fn resolve_dispute(
@@ -770,6 +831,7 @@ pub mod pallet {
             let effective_score_bps = if uphold {
                 result.status = RoundStatus::DisputeUpheld;
                 // Already rolled back by dispute_round; nothing to re-apply.
+                Self::slash_round_submitters(&provider, round, dimension);
                 result.previous_score_bps
             } else {
                 result.status = RoundStatus::DisputeRejected;
@@ -903,6 +965,54 @@ pub mod pallet {
                     ..
                 })
             )
+        }
+
+        /// ADR-018: slash every validator recorded in
+        /// [`RoundSubmitters`] for (provider, round, dimension) --
+        /// called only from `resolve_dispute(uphold: true)`, once the
+        /// dispute window has already confirmed this round's aggregate
+        /// was wrong. Best-effort per validator: a missing `Validators`
+        /// record (should not happen -- only ever populated with
+        /// then-registered validators -- but this must not panic on a
+        /// stale/corrupt entry) is silently skipped rather than failing
+        /// the whole dispatch, since `resolve_dispute` must not be
+        /// blockable by one bad entry among potentially several.
+        fn slash_round_submitters(provider: &T::AccountId, round: u64, dimension: ScoreDimension) {
+            let submitters = RoundSubmitters::<T>::get((provider, round, dimension));
+            let requested = T::SlashAmount::get();
+            for validator in submitters.iter() {
+                let Some(mut record) = Validators::<T>::get(validator) else {
+                    continue;
+                };
+                // slash_reserved cannot remove more than is actually
+                // reserved regardless of `requested`; `shortfall` is what
+                // it could *not* slash, so `requested - shortfall` is the
+                // real amount removed.
+                let (imbalance, shortfall) = T::Currency::slash_reserved(validator, requested);
+                drop(imbalance); // burned: no `resolves` call, matching ADR-018 §3
+                let slashed = requested.saturating_sub(shortfall);
+                if slashed.is_zero() {
+                    continue;
+                }
+                record.stake = record.stake.saturating_sub(slashed);
+                let force_suspended =
+                    record.stake.is_zero() && matches!(record.status, ValidatorStatus::Active);
+                if force_suspended {
+                    record.status = ValidatorStatus::Suspended;
+                }
+                Validators::<T>::insert(validator, record);
+                if force_suspended {
+                    Self::leave_active_set(validator);
+                }
+                Self::deposit_event(Event::ValidatorSlashed {
+                    validator: validator.clone(),
+                    provider: provider.clone(),
+                    round,
+                    dimension,
+                    amount: slashed,
+                    force_suspended,
+                });
+            }
         }
     }
 
