@@ -31,9 +31,14 @@ const dependencyProbeTimeout = 2 * time.Second
 
 // DependencyHealth is one backing service's probe result.
 type DependencyHealth struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"` // "ok" | "degraded" | "unavailable"
-	LatencyMS int64  `json:"latency_ms"`
+	Name   string `json:"name"`
+	Status string `json:"status"` // "ok" | "degraded" | "unavailable"
+	// LatencyUS is microseconds, not milliseconds: every probe against a
+	// container on the same host completes well under 1ms, so a
+	// millisecond field reads 0 for all three and tells an operator
+	// nothing -- verified against the running stack, where that is
+	// exactly what it did.
+	LatencyUS int64 `json:"latency_us"`
 	// Detail carries the reason for a non-ok status, or a qualifier for a
 	// degraded one (e.g. the chain answering while still syncing). Never
 	// the raw driver error: those can carry connection strings.
@@ -179,18 +184,18 @@ func (s *Server) probe(ctx context.Context, name string, check func(context.Cont
 
 	started := s.now()
 	detail, err := check(probeCtx)
-	latency := s.now().Sub(started).Milliseconds()
+	latency := s.now().Sub(started).Microseconds()
 
 	switch {
 	case err != nil:
 		// The error itself is not echoed: a driver error can embed a
 		// connection string, and this endpoint is read by humans who
 		// have the logs for the detail.
-		return DependencyHealth{Name: name, Status: "unavailable", LatencyMS: latency, Detail: "probe failed"}
+		return DependencyHealth{Name: name, Status: "unavailable", LatencyUS: latency, Detail: "probe failed"}
 	case detail != "":
-		return DependencyHealth{Name: name, Status: "degraded", LatencyMS: latency, Detail: detail}
+		return DependencyHealth{Name: name, Status: "degraded", LatencyUS: latency, Detail: detail}
 	default:
-		return DependencyHealth{Name: name, Status: "ok", LatencyMS: latency}
+		return DependencyHealth{Name: name, Status: "ok", LatencyUS: latency}
 	}
 }
 

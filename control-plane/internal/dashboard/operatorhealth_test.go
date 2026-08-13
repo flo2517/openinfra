@@ -26,8 +26,8 @@ func TestProbeClassifiesEachOutcome(t *testing.T) {
 	if ok.Status != "ok" || ok.Detail != "" {
 		t.Fatalf("healthy probe = %+v, want status ok with no detail", ok)
 	}
-	if ok.LatencyMS != 5 {
-		t.Fatalf("latency_ms = %d, want the elapsed 5ms", ok.LatencyMS)
+	if ok.LatencyUS != 5_000 {
+		t.Fatalf("latency_us = %d, want the elapsed 5ms expressed in microseconds", ok.LatencyUS)
 	}
 
 	degraded := server.probe(context.Background(), "dep", func(context.Context) (string, error) { return "syncing", nil })
