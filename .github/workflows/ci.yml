@@ -17,6 +17,26 @@ jobs:
     name: Control Plane / Go
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Every Postgres-backed test in control-plane/ guards on
+    # OPENINFRA_TEST_DATABASE_URL. Without this service they all skipped,
+    # and a skipped test is reported as a passing job -- including the
+    # tenant-isolation assertions (issue #98). Same image digest as
+    # deployments/docker-compose.yml, so CI and the dev stack cannot drift
+    # onto different Postgres majors.
+    services:
+      postgres:
+        image: postgres:17.6-alpine3.22@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+        env:
+          POSTGRES_USER: openinfra
+          POSTGRES_PASSWORD: openinfra
+          POSTGRES_DB: openinfra_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openinfra -d openinfra_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -35,6 +55,11 @@ jobs:
         run: go vet ./...
       - name: Test
         working-directory: control-plane
+        env:
+          # Each test helper creates and drops its own isolated schema in
+          # this database and applies the migrations itself, so no fixture
+          # loading or ordering between packages is needed.
+          OPENINFRA_TEST_DATABASE_URL: postgres://openinfra:openinfra@127.0.0.1:5432/openinfra_test?sslmode=disable
         run: go test ./...
 
   provider-agent:

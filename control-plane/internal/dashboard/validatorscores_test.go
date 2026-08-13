@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/testsupport"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/walletlogin"
 	"github.com/openinfra/network/migrations"
@@ -26,10 +27,7 @@ import (
 // live-chain test in this codebase.
 func newValidatorScoresTestServer(t *testing.T) (context.Context, *Server, *pgxpool.Pool) {
 	t.Helper()
-	databaseURL := os.Getenv("OPENINFRA_TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("OPENINFRA_TEST_DATABASE_URL is not set")
-	}
+	databaseURL := testsupport.RequireDatabaseURL(t)
 	rpcURL := os.Getenv("OPENINFRA_TEST_SUBSTRATE_RPC_URL")
 	if rpcURL == "" {
 		t.Skip("OPENINFRA_TEST_SUBSTRATE_RPC_URL is not set")

@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/ratelimit"
+	"github.com/openinfra/network/internal/testsupport"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/walletlogin"
 	"github.com/openinfra/network/migrations"
@@ -32,10 +33,7 @@ import (
 // isolation (those already have their own unit/integration tests).
 func newAuthTestServer(t *testing.T) (context.Context, *Server, *pgxpool.Pool) {
 	t.Helper()
-	databaseURL := os.Getenv("OPENINFRA_TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("OPENINFRA_TEST_DATABASE_URL is not set")
-	}
+	databaseURL := testsupport.RequireDatabaseURL(t)
 	ctx := context.Background()
 	admin, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
