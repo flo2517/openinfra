@@ -151,7 +151,16 @@ async function loadOpenRounds(){
         rows.append(row([dimension.dimension,round.round,`${submissions.length}/${round.quorum_required}`,round.quorum_reached?'atteint':'pas encore',awaiting,committee,detail]));
       }
     }
-    if(!any&&!data.partial){warning.hidden=false;warning.textContent='Aucun round ouvert pour ce provider dans la fenêtre récente — tous les rounds récents sont clos ou sans soumission.'}
+    // An empty list has two very different causes: nothing is pending, or
+    // the challenge protocol is inert because no validator is active at
+    // all. Saying "no open round" in the second case would read as "all
+    // clear" when in fact nothing can be assigned or closed.
+    if(!any&&!data.partial){
+      warning.hidden=false;
+      warning.textContent=data.active_validators===0
+        ?'Aucun Network Validator actif on-chain : aucun round ne peut être assigné ni clos pour ce provider.'
+        :'Aucun round en attente pour ce provider dans la fenêtre récente.';
+    }
   }catch(error){warning.hidden=false;warning.textContent='Impossible de charger les rounds ouverts.'}
 }
 function loadValidatorViews(){loadValidatorScores();loadOpenRounds()}

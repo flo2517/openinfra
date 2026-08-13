@@ -168,6 +168,26 @@ func TestBuildOpenRoundEncodesAccountsInFullAndHashesAsHex(t *testing.T) {
 	}
 }
 
+// TestOpenRoundIsInformativeDropsRoundsNobodyWasAssignedTo pins the
+// filter that keeps the response readable: against a chain with no active
+// validators, every round of every dimension is technically open, which
+// rendered as 20 identical empty rows before this existed.
+func TestOpenRoundIsInformativeDropsRoundsNobodyWasAssignedTo(t *testing.T) {
+	var provider, validator [32]byte
+	validator[0] = 4
+	active := activeSetForTest(8)
+
+	if openRoundIsInformative(buildOpenRound(provider, 1, nil, nil)) {
+		t.Fatal("a round with no submissions and no committee has nothing to report and must be dropped")
+	}
+	if !openRoundIsInformative(buildOpenRound(provider, 1, nil, active)) {
+		t.Fatal("a round whose committee owes an answer is the queue itself and must be kept")
+	}
+	if !openRoundIsInformative(buildOpenRound(provider, 1, []blockchainbridge.Submission{submissionFrom(validator, 1)}, nil)) {
+		t.Fatal("a round with a submission must be kept even when the committee cannot be computed")
+	}
+}
+
 // The handler tests below reuse newValidatorScoresTestServer: the two
 // endpoints have identical dependencies (Postgres for the provider lookup,
 // a live chain for every read) and it is already gated on both.

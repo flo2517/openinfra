@@ -173,9 +173,30 @@ func (s *Server) dimensionOpenRounds(ctx context.Context, account [32]byte, curr
 				continue
 			}
 		}
-		open.Rounds = append(open.Rounds, buildOpenRound(account, round, submissions, activeValidators))
+		entry := buildOpenRound(account, round, submissions, activeValidators)
+		if !openRoundIsInformative(entry) {
+			continue
+		}
+		open.Rounds = append(open.Rounds, entry)
 	}
 	return open, sawError
+}
+
+// openRoundIsInformative rejects a round where nobody has answered *and*
+// nobody was asked. Every round in the lookback window is technically
+// "open" until it closes, so with an empty active validator set a
+// provider's response would otherwise list every round of every dimension
+// as an open queue entry -- verified against the dev chain, where that is
+// 20 identical empty rows. Nothing can be assigned or closed without an
+// active set, so those rows describe an inert protocol as a backlog.
+//
+// A round is kept as soon as it has either a submission (someone answered)
+// or a committee (someone owes an answer, including the stuck-round case
+// where the committee has answered nothing for several rounds). The
+// active-set size is reported separately on the response, so "no open
+// rounds" and "no validators at all" stay distinguishable.
+func openRoundIsInformative(entry OpenRound) bool {
+	return len(entry.Submissions) > 0 || len(entry.Committee) > 0
 }
 
 // buildOpenRound joins the submissions actually on-chain with the
