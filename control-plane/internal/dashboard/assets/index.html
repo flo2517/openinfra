@@ -39,7 +39,8 @@
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">VALIDATORS</span><h2>Scoring décentralisé</h2></div></div>
       <div id="validators-warning" class="warning" role="alert" hidden>Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.</div>
-      <div class="table-wrap" role="region" tabindex="0" aria-label="Network Validators actifs (zone défilable)"><table><caption class="sr-only">Network Validators actuellement actifs on-chain</caption><thead><tr><th scope="col">Validator</th></tr></thead><tbody id="validators"></tbody></table></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Network Validators actifs et leur état on-chain (zone défilable)"><table><caption class="sr-only">Network Validators actuellement actifs on-chain, avec leur état de cycle de vie, leur stake et leur bloc d'enregistrement</caption><thead><tr><th scope="col">Validator</th><th scope="col">État</th><th scope="col">Stake</th><th scope="col">Enregistré</th></tr></thead><tbody id="validators"></tbody></table></div>
+      <p class="muted">Quorum requis pour clore un round : <span id="validator-quorum">—</span> soumissions, sur un comité visé de <span id="validator-committee">—</span>.</p>
     </section>
     <section class="panel" id="validator-scores-panel">
       <div class="panel-head"><div><span class="eyebrow">VALIDATOR SCORES</span><h2>Historique des rounds de scoring</h2></div></div>
@@ -51,6 +52,10 @@
       </div>
       <div id="score-warning" class="warning" role="alert" hidden></div>
       <div class="table-wrap" role="region" tabindex="0" aria-label="Historique des rounds de scoring (zone défilable)"><table><caption class="sr-only">Historique des rounds de scoring pour le provider recherché, par dimension</caption><thead><tr><th scope="col">Dimension</th><th scope="col">Round</th><th scope="col">Score</th><th scope="col">Précédent</th><th scope="col">Confiance</th><th scope="col">Soumissions</th><th scope="col">Statut</th><th scope="col">Bloc de clôture</th></tr></thead><tbody id="score-rows"></tbody></table></div>
+      <h3 id="open-rounds-title">Rounds ouverts et file de challenges</h3>
+      <p class="muted">Rounds pas encore clos pour ce provider : qui a été assigné, qui a déjà répondu, et si le quorum est atteint. Le comité est recalculé à partir de l'ensemble actif <em>actuel</em> — s'il a changé depuis, la ligne est marquée « comité indicatif ».</p>
+      <div id="rounds-warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Rounds ouverts et file de challenges (zone défilable)"><table><caption class="sr-only">Rounds de challenge encore ouverts pour le provider recherché, par dimension</caption><thead><tr><th scope="col">Dimension</th><th scope="col">Round</th><th scope="col">Soumissions</th><th scope="col">Quorum</th><th scope="col">En attente</th><th scope="col">Comité</th><th scope="col">Détail des soumissions</th></tr></thead><tbody id="rounds-rows"></tbody></table></div>
     </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">PROVIDERS</span><h2>État du réseau</h2></div><button id="refresh" type="button">Actualiser</button></div>
       <div id="warning" class="warning" role="alert" hidden></div>

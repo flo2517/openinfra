@@ -89,17 +89,25 @@ func (c *RPCClient) FinalizedRoundResult(ctx context.Context, provider [32]byte,
 }
 
 // roundResultStorageKey addresses pallet-network-validator's Rounds
-// StorageNMap, keyed (Blake2_128Concat AccountId, Twox64Concat u64,
-// Twox64Concat ScoreDimension) -- unlike mapStorageKey's single hashed
-// key, an NMap's storage key is the pallet/item prefix followed by each
-// key component's own hasher output concatenated in declaration order,
-// each one immediately followed by that component's own raw SCALE
-// encoding (the "Concat" half of each hasher's name). Evidence uses the
-// identical key shape (same three key types, same hashers) -- if a
-// caller ever needs to read Evidence too, this same construction applies
-// with "Evidence" in place of "Rounds".
+// StorageNMap.
 func roundResultStorageKey(provider [32]byte, round uint64, dimension ScoreDimension) string {
-	key := append(twox128([]byte("NetworkValidator")), twox128([]byte("Rounds"))...)
+	return networkValidatorRoundKey("Rounds", provider, round, dimension)
+}
+
+// networkValidatorRoundKey builds the storage key for either of
+// pallet-network-validator's two (provider, round, dimension) NMaps --
+// Rounds and Evidence, which are declared with the identical key shape
+// (Blake2_128Concat AccountId, Twox64Concat u64, Twox64Concat
+// ScoreDimension) -- hence one construction parameterized by item name
+// rather than two that must be kept in step.
+//
+// Unlike mapStorageKey's single hashed key, an NMap's storage key is the
+// pallet/item prefix followed by each key component's own hasher output
+// concatenated in declaration order, each one immediately followed by
+// that component's own raw SCALE encoding (the "Concat" half of each
+// hasher's name).
+func networkValidatorRoundKey(item string, provider [32]byte, round uint64, dimension ScoreDimension) string {
+	key := append(twox128([]byte("NetworkValidator")), twox128([]byte(item))...)
 
 	providerDigest, _ := blake2b.New(16, nil)
 	_, _ = providerDigest.Write(provider[:])
