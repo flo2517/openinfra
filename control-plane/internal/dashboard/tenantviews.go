@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/openinfra/network/internal/workloadapi"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -230,4 +231,60 @@ func decodeRequirements(definition []byte) *TenantWorkloadRequirements {
 		}
 	}
 	return &requirements
+}
+
+// stopMyWorkload is ADR-016 §2's tenant-tier stop action: a thin HTTP
+// wrapper over the exact RequestStop path internal/workloadapi already
+// exposes over gRPC. No new business logic lives here -- in particular
+// the ownership check is RequestStop's own `WHERE workload_id=$1 AND
+// owner_id=$2 FOR UPDATE`, not a second check in this package that could
+// drift from it.
+//
+// This is the first authenticated *write* on the dashboard's HTTP
+// surface, which is what makes ADR-016 slice 5's audit log meaningful
+// rather than an empty table; both success and refusal are recorded.
+func (s *Server) stopMyWorkload(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	user, ok := s.authenticatedUser(ctx, r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		return
+	}
+	workloadID := r.PathValue("workload_id")
+	if _, err := uuid.Parse(workloadID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workload_id must be a UUID"})
+		return
+	}
+
+	// The stop request's idempotency key is generated server-side rather
+	// than taken from the caller: a browser has no way to keep a stable
+	// one across a page reload, and RequestStop already treats a second
+	// stop on an already-stopping workload as a conflict, so retry
+	// safety comes from that check rather than from the caller's key.
+	repository := workloadapi.NewPostgresRepository(s.pool)
+	stored, err := repository.RequestStop(ctx, workloadID, uuid.NewString(), user.UserID, s.now().UTC())
+	switch {
+	case errors.Is(err, workloadapi.ErrNotFound), errors.Is(err, pgx.ErrNoRows):
+		// 404 for someone else's workload too, same existence-oracle
+		// reasoning as myWorkload above.
+		s.recordAudit(ctx, user, auditActionWorkloadStop, auditTargetWorkload, workloadID, auditOutcomeDenied)
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workload not found"})
+		return
+	case errors.Is(err, workloadapi.ErrConflict):
+		s.recordAudit(ctx, user, auditActionWorkloadStop, auditTargetWorkload, workloadID, auditOutcomeDenied)
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "workload already has a stop request"})
+		return
+	case err != nil:
+		s.recordAudit(ctx, user, auditActionWorkloadStop, auditTargetWorkload, workloadID, auditOutcomeError)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "stop request unavailable"})
+		return
+	}
+
+	s.recordAudit(ctx, user, auditActionWorkloadStop, auditTargetWorkload, workloadID, auditOutcomeSuccess)
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"workload_id": stored.WorkloadID,
+		"state":       stored.State,
+	})
 }
