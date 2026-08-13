@@ -106,22 +106,25 @@ type Overview struct {
 	// tell "500 providers, all shown" apart from "500 providers, a page
 	// of an unknown larger total" other than guessing from the hardcoded
 	// LIMIT.
-	ProvidersTotal  int        `json:"providers_total"`
-	ProvidersLimit  int        `json:"providers_limit"`
-	ProvidersOffset int        `json:"providers_offset"`
-	ProvidersFresh  int        `json:"providers_fresh"`
-	WorkloadsTotal  int        `json:"workloads_total"`
-	WorkloadsLimit  int        `json:"workloads_limit"`
-	WorkloadsOffset int        `json:"workloads_offset"`
-	CPUAvailable    float64    `json:"cpu_available"`
-	MemoryMB        int64      `json:"memory_available_mb"`
-	FinalizedBlock  uint64     `json:"finalized_block"`
-	BestBlock       uint64     `json:"best_block"`
-	ChainSyncing    bool       `json:"chain_syncing"`
-	Partial         bool       `json:"partial"`
-	Errors          []string   `json:"errors,omitempty"`
-	Providers       []Provider `json:"providers"`
-	Workloads       []Workload `json:"workloads"`
+	ProvidersTotal  int `json:"providers_total"`
+	ProvidersLimit  int `json:"providers_limit"`
+	ProvidersOffset int `json:"providers_offset"`
+	ProvidersFresh  int `json:"providers_fresh"`
+	WorkloadsTotal  int `json:"workloads_total"`
+	// WorkloadsByState replaces the per-workload list this endpoint used
+	// to return (ADR-016 §3). Keys are workloads.state values; every
+	// known state is present, including zero-count ones, so a client can
+	// tell "no RUNNING workloads" from "this build doesn't report
+	// RUNNING" without consulting the schema.
+	WorkloadsByState map[string]int `json:"workloads_by_state"`
+	CPUAvailable     float64        `json:"cpu_available"`
+	MemoryMB         int64          `json:"memory_available_mb"`
+	FinalizedBlock   uint64         `json:"finalized_block"`
+	BestBlock        uint64         `json:"best_block"`
+	ChainSyncing     bool           `json:"chain_syncing"`
+	Partial          bool           `json:"partial"`
+	Errors           []string       `json:"errors,omitempty"`
+	Providers        []Provider     `json:"providers"`
 	// ValidatorsActive is -1 when the read failed, so a client can tell
 	// "no validators registered" (0) apart from "unavailable" (-1) --
 	// ADR-011 requires never reporting false success on a degraded read.
@@ -129,20 +132,33 @@ type Overview struct {
 	Validators       []string `json:"validators,omitempty"`
 }
 
-// overviewPagination bounds /api/v1/overview's two independently
-// paginated collections. Defaults match this endpoint's pre-pagination
-// behavior exactly (LIMIT 500 / LIMIT 100, offset 0) so an existing
-// caller that never passes these query params sees no change.
+// emptyWorkloadStateCounts seeds every state workloads.state's CHECK
+// constraint allows with an explicit zero, so a state with no rows is
+// reported as 0 rather than being absent from the map -- the same
+// no-false-success instinct operatorviews.go applies to its own
+// per-state counts, and the reason a client can trust "0 RUNNING" here.
+func emptyWorkloadStateCounts() map[string]int {
+	counts := make(map[string]int, len(operatorWorkloadStates))
+	for _, state := range operatorWorkloadStates {
+		counts[state] = 0
+	}
+	return counts
+}
+
+// overviewPagination bounds /api/v1/overview's provider list. It used
+// to bound a workload list too; ADR-016 §3 replaced that with
+// WorkloadsByState, which is a fixed-size aggregate and needs no paging.
+// The workloads_limit/workloads_offset query params are consequently
+// gone -- a caller still passing them is simply ignored rather than
+// erroring, matching boundedQueryInt's existing lenience about unusable
+// values.
 type overviewPagination struct {
 	ProvidersLimit, ProvidersOffset int
-	WorkloadsLimit, WorkloadsOffset int
 }
 
 const (
 	defaultProvidersLimit = 500
 	maxProvidersLimit     = 500
-	defaultWorkloadsLimit = 100
-	maxWorkloadsLimit     = 200
 )
 
 func parseOverviewPagination(r *http.Request) overviewPagination {
@@ -150,8 +166,6 @@ func parseOverviewPagination(r *http.Request) overviewPagination {
 	return overviewPagination{
 		ProvidersLimit:  boundedQueryInt(query, "providers_limit", defaultProvidersLimit, 1, maxProvidersLimit),
 		ProvidersOffset: boundedQueryInt(query, "providers_offset", 0, 0, math.MaxInt32),
-		WorkloadsLimit:  boundedQueryInt(query, "workloads_limit", defaultWorkloadsLimit, 1, maxWorkloadsLimit),
-		WorkloadsOffset: boundedQueryInt(query, "workloads_offset", 0, 0, math.MaxInt32),
 	}
 }
 
@@ -175,14 +189,6 @@ func boundedQueryInt(query url.Values, key string, fallback, min, max int) int {
 		return max
 	}
 	return parsed
-}
-
-type Workload struct {
-	WorkloadID string `json:"workload_id"`
-	State      string `json:"state"`
-	ProviderID string `json:"provider_id,omitempty"`
-	LeaseID    string `json:"lease_id,omitempty"`
-	CreatedAt  string `json:"created_at"`
 }
 
 func New(pool *pgxpool.Pool, redisClient redis.UniversalClient, chain *blockchainbridge.RPCClient, wallet *walletlogin.Service, users userauth.Repository, limiter RateLimiter) *Server {
@@ -253,12 +259,10 @@ func (s *Server) loadOverview(ctx context.Context, pagination overviewPagination
 	result := Overview{
 		GeneratedAt:      s.now().UTC().Format(time.RFC3339),
 		Providers:        []Provider{},
-		Workloads:        []Workload{},
+		WorkloadsByState: emptyWorkloadStateCounts(),
 		ValidatorsActive: -1,
 		ProvidersLimit:   pagination.ProvidersLimit,
 		ProvidersOffset:  pagination.ProvidersOffset,
-		WorkloadsLimit:   pagination.WorkloadsLimit,
-		WorkloadsOffset:  pagination.WorkloadsOffset,
 	}
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM providers`).Scan(&result.ProvidersTotal); err != nil {
 		return Overview{}, err
@@ -292,25 +296,32 @@ func (s *Server) loadOverview(ctx context.Context, pagination overviewPagination
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM workloads`).Scan(&result.WorkloadsTotal); err != nil {
 		return Overview{}, err
 	}
-	workloadRows, err := s.pool.Query(ctx, `SELECT workload_id::text, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), created_at FROM workloads ORDER BY created_at DESC LIMIT $1 OFFSET $2`, pagination.WorkloadsLimit, pagination.WorkloadsOffset)
+	// ADR-016 §3: this endpoint is Public tier, so it reports how many
+	// workloads are in each state and nothing per-workload. It used to
+	// return up to 100 rows of (workload_id, state, provider_id,
+	// lease_id, created_at) to any unauthenticated caller -- none of
+	// those fields is a secret on its own, but together they are exactly
+	// the shape of "which tenants are using this network, and when."
+	// Per-workload detail now lives behind GET /api/v1/my/workloads,
+	// scoped to its owner.
+	stateRows, err := s.pool.Query(ctx, `SELECT state, count(*) FROM workloads GROUP BY state`)
 	if err != nil {
 		return Overview{}, err
 	}
-	for workloadRows.Next() {
-		var item Workload
-		var created time.Time
-		if err := workloadRows.Scan(&item.WorkloadID, &item.State, &item.ProviderID, &item.LeaseID, &created); err != nil {
-			workloadRows.Close()
+	for stateRows.Next() {
+		var state string
+		var count int
+		if err := stateRows.Scan(&state, &count); err != nil {
+			stateRows.Close()
 			return Overview{}, err
 		}
-		item.WorkloadID, item.ProviderID, item.CreatedAt = abbreviate(item.WorkloadID), abbreviate(item.ProviderID), created.UTC().Format(time.RFC3339)
-		result.Workloads = append(result.Workloads, item)
+		result.WorkloadsByState[state] = count
 	}
-	if err := workloadRows.Err(); err != nil {
-		workloadRows.Close()
+	if err := stateRows.Err(); err != nil {
+		stateRows.Close()
 		return Overview{}, err
 	}
-	workloadRows.Close()
+	stateRows.Close()
 
 	// Redis is reconstructible: failure makes liveness unknown, never zero/offline.
 	for index := range result.Providers {
