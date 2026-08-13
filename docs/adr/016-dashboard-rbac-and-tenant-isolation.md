@@ -133,6 +133,7 @@ separate design exercise per endpoint.
 | `GET /api/v1/operator/queue` *(new)* | Operator (`operator_readonly`) | Counts of workloads by `state`, oldest `next_attempt_at` per state, `attempt_count` distribution — all already-existing columns (`migrations/000004_workloads.sql`, `000006`, `000007`), no new schema needed. |
 | `GET /api/v1/operator/workers` *(new)* | Operator (`operator_readonly`) | Distinct `worker_id`/`worker_lease_until` currently holding a claim (`workloads.worker_id`) cross-referenced with `internal/agentmanager`'s live connection state. |
 | `GET /api/v1/operator/audit` *(new, later slice)* | Operator (`operator_readonly`) | No audit log exists yet — this is new work, not a read of existing data. Flagged as its own slice in §5, not assumed free. |
+| `GET /api/v1/operator/health` *(added after acceptance)* | Operator (`operator_readonly`) | Dependency probes (Postgres/Redis/chain, each probed independently — unlike `/readyz`, which short-circuits on the first failure and so can never say *which* one is down) plus alerts derived from existing state. Operator-tier rather than public because the alert counts alone describe how much cross-tenant work is in flight. |
 | Dashboard static assets (`/dashboard/*`) | Public | Unchanged — the HTML/JS shell itself carries no data; per-role content is fetched by the JS after login, same SPA-shell pattern already in place for the auth panel. |
 
 ### 3. `/api/v1/overview`'s workload list must shrink for public callers
