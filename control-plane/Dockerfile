@@ -12,10 +12,20 @@ RUN go mod download
 
 COPY control-plane/ /src/control-plane/
 RUN go build -trimpath -ldflags="-s -w" -o /out/control-plane ./cmd/controlplane
+# controlplane-admin ships alongside the server because ADR-016 §4 makes
+# `grant-role` the only way a user becomes a dashboard operator, and
+# ADR-014/#12 make `create-user`/`issue-key`/`revoke-key` the only way a
+# non-wallet user gets a credential at all. Without this binary in the
+# image, an operator running the packaged deployment cannot perform any
+# of those actions without building from source and reaching the
+# database out-of-band -- i.e. the shipped artifact would not support
+# its own documented operational procedures.
+RUN go build -trimpath -ldflags="-s -w" -o /out/controlplane-admin ./cmd/controlplane-admin
 RUN GOBIN=/out go install github.com/grpc-ecosystem/grpc-health-probe@${GRPC_HEALTH_PROBE_VERSION}
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
 COPY --from=build /out/control-plane /usr/local/bin/control-plane
+COPY --from=build /out/controlplane-admin /usr/local/bin/controlplane-admin
 COPY --from=build /out/grpc-health-probe /usr/local/bin/grpc-health-probe
 USER nonroot:nonroot
 EXPOSE 50051
