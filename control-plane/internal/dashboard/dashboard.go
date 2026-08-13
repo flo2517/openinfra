@@ -217,6 +217,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/operator/queue", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorQueue))
 	mux.HandleFunc("GET /api/v1/operator/workers", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorWorkers))
 	mux.HandleFunc("GET /api/v1/operator/audit", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorAudit))
+	mux.HandleFunc("GET /api/v1/operator/health", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorHealth))
 	mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(static))))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
