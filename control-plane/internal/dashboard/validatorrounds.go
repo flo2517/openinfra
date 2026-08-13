@@ -77,11 +77,11 @@ type DimensionOpenRounds struct {
 // response body: the in-flight side of the challenge protocol, the
 // counterpart to validator-scores' closed-round history.
 type ValidatorRounds struct {
-	ProviderID      string                `json:"provider_id"`
-	CurrentRound    uint64                `json:"current_round"`
-	ActiveValidator int                   `json:"active_validators"`
-	Dimensions      []DimensionOpenRounds `json:"dimensions"`
-	Partial         bool                  `json:"partial,omitempty"`
+	ProviderID       string                `json:"provider_id"`
+	CurrentRound     uint64                `json:"current_round"`
+	ActiveValidators int                   `json:"active_validators"`
+	Dimensions       []DimensionOpenRounds `json:"dimensions"`
+	Partial          bool                  `json:"partial,omitempty"`
 }
 
 // validatorRounds serves #76's "challenge queue, evidence, quorum, weight
@@ -124,7 +124,7 @@ func (s *Server) validatorRounds(w http.ResponseWriter, r *http.Request) {
 		result.Partial = true
 		activeValidators = nil
 	}
-	result.ActiveValidator = len(activeValidators)
+	result.ActiveValidators = len(activeValidators)
 
 	var partial sync.Mutex
 	var wg sync.WaitGroup
