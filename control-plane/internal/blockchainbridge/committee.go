@@ -19,6 +19,17 @@ import (
 // introducing a new one for a single constant).
 const NetworkValidatorTargetCommitteeSize uint32 = 5
 
+// NetworkValidatorMinQuorum mirrors the runtime's ValidatorMinQuorum
+// constant (wired to pallet_network_validator::Config::MinQuorum): the
+// number of independent submissions close_round requires before it will
+// aggregate a round. Hand-synced for the same reason as
+// NetworkValidatorTargetCommitteeSize above.
+//
+// Note this is *not* the committee size: the committee is who was asked
+// (5), the quorum is how many answers suffice (3), so a round can close
+// with two assigned validators never having submitted.
+const NetworkValidatorMinQuorum uint32 = 3
+
 // Committee replicates pallet-network-validator::Pallet::committee's
 // selection bit-for-bit (blockchain/pallets/network-validator/src/lib.rs).
 // It is a pure function of public inputs -- ADR-011 §1's explicit design:

@@ -33,8 +33,7 @@ async function refresh(){
     // rows, only counts by state. Per-workload detail lives behind
     // /api/v1/my/workloads, scoped to the authenticated owner.
     const workloads=$('workloads');workloads.replaceChildren();const byState=data.workloads_by_state||{};for(const state of Object.keys(byState).sort())workloads.append(row([state,byState[state]]));
-    const validators=$('validators');validators.replaceChildren();for(const v of data.validators||[])validators.append(row([v]));
-    $('validators-warning').hidden=data.validators_active>=0;
+    await loadValidatorHealth(data.validators||[],data.validators_active,active.signal);
     const warning=$('warning');warning.hidden=!data.partial;warning.textContent=data.partial?'Certaines sources sont momentanément indisponibles. Les données affichées restent partielles.':'';
     const shown=data.providers.length;
     const rangeStart=shown===0?0:data.providers_offset+1;
@@ -43,6 +42,47 @@ async function refresh(){
     $('providers-prev').disabled=data.providers_offset<=0;
     $('providers-next').disabled=data.providers_offset+shown>=data.providers_total;
   }catch(error){if(error.name!=='AbortError'){text('sample','Indisponible');const warning=$('warning');warning.hidden=false;warning.textContent='Le dashboard ne peut pas charger les données.'}}
+}
+// #76 validator health: /api/v1/overview already carries the active set's
+// accounts, but abbreviated and with no lifecycle state at all.
+// /api/v1/validator/health adds status/stake/registration per validator.
+// It is fetched inside its own try so a failure here degrades this one
+// table back to the overview's abbreviated list instead of breaking the
+// whole refresh -- the same "partial beats blank" rule the rest of this
+// dashboard follows.
+function validatorStatusLabel(validator){
+  if(validator.unavailable)return'lecture indisponible';
+  // found===false with a successful read means the account is in
+  // ActiveValidatorSet but has no Validators record -- an on-chain
+  // inconsistency, shown as such rather than as a healthy validator.
+  if(!validator.found)return'aucun enregistrement on-chain';
+  const labels={ACTIVE:'actif',SUSPENDED:'suspendu',EXITING:'sortie en cours'};
+  const label=labels[validator.status]||validator.status;
+  return validator.status==='EXITING'&&validator.available_at_block?`${label} (retrait au bloc #${validator.available_at_block})`:label;
+}
+async function loadValidatorHealth(fallbackAccounts,activeCount,signal){
+  const validators=$('validators');const warning=$('validators-warning');
+  validators.replaceChildren();
+  const unavailable='Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.';
+  try{
+    const response=await fetch('/api/v1/validator/health',{signal});
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    const data=await response.json();
+    text('validator-quorum',data.min_quorum);text('validator-committee',data.target_committee_size);
+    for(const validator of data.validators||[])validators.append(row([validator.validator,validatorStatusLabel(validator),validator.found?validator.stake:'—',validator.found?`#${validator.registered_at_block}`:'—']));
+    if(activeCount<0){warning.hidden=false;warning.textContent=unavailable}
+    else if(data.partial){warning.hidden=false;warning.textContent='État de certains validateurs illisible on-chain — les lignes concernées le disent explicitement.'}
+    else if(data.truncated){warning.hidden=false;warning.textContent=`Ensemble actif tronqué : ${data.validators.length} validateurs affichés sur ${data.active_count}.`}
+    else{warning.hidden=true}
+  }catch(error){
+    // An aborted read is a newer refresh superseding this one, not a
+    // failure: it must not paint a stale fallback list over the table
+    // the newer pass is about to fill.
+    if(error.name==='AbortError')return;
+    for(const account of fallbackAccounts)validators.append(row([account,'—','—','—']));
+    warning.hidden=false;
+    warning.textContent=activeCount<0?unavailable:'État détaillé des validateurs indisponible — seuls les comptes actifs sont affichés.';
+  }
 }
 $('refresh').addEventListener('click',refresh);refresh();setInterval(refresh,10000);
 $('providers-prev').addEventListener('click',()=>{providersOffset=Math.max(0,providersOffset-providersLimit);refresh()});
@@ -81,5 +121,48 @@ async function loadValidatorScores(){
     if(!any&&!data.partial){warning.hidden=false;warning.textContent='Aucun round clos pour ce provider dans la fenêtre récente.'}
   }catch(error){warning.hidden=false;warning.textContent='Impossible de charger l\'historique de scoring.'}
 }
-$('score-load').addEventListener('click',loadValidatorScores);
-$('score-provider-id').addEventListener('keydown',e=>{if(e.key==='Enter')loadValidatorScores()});
+// #76 challenge queue: the open-round counterpart to the closed-round
+// history above. Same provider_id, same explicit "Charger" action -- one
+// input for both, since "what has this provider been scored on, and what
+// is still in flight" is one question, and duplicating the control would
+// let the two tables drift to different providers.
+function shortAccount(account){return account.length>14?account.slice(0,10)+'…':account}
+async function loadOpenRounds(){
+  const providerId=$('score-provider-id').value.trim();
+  const warning=$('rounds-warning');const rows=$('rounds-rows');
+  warning.hidden=true;warning.textContent='';rows.replaceChildren();
+  // An empty or unknown provider_id is already reported by the score
+  // panel above; repeating it here would be two alerts for one mistake.
+  if(!providerId)return;
+  try{
+    const response=await fetch(`/api/v1/validator/rounds/${encodeURIComponent(providerId)}`);
+    if(response.status===404)return;
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    const data=await response.json();
+    if(data.partial){warning.hidden=false;warning.textContent='Lecture partielle — certains rounds ouverts n\'ont pas pu être lus on-chain.'}
+    let any=false;
+    for(const dimension of data.dimensions||[]){
+      for(const round of dimension.rounds||[]){
+        any=true;
+        const submissions=round.submissions||[];
+        const detail=submissions.map(s=>`${shortAccount(s.validator)} · ${(s.score_bps/100).toFixed(2)} % · ${s.sample_count} éch.`).join(' | ')||'aucune soumission';
+        const awaiting=(round.awaiting_response||[]).map(shortAccount).join(', ')||'—';
+        const committee=round.committee_stale?`${(round.committee||[]).length} (indicatif)`:String((round.committee||[]).length);
+        rows.append(row([dimension.dimension,round.round,`${submissions.length}/${round.quorum_required}`,round.quorum_reached?'atteint':'pas encore',awaiting,committee,detail]));
+      }
+    }
+    // An empty list has two very different causes: nothing is pending, or
+    // the challenge protocol is inert because no validator is active at
+    // all. Saying "no open round" in the second case would read as "all
+    // clear" when in fact nothing can be assigned or closed.
+    if(!any&&!data.partial){
+      warning.hidden=false;
+      warning.textContent=data.active_validators===0
+        ?'Aucun Network Validator actif on-chain : aucun round ne peut être assigné ni clos pour ce provider.'
+        :'Aucun round en attente pour ce provider dans la fenêtre récente.';
+    }
+  }catch(error){warning.hidden=false;warning.textContent='Impossible de charger les rounds ouverts.'}
+}
+function loadValidatorViews(){loadValidatorScores();loadOpenRounds()}
+$('score-load').addEventListener('click',loadValidatorViews);
+$('score-provider-id').addEventListener('keydown',e=>{if(e.key==='Enter')loadValidatorViews()});

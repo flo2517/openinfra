@@ -98,47 +98,14 @@ func (s *Server) validatorScores(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	providerID := r.PathValue("provider_id")
-	if providerID == "" || len(providerID) > maxProviderIDLength {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider_id is required and bounded"})
+	account, ok := s.providerOnChainAccount(ctx, w, providerID)
+	if !ok {
 		return
 	}
-
-	var publicKey []byte
-	err := s.pool.QueryRow(ctx, `SELECT public_key FROM providers WHERE provider_id=$1`, providerID).Scan(&publicKey)
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider not found"})
+	currentRound, ok := s.currentValidatorRound(ctx, w)
+	if !ok {
 		return
 	}
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "provider lookup unavailable"})
-		return
-	}
-	if len(publicKey) != ed25519.PublicKeySize {
-		// Same defensive check loadOverview applies before treating a
-		// provider's public_key as a 32-byte AccountId -- a corrupt or
-		// pre-migration row should not crash this endpoint.
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "provider has no usable on-chain identity"})
-		return
-	}
-	var account [32]byte
-	copy(account[:], publicKey)
-
-	head, err := s.chain.FinalizedHead(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "blockchain status unavailable"})
-		return
-	}
-	header, err := s.chain.HeaderAt(ctx, head)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "blockchain status unavailable"})
-		return
-	}
-	finalizedBlockNumber, err := header.BlockNumber()
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "blockchain status unavailable"})
-		return
-	}
-	currentRound := networkvalidator.RoundLength(networkvalidator.DefaultRoundLengthBlocks).Round(finalizedBlockNumber)
 
 	result := ValidatorScores{
 		ProviderID:   providerID,
@@ -168,6 +135,61 @@ func (s *Server) validatorScores(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// providerOnChainAccount resolves a path-parameter provider_id to the
+// 32-byte AccountId every pallet-network-validator read is keyed by,
+// writing the appropriate error response and returning false when it
+// cannot. Shared by every per-provider validator view so they answer a
+// bad, unknown, or unusable provider_id identically -- a client should
+// not have to learn which endpoint returns 400 vs 404 for the same input.
+func (s *Server) providerOnChainAccount(ctx context.Context, w http.ResponseWriter, providerID string) ([32]byte, bool) {
+	var account [32]byte
+	if providerID == "" || len(providerID) > maxProviderIDLength {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider_id is required and bounded"})
+		return account, false
+	}
+	var publicKey []byte
+	err := s.pool.QueryRow(ctx, `SELECT public_key FROM providers WHERE provider_id=$1`, providerID).Scan(&publicKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider not found"})
+		return account, false
+	}
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "provider lookup unavailable"})
+		return account, false
+	}
+	if len(publicKey) != ed25519.PublicKeySize {
+		// Same defensive check loadOverview applies before treating a
+		// provider's public_key as a 32-byte AccountId -- a corrupt or
+		// pre-migration row should not crash this endpoint.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "provider has no usable on-chain identity"})
+		return account, false
+	}
+	copy(account[:], publicKey)
+	return account, true
+}
+
+// currentValidatorRound derives the round number the finalized head falls
+// in, the same way internal/networkvalidator's own daemon does, writing
+// the error response and returning false when the chain is unreachable.
+func (s *Server) currentValidatorRound(ctx context.Context, w http.ResponseWriter) (uint64, bool) {
+	head, err := s.chain.FinalizedHead(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "blockchain status unavailable"})
+		return 0, false
+	}
+	header, err := s.chain.HeaderAt(ctx, head)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "blockchain status unavailable"})
+		return 0, false
+	}
+	finalizedBlockNumber, err := header.BlockNumber()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "blockchain status unavailable"})
+		return 0, false
+	}
+	return networkvalidator.RoundLength(networkvalidator.DefaultRoundLengthBlocks).Round(finalizedBlockNumber), true
 }
 
 func (s *Server) dimensionScoreHistory(ctx context.Context, account [32]byte, currentRound uint64, dimension blockchainbridge.ScoreDimension) (DimensionScoreHistory, bool) {
