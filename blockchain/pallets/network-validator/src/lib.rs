@@ -445,6 +445,17 @@ pub mod pallet {
         SelfScoringForbidden,
         /// This validator already submitted for this provider/round/dimension.
         DuplicateSubmission,
+        /// Another validator already submitted this exact `payload_hash`
+        /// for this round. Each challenge payload is freshly random per
+        /// validator (32 bytes from the OS CSPRNG, see
+        /// `internal/networkvalidator`'s `Challenge`/`runOneBandwidthProbe`),
+        /// so two honest validators cannot collide -- an identical hash
+        /// means the same evidence blob was reused, i.e. one validator
+        /// copied another's work instead of independently measuring.
+        /// Aggregating a copy as if it were corroboration is exactly what
+        /// the trimmed mean must not be fed (ADR-011 §2: weights are
+        /// aggregated on the assumption that they are *independent*).
+        CopiedEvidence,
         /// `MaxSubmissionsPerRound` reached for this round.
         TooManySubmissions,
         /// Scores are basis points and must be 0..=10_000.
@@ -651,6 +662,17 @@ pub mod pallet {
                     ensure!(
                         !submissions.iter().any(|entry| entry.validator == validator),
                         Error::<T>::DuplicateSubmission
+                    );
+                    // Independence is the premise the aggregate rests on,
+                    // so it is enforced, not assumed: a copied payload_hash
+                    // is a second vote cast from one measurement. Bounded
+                    // by MaxSubmissionsPerRound, the same vec the check
+                    // above already walks.
+                    ensure!(
+                        !submissions
+                            .iter()
+                            .any(|entry| entry.payload_hash == payload_hash),
+                        Error::<T>::CopiedEvidence
                     );
                     submissions
                         .try_push(Submission {

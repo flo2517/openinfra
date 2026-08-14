@@ -328,6 +328,17 @@ fn committee() -> Vec<u64> {
     NetworkValidator::committee(&PROVIDER, ROUND)
 }
 
+/// Each validator challenges with its own freshly random payload in
+/// production (`internal/networkvalidator`), so its `payload_hash` is its
+/// own. Deriving the test hash from the validator id keeps that property:
+/// a shared constant here would make every multi-validator test submit
+/// evidence that is, by the pallet's own definition, copied.
+fn payload_hash_for(validator: u64) -> [u8; 32] {
+    let mut hash = [0u8; 32];
+    hash[..8].copy_from_slice(&validator.to_le_bytes());
+    hash
+}
+
 fn submit(validator: u64, dimension: ScoreDimension, score: u16) -> sp_runtime::DispatchResult {
     NetworkValidator::submit_evidence(
         RuntimeOrigin::signed(validator),
@@ -336,7 +347,7 @@ fn submit(validator: u64, dimension: ScoreDimension, score: u16) -> sp_runtime::
         dimension,
         score,
         10,
-        [1; 32],
+        payload_hash_for(validator),
     )
 }
 
@@ -505,6 +516,53 @@ fn evidence_rejects_duplicate_replayed_and_out_of_range_submissions() {
         );
         // A different dimension in the same round is a separate slot.
         assert_ok!(submit(member, ScoreDimension::Storage, 9_000));
+    });
+}
+
+#[test]
+fn a_validator_cannot_submit_another_validators_evidence() {
+    new_test_ext().execute_with(|| {
+        register_validators(6);
+        let assigned = committee();
+        let (first, second) = (assigned[0], assigned[1]);
+
+        assert_ok!(submit(first, ScoreDimension::Compute, 5_000));
+
+        // A second, distinct, correctly-assigned validator submitting the
+        // *same* payload_hash did not measure anything: it reused the
+        // first validator's evidence blob. Payloads are 32 random bytes
+        // per challenge, so honest validators never collide -- accepting
+        // this would let one measurement count twice toward MinQuorum and
+        // toward the trimmed mean, which is precisely the independence
+        // assumption ADR-011 §2 aggregates under.
+        assert_noop!(
+            NetworkValidator::submit_evidence(
+                RuntimeOrigin::signed(second),
+                PROVIDER,
+                ROUND,
+                ScoreDimension::Compute,
+                5_000,
+                10,
+                payload_hash_for(first),
+            ),
+            crate::Error::<Test>::CopiedEvidence
+        );
+
+        // Its own evidence is still accepted: the rejection is about the
+        // copied payload, not about the validator.
+        assert_ok!(submit(second, ScoreDimension::Compute, 5_000));
+
+        // The same payload_hash in a *different* dimension is a different
+        // round slot and cannot be a copy of anything in this one.
+        assert_ok!(NetworkValidator::submit_evidence(
+            RuntimeOrigin::signed(second),
+            PROVIDER,
+            ROUND,
+            ScoreDimension::Storage,
+            5_000,
+            10,
+            payload_hash_for(first),
+        ));
     });
 }
 
@@ -694,7 +752,7 @@ fn a_dispute_rolls_reputation_back_to_the_pre_round_value() {
                 ScoreDimension::Compute,
                 3_000,
                 10,
-                [1; 32]
+                payload_hash_for(*member)
             ));
         }
         assert_ok!(NetworkValidator::close_round(
@@ -998,7 +1056,7 @@ fn a_slash_that_exhausts_stake_force_suspends_the_validator() {
                     ScoreDimension::Compute,
                     9_000,
                     10,
-                    [1; 32]
+                    payload_hash_for(*member)
                 ));
             }
             assert_ok!(NetworkValidator::close_round(
