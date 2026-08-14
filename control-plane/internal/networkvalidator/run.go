@@ -192,6 +192,16 @@ func challengeAndSubmit(ctx context.Context, cfg LoopConfig, key roundKey, done 
 		logger.Warn("networkvalidator: could not attempt challenge, will retry next tick", "error", err)
 		return
 	}
+	if result.Unscored {
+		// Judged nothing, so submit nothing. Writing either verdict would
+		// put a claim into consensus state that no measurement supports
+		// (see ChallengeResult.Unscored). Not marked done, so a later
+		// tick retries once the missing input -- currently only the
+		// provider's declared capacity, which arrives with its next
+		// heartbeat -- is available.
+		logger.Warn("networkvalidator: challenge unscored, submitting nothing", "reason", result.Reason)
+		return
+	}
 	logger.Info("networkvalidator: challenge scored", "score_bps", result.ScoreBps, "reason", result.Reason)
 
 	if err := cfg.Registrar.SubmitEvidence(ctx, key.provider, key.round, key.dimension, result.ScoreBps, result.SampleCount, result.PayloadHash); err != nil {

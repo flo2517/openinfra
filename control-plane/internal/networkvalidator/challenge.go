@@ -59,6 +59,23 @@ type ChallengeResult struct {
 	// bad signature vs. timeout) is exactly the auditability this whole
 	// loop exists for.
 	Reason string
+	// Unscored means this challenge could not be judged at all, as
+	// distinct from judged-and-failed (ScoreBps == failingScoreBps).
+	//
+	// The case that forced this distinction: MeasureBandwidth scores
+	// measured throughput against the provider's *own declared*
+	// capacity, and when no declared figure is available there is
+	// nothing to compare against. Scoring that as a pass writes a
+	// verified-looking 10_000 into consensus state on the strength of no
+	// verification at all -- precisely the false success ADR-011 forbids
+	// -- while scoring it as a fail would punish a provider for a gap in
+	// our own discovery data.
+	//
+	// Neither is honest, so an unscored result is not submitted: the
+	// round simply goes without this validator's evidence, which the
+	// quorum machinery and the dashboard already represent as
+	// under-attested rather than as a verdict.
+	Unscored bool
 }
 
 // passingScoreBps/failingScoreBps are pallet-network-validator's

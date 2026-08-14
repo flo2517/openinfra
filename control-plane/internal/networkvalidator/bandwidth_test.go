@@ -236,12 +236,20 @@ func TestMeasureBandwidthFailsTheWholeRoundIfAnySingleProbeFails(t *testing.T) {
 
 // passesBandwidthTolerance and estimateThroughputMbps are pure and cheap
 // to unit-test directly, independent of any real network round trip.
-func TestPassesBandwidthToleranceTreatsNonPositiveDeclaredAsAutoPass(t *testing.T) {
-	if !passesBandwidthTolerance(0, 0) {
-		t.Fatal("expected a non-positive declared figure to trivially pass")
-	}
-	if !passesBandwidthTolerance(0, -5) {
-		t.Fatal("expected a negative declared figure to trivially pass")
+//
+// A non-positive declared figure means there is nothing to verify
+// against. It used to return true here, which turned "we checked
+// nothing" into a full-marks pass written to chain. MeasureBandwidth now
+// classifies that case as unscored before this is reached, and this
+// function refuses it too, so the auto-pass cannot come back through
+// either door.
+func TestPassesBandwidthToleranceRefusesAnUnverifiableDeclaredFigure(t *testing.T) {
+	for _, declared := range []int32{0, -5} {
+		// Even a wildly high measurement must not pass: the point is that
+		// there is no claim to check it against, not that the link is slow.
+		if passesBandwidthTolerance(10_000, declared) {
+			t.Errorf("declared=%d: expected no pass when there is nothing to verify against", declared)
+		}
 	}
 }
 
@@ -275,5 +283,51 @@ func TestEstimateThroughputMbpsSplitsProportionallyBySize(t *testing.T) {
 	}
 	if egressOnly != 0 {
 		t.Fatalf("expected exactly zero egress throughput when downloadBytes is 0, got %v", egressOnly)
+	}
+}
+
+// An undeclared capacity must produce an explicitly unscored result, not
+// a pass. Scoring it as a pass wrote 10_000 basis points into consensus
+// state on the strength of no verification at all, which is the false
+// success ADR-011 exists to prevent -- and it was reachable simply by a
+// provider never heartbeating its ResourceCapability.Bandwidth.
+//
+// Failing it instead would be the opposite error: punishing a provider
+// for a gap in the Control Plane's own discovery data.
+func TestMeasureBandwidthIsUnscoredWithoutADeclaredCapacity(t *testing.T) {
+	cases := map[string]struct{ ingress, egress int32 }{
+		"neither direction declared": {0, 0},
+		"only ingress declared":      {1, 0},
+		"only egress declared":       {0, 1},
+		"negative figure":            {-1, 1},
+	}
+	for name, declared := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("generate agent key: %v", err)
+			}
+			harness := startTestAgentHarness(t, &fakeAgentServer{
+				privateKey:          agentPriv,
+				declaredIngressMbps: declared.ingress,
+				declaredEgressMbps:  declared.egress,
+			})
+			defer harness.close()
+
+			client := newChallengeClient(t, harness)
+			result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+			if err != nil {
+				t.Fatalf("MeasureBandwidth: %v", err)
+			}
+			if !result.Unscored {
+				t.Fatalf("Unscored = false (ScoreBps=%d, reason=%q); an unverifiable measurement must not be scored",
+					result.ScoreBps, result.Reason)
+			}
+			// Belt and braces: a caller that ignores Unscored must not
+			// find a passing score sitting in the result either.
+			if result.ScoreBps == passingScoreBps {
+				t.Fatalf("ScoreBps = %d on an unscored result", result.ScoreBps)
+			}
+		})
 	}
 }
