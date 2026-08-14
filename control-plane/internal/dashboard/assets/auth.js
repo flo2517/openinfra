@@ -9,6 +9,15 @@
 // backing and is only as safe as this browser profile. It proves the
 // same protocol end to end; it is not presented as equivalent to a real
 // wallet extension or hardware key.
+//
+// Everything below is wrapped in an IIFE because classic <script>s share
+// one global lexical environment: a top-level `const` here collides with
+// the same name in app.js, and a collision is not a warning -- it is a
+// redeclaration SyntaxError that stops the *other* script from running at
+// all. That outage happened (this file's `$` versus app.js's) and was
+// invisible to every server-side test. Function scope makes it
+// impossible; assets_browser_harness.js keeps it that way.
+(() => {
 const $ = id => document.getElementById(id);
 
 const LOCAL_KEY_STORAGE = 'openinfra_wallet_key';
@@ -152,3 +161,4 @@ async function init() {
 }
 
 init();
+})();

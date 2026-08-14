@@ -1,3 +1,9 @@
+// Wrapped in an IIFE for the reason spelled out at the top of auth.js:
+// classic scripts share one global lexical environment, so a top-level
+// `const` here and in auth.js is a redeclaration SyntaxError that stops
+// this file from executing at all -- which is exactly what silently took
+// this dashboard offline once. Function scope removes the hazard.
+(() => {
 const $=id=>document.getElementById(id);let active;
 function text(id,value){$(id).textContent=value}
 function status(value){const span=document.createElement('span');span.className=`status ${value}`;span.textContent=value;return span}
@@ -166,3 +172,4 @@ async function loadOpenRounds(){
 function loadValidatorViews(){loadValidatorScores();loadOpenRounds()}
 $('score-load').addEventListener('click',loadValidatorViews);
 $('score-provider-id').addEventListener('keydown',e=>{if(e.key==='Enter')loadValidatorViews()});
+})();
