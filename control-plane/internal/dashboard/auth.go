@@ -127,6 +127,46 @@ func (s *Server) authIssueAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"api_key": key.Raw, "key_id": key.KeyID})
 }
 
+// SessionIdentity is GET /api/v1/me's response body: who the presented
+// credential belongs to, and which ADR-016 tier it holds.
+type SessionIdentity struct {
+	UserID string `json:"user_id"`
+	Role   string `json:"role"`
+}
+
+// authMe answers "who am I, and what am I allowed to see" for the
+// credential on this request. The dashboard client needs it to decide
+// whether to render the operator panel at all: without it the client's
+// only way to discover its own tier is to fire a request at an
+// operator-gated endpoint and read the status code, which cannot tell
+// "you are a tenant" (403) apart from "Postgres is down" (503).
+//
+// This is a rendering hint, never an authorization decision. Every
+// operator route stays gated server-side by requireRole; a client that
+// lies to itself about its role gets 403s from the endpoints, not data.
+//
+// Deliberately NOT wrapped in requireRole(RoleTenant), even though every
+// valid role satisfies it: RoleSatisfies fails closed on a role it does
+// not recognize, so a user whose role somehow fell outside the known set
+// would get a 403 here and the client could not distinguish that from
+// "not logged in". Answering with the role we actually hold lets the UI
+// say "your account has no operator access" instead of breaking.
+//
+// The role is read fresh per request rather than baked into the login
+// response, so an operator grant (or revocation) through
+// cmd/controlplane-admin takes effect on the next page load instead of
+// waiting for the user's session to expire.
+func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	user, ok := s.authenticatedUser(ctx, r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		return
+	}
+	writeJSON(w, http.StatusOK, SessionIdentity{UserID: user.UserID, Role: user.Role})
+}
+
 func (s *Server) authenticatedUserID(ctx context.Context, r *http.Request) (string, bool) {
 	user, ok := s.authenticatedUser(ctx, r)
 	if !ok {

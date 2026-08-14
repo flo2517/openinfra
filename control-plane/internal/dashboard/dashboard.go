@@ -207,6 +207,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/challenge", s.authChallenge)
 	mux.HandleFunc("POST /api/v1/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/v1/auth/api-keys", s.authIssueAPIKey)
+	mux.HandleFunc("GET /api/v1/me", s.authMe)
 	mux.HandleFunc("GET /api/v1/agent-endpoint/{provider_id}", s.agentEndpoint)
 	mux.HandleFunc("GET /api/v1/validator-scores/{provider_id}", s.validatorScores)
 	mux.HandleFunc("GET /api/v1/validator/health", s.validatorHealth)
