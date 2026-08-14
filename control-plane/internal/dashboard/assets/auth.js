@@ -57,6 +57,41 @@ async function getOrCreateLocalKey() {
   return { privateKey: pair.privateKey, publicKeyHex: toHex(rawPublic) };
 }
 
+// The session bridge other asset scripts read. Each script is now
+// function-scoped (see the IIFE note above), so this one explicit
+// window-level surface is how the operator panel learns there is a
+// session at all -- deliberately narrower than exporting the whole
+// module: a reader gets the key and a change notification, nothing that
+// would let it mint, mutate, or extend one.
+//
+// Sharing the sessionStorage key name across files instead would put the
+// same magic string in two places and let them drift apart silently.
+const sessionListeners = [];
+window.openinfraSession = {
+  // Returns null for an absent OR expired session, so a caller never has
+  // to re-derive the expiry rule (and cannot forget to).
+  key() {
+    const key = sessionStorage.getItem(SESSION_KEY_STORAGE);
+    const expiry = sessionStorage.getItem(SESSION_EXPIRY_STORAGE);
+    if (!key || !expiry || new Date(expiry) <= new Date()) return null;
+    return key;
+  },
+  onChange(listener) {
+    sessionListeners.push(listener);
+  },
+};
+
+function announceSession() {
+  for (const listener of sessionListeners) {
+    // One listener throwing must not stop the others from being told.
+    try {
+      listener();
+    } catch (error) {
+      console.error('session listener failed', error);
+    }
+  }
+}
+
 function renderLoggedIn(account, expiresAt) {
   $('auth-logged-out').hidden = true;
   $('auth-logged-in').hidden = false;
@@ -103,12 +138,14 @@ async function login() {
   sessionStorage.setItem(SESSION_KEY_STORAGE, session.session_key);
   sessionStorage.setItem(SESSION_EXPIRY_STORAGE, session.expires_at);
   renderLoggedIn(key.publicKeyHex, session.expires_at);
+  announceSession();
 }
 
 function logout() {
   sessionStorage.removeItem(SESSION_KEY_STORAGE);
   sessionStorage.removeItem(SESSION_EXPIRY_STORAGE);
   renderLoggedOut();
+  announceSession();
 }
 
 async function issueAPIKey() {
