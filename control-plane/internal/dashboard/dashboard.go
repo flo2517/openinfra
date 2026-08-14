@@ -212,6 +212,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/validator-scores/{provider_id}", s.validatorScores)
 	mux.HandleFunc("GET /api/v1/validator/health", s.validatorHealth)
 	mux.HandleFunc("GET /api/v1/validator/rounds/{provider_id}", s.validatorRounds)
+	mux.HandleFunc("GET /api/v1/provider/{provider_id}/onchain", s.providerOnChain)
 	mux.HandleFunc("GET /api/v1/my/workloads", s.requireRole(userauth.RoleTenant, s.myWorkloads))
 	mux.HandleFunc("GET /api/v1/my/workloads/{workload_id}", s.requireRole(userauth.RoleTenant, s.myWorkload))
 	mux.HandleFunc("POST /api/v1/my/workloads/{workload_id}/stop", s.requireRole(userauth.RoleTenant, s.stopMyWorkload))
