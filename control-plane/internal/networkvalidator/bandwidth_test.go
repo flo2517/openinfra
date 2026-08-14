@@ -331,3 +331,44 @@ func TestMeasureBandwidthIsUnscoredWithoutADeclaredCapacity(t *testing.T) {
 		})
 	}
 }
+
+// ADR-025 §5's asymmetric-link case: a link that clears the tolerance in
+// one direction and fails it in the other must score 0, not an averaged
+// partial pass. The two directions are scored independently and the round
+// fails if either does -- a provider that delivers its promised download
+// while failing its promised upload has not delivered what it advertised.
+func TestMeasureBandwidthFailsAnAsymmetricLinkInEitherDirection(t *testing.T) {
+	// One direction declared at 1 Mbps (any loopback clears it), the other
+	// at 100 Pbps (nothing clears it).
+	cases := map[string]struct{ ingress, egress int32 }{
+		"egress unattainable":  {1, 100_000_000},
+		"ingress unattainable": {100_000_000, 1},
+	}
+	for name, declared := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("generate agent key: %v", err)
+			}
+			harness := startTestAgentHarness(t, &fakeAgentServer{
+				privateKey:          agentPriv,
+				declaredIngressMbps: declared.ingress,
+				declaredEgressMbps:  declared.egress,
+			})
+			defer harness.close()
+
+			client := newChallengeClient(t, harness)
+			result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+			if err != nil {
+				t.Fatalf("MeasureBandwidth: %v", err)
+			}
+			if result.Unscored {
+				t.Fatalf("Unscored = true; both directions were declared, so this is judgeable (reason=%q)", result.Reason)
+			}
+			if result.ScoreBps != failingScoreBps {
+				t.Fatalf("ScoreBps = %d, want %d: one failing direction must fail the round outright, never average to a partial pass (reason=%q)",
+					result.ScoreBps, failingScoreBps, result.Reason)
+			}
+		})
+	}
+}
