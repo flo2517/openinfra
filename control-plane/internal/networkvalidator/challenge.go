@@ -75,6 +75,12 @@ type ChallengeResult struct {
 	// round simply goes without this validator's evidence, which the
 	// quorum machinery and the dashboard already represent as
 	// under-attested rather than as a verdict.
+	//
+	// Callers must check Unscored before reading ScoreBps: an unscored
+	// result leaves ScoreBps at its zero value, numerically identical to
+	// failingScoreBps. Today's only caller (challengeAndSubmit) already
+	// checks Unscored first and never reads ScoreBps otherwise -- this
+	// comment is for the next one.
 	Unscored bool
 }
 

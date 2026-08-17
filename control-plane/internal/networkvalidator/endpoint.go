@@ -28,10 +28,15 @@ type AgentEndpoint struct {
 	// 0 when the dashboard has no fresh heartbeat capability data for
 	// this provider yet (see internal/dashboard/agentendpoint.go's
 	// declaredBandwidth) -- indistinguishable here from "provider
-	// declared 0 Mbps"; MeasureBandwidth's tolerance check treats a
-	// non-positive declared figure as "nothing to verify against" either
-	// way, so this ambiguity does not silently fail a provider that
-	// simply hasn't heartbeated its capability yet.
+	// declared 0 Mbps". Either way, MeasureBandwidth treats a non-positive
+	// declared figure as "nothing to verify against" and returns
+	// ChallengeResult.Unscored instead of a tolerance verdict -- not a
+	// silent pass (the original bug this field's ambiguity caused) and
+	// not a silent fail either. That guard applies whether or not the
+	// probe itself succeeds: a provider with no declared capacity gets
+	// Unscored even if its Agent is also unreachable, never a permanent
+	// failing score for a judgement that was never possible in the first
+	// place.
 	DeclaredIngressMbps int32
 	DeclaredEgressMbps  int32
 }

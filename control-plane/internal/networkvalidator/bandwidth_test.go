@@ -332,6 +332,43 @@ func TestMeasureBandwidthIsUnscoredWithoutADeclaredCapacity(t *testing.T) {
 	}
 }
 
+// A provider with no declared capacity must get Unscored even when its
+// Agent's response also fails verification -- the two conditions are
+// independent, and Unscored must win regardless of which one a given
+// probe happens to hit. Before this, a failed probe returned a permanent
+// failingScoreBps immediately, without ever reaching the declared-
+// capacity check below it: exactly the case this test pins.
+func TestMeasureBandwidthIsUnscoredEvenWhenAProbeAlsoFails(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey:            agentPriv,
+		declaredIngressMbps:   0, // no declared capacity: nothing to verify against
+		declaredEgressMbps:    0,
+		tamperBandwidthOnCall: 1, // the very first probe also fails verification
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClient(t, harness)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if !result.Unscored {
+		t.Fatalf("Unscored = false (ScoreBps=%d, reason=%q); an undeclared provider must never get a permanent failing score just because a probe also failed",
+			result.ScoreBps, result.Reason)
+	}
+	// Belt and braces, mirroring TestMeasureBandwidthIsUnscoredWithout-
+	// ADeclaredCapacity: a caller that ignores Unscored must not find a
+	// passing score sitting in the result either.
+	if result.ScoreBps == passingScoreBps {
+		t.Fatalf("ScoreBps = %d on an unscored result", result.ScoreBps)
+	}
+}
+
 // ADR-025 §5's asymmetric-link case: a link that clears the tolerance in
 // one direction and fails it in the other must score 0, not an averaged
 // partial pass. The two directions are scored independently and the round

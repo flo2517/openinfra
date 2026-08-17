@@ -96,6 +96,19 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 		probes = DefaultBandwidthProbesPerRound
 	}
 
+	// Nothing to score against is not a pass -- and, just as importantly,
+	// not a fail either. Both directions are checked because a provider
+	// declaring only one of them still leaves the other unverifiable, and
+	// a result that verified half of what it claims to verify should not
+	// be submitted as a full pass. Captured once up front, before the
+	// probe loop, so this verdict is not at the mercy of *how* a probe
+	// turns out: a provider with no declared capacity must get Unscored
+	// even when a probe also fails outright (unreachable Agent, bad
+	// signature) -- there was never a judgement to make in the first
+	// place, so a transient network hiccup on top of that must not turn
+	// into a permanent, on-chain failing score. See the loop below.
+	capacityDeclared := endpoint.DeclaredIngressMbps > 0 && endpoint.DeclaredEgressMbps > 0
+
 	var minIngress, minEgress float64
 	var lastPayloadHash [32]byte
 	for i := 0; i < probes; i++ {
@@ -105,6 +118,16 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 		}
 		lastPayloadHash = outcome.payloadHash
 		if outcome.failed {
+			if !capacityDeclared {
+				return ChallengeResult{
+					Unscored:    true,
+					PayloadHash: outcome.payloadHash,
+					Reason: fmt.Sprintf(
+						"unscored: no declared capacity to verify against (declared ingress=%dMbps, egress=%dMbps); probe %d/%d also failed: %s",
+						endpoint.DeclaredIngressMbps, endpoint.DeclaredEgressMbps, i+1, probes, outcome.reason,
+					),
+				}, nil
+			}
 			return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: outcome.payloadHash, Reason: fmt.Sprintf("probe %d/%d: %s", i+1, probes, outcome.reason)}, nil
 		}
 		if i == 0 || outcome.ingressMbps < minIngress {
@@ -115,11 +138,7 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 		}
 	}
 
-	// Nothing to score against is not a pass. Both directions are checked
-	// because a provider declaring only one of them still leaves the
-	// other unverifiable, and a result that verified half of what it
-	// claims to verify should not be submitted as a full pass.
-	if endpoint.DeclaredIngressMbps <= 0 || endpoint.DeclaredEgressMbps <= 0 {
+	if !capacityDeclared {
 		return ChallengeResult{
 			Unscored:    true,
 			PayloadHash: lastPayloadHash,
