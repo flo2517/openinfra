@@ -233,6 +233,91 @@ func TestRankIgnoresBandwidthEntirelyWhenNotRequested(t *testing.T) {
 	}
 }
 
+func TestRankAppliesWireGuardOverheadOnlyWhenOverlayEnabled(t *testing.T) {
+	// Both candidates declare exactly the requested bandwidth (a tight
+	// fit). Without overlay accounting that is a perfect 10_000bps fit;
+	// with it, the requirement can no longer be fully covered by the raw
+	// total once WireGuard's overhead is taken into account.
+	requirements := &sharedv1.ResourceRequirements{
+		Cpu: 1, RamMb: 512,
+		Bandwidth: &sharedv1.Bandwidth{IngressMbps: 1000, EgressMbps: 1000},
+	}
+	candidates := []Candidate{
+		{ProviderID: "a", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096, IngressTotalMbps: 1000, EgressTotalMbps: 1000},
+	}
+
+	overlayOff := testRanker()
+	withoutOverlay := overlayOff.Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, candidates)
+	if withoutOverlay.Selected == nil {
+		t.Fatalf("expected a selection with overlay disabled, got %+v", withoutOverlay.Excluded)
+	}
+	if withoutOverlay.Selected.ResourceFitBps != 10_000 {
+		t.Fatalf("overlay disabled: expected a full 10_000bps resource fit, got %d", withoutOverlay.Selected.ResourceFitBps)
+	}
+
+	overlayOn := testRanker()
+	overlayOn.SetWireGuardOverlayEnabled(true)
+	withOverlay := overlayOn.Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, candidates)
+	if len(withOverlay.Ranked) != 0 || withOverlay.Selected != nil {
+		t.Fatalf("overlay enabled: expected the tight-fit candidate excluded once overhead is accounted for, got selected=%+v ranked=%+v", withOverlay.Selected, withOverlay.Ranked)
+	}
+	found := false
+	for _, e := range withOverlay.Excluded {
+		if e.ProviderID == "a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected candidate 'a' excluded for insufficient bandwidth once overhead is accounted for, got %+v", withOverlay.Excluded)
+	}
+}
+
+func TestRankAppliesWireGuardOverheadToBothIngressAndEgressConsistently(t *testing.T) {
+	// A candidate with generous headroom on both directions should still
+	// fit once overhead shaves a fixed fraction off both, and the two
+	// fit scores should move together (same formula applied to each).
+	requirements := &sharedv1.ResourceRequirements{
+		Cpu: 1, RamMb: 512,
+		Bandwidth: &sharedv1.Bandwidth{IngressMbps: 900, EgressMbps: 900},
+	}
+	candidates := []Candidate{
+		{ProviderID: "a", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096, IngressTotalMbps: 1000, EgressTotalMbps: 1000},
+	}
+	ranker := testRanker()
+	ranker.SetWireGuardOverlayEnabled(true)
+	decision := ranker.Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, candidates)
+	if decision.Selected == nil {
+		t.Fatalf("expected a selection, got excluded=%+v", decision.Excluded)
+	}
+	// 1000 * (1500-60)/1500 = 960 effective Mbps in each direction; against
+	// a 900 requirement that is fitBps(960, 900) = 960*10_000/900, clamped
+	// to 10_000 -- still a fit, just with less headroom than the raw total
+	// would suggest, and identical for both directions since the same
+	// formula and inputs apply to ingress and egress alike.
+	if decision.Selected.ResourceFitBps != 10_000 {
+		t.Fatalf("expected the candidate to still fit both directions with headroom to spare, got ResourceFitBps=%d", decision.Selected.ResourceFitBps)
+	}
+}
+
+func TestWireGuardEffectiveMbpsIsExactIntegerArithmeticWithNoOverflowOrNegativeSurprises(t *testing.T) {
+	cases := []struct {
+		totalMbps int64
+		want      int64
+	}{
+		{totalMbps: 0, want: 0},
+		{totalMbps: -5, want: -5}, // defensively unchanged, never produced in practice
+		{totalMbps: 1500, want: 1440},
+		{totalMbps: 1000, want: 960},
+		{totalMbps: 1, want: 0}, // rounds down to zero rather than negative or fractional
+	}
+	for _, c := range cases {
+		got := wireGuardEffectiveMbps(c.totalMbps)
+		if got != c.want {
+			t.Errorf("wireGuardEffectiveMbps(%d) = %d, want %d", c.totalMbps, got, c.want)
+		}
+	}
+}
+
 func TestRankUsesFallbackWeightsForAnUnknownProfile(t *testing.T) {
 	requirements := &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 512}
 	candidates := []Candidate{

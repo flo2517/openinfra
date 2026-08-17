@@ -65,6 +65,26 @@ var DefaultProfileWeights = map[sharedv1.WorkloadProfile]ProfileWeights{
 	},
 }
 
+// WireGuardOverheadBytes is the per-packet cost a lease-gated WireGuard
+// overlay adds on top of a standard Ethernet MTU: a 20-byte outer IPv4
+// header + an 8-byte UDP header + WireGuard's own 32-byte header = 60
+// bytes (see docs/adr/015-bandwidth-throughput-measurement.md's
+// "Consequences" section and issue #73). IPv6's larger address fields push
+// this higher, but nothing on the wire today tells the scheduler whether a
+// given workload's traffic will be IPv4 or IPv6, so this uses the IPv4
+// figure as a documented, conservative approximation rather than inventing
+// a worst case.
+//
+// DefaultOverlayMTUBytes is the standard Ethernet MTU the overhead is taken
+// out of. Together the two model the *fraction* of a link's raw capacity
+// that survives encapsulation, (mtu-overhead)/mtu -- never an invented
+// absolute "available bandwidth" figure, matching the honest-signal
+// philosophy documented on Candidate above.
+const (
+	WireGuardOverheadBytes = 60
+	DefaultOverlayMTUBytes = 1500
+)
+
 // DefaultMaxReputationScore and DefaultDefaultReputationScore match
 // blockchain/runtime/src/lib.rs's MaxReputation/DefaultReputation
 // parameter_types! as of ADR-011. Passed explicitly at NewRanker's call
@@ -144,6 +164,15 @@ type Ranker struct {
 	Weights                map[sharedv1.WorkloadProfile]ProfileWeights
 	MaxReputationScore     uint32
 	DefaultReputationScore uint32
+
+	// WireGuardOverlayEnabled mirrors orchestrator.Worker's own overlay
+	// on/off state (see Worker.SetOverlay's doc comment): today the overlay
+	// is an all-or-nothing, deployment-wide setting -- every DEPLOYING
+	// workload gets OverlayManager.Attach called when the worker has one
+	// configured, there is no per-workload opt-out yet. That is exactly the
+	// same condition this field gates, so it is not an approximation of a
+	// per-workload signal, it *is* the signal, until one exists.
+	WireGuardOverlayEnabled bool
 }
 
 // NewRanker returns a Ranker using DefaultProfileWeights and the same
@@ -156,6 +185,14 @@ type Ranker struct {
 func NewRanker(maxReputationScore, defaultReputationScore uint32) *Ranker {
 	return &Ranker{Weights: DefaultProfileWeights, MaxReputationScore: maxReputationScore, DefaultReputationScore: defaultReputationScore}
 }
+
+// SetWireGuardOverlayEnabled turns on WireGuard overhead accounting in
+// bandwidth fit-scoring (see scoreOne). It is a setter, not a constructor
+// argument, for the same reason Worker.SetOverlay is one: it keeps every
+// ranker constructed today (tests, and any deployment without
+// WIREGUARD_INTERFACE set) behaving exactly as before -- callers must
+// opt in explicitly once the overlay is actually configured.
+func (r *Ranker) SetWireGuardOverlayEnabled(enabled bool) { r.WireGuardOverlayEnabled = enabled }
 
 // Rank scores every candidate against requirements/constraints for
 // profile, excluding anything stale, incompatible, or insufficient
@@ -234,11 +271,24 @@ func (r *Ranker) scoreOne(
 	resourceFitCount := uint32(3)
 	var bandwidthFitBps uint32
 	if bandwidth := requirements.Bandwidth; bandwidth != nil && (bandwidth.IngressMbps > 0 || bandwidth.EgressMbps > 0) {
-		ingressFitBps, ok := fitBps(candidate.IngressTotalMbps, int64(bandwidth.IngressMbps))
+		// The declared interface total is the raw, unencapsulated figure
+		// (see Candidate's doc comment). When this workload's traffic will
+		// actually transit the WireGuard overlay, only the post-overhead
+		// fraction of that total is usable, so fit-scoring must compare the
+		// requirement against the *effective* figure, not the raw one --
+		// otherwise a provider whose raw capacity just barely covers the
+		// requirement would be scored as fitting when the workload will, in
+		// practice, never see that much throughput.
+		ingressAvailable, egressAvailable := candidate.IngressTotalMbps, candidate.EgressTotalMbps
+		if r.WireGuardOverlayEnabled {
+			ingressAvailable = wireGuardEffectiveMbps(ingressAvailable)
+			egressAvailable = wireGuardEffectiveMbps(egressAvailable)
+		}
+		ingressFitBps, ok := fitBps(ingressAvailable, int64(bandwidth.IngressMbps))
 		if !ok {
 			return Score{}, true, "insufficient ingress bandwidth"
 		}
-		egressFitBps, ok := fitBps(candidate.EgressTotalMbps, int64(bandwidth.EgressMbps))
+		egressFitBps, ok := fitBps(egressAvailable, int64(bandwidth.EgressMbps))
 		if !ok {
 			return Score{}, true, "insufficient egress bandwidth"
 		}
@@ -328,6 +378,21 @@ func fitBps(available, required int64) (bps uint32, ok bool) {
 		ratio = 10_000
 	}
 	return uint32(ratio), true
+}
+
+// wireGuardEffectiveMbps scales a declared raw-interface bandwidth figure
+// down by WireGuard's fixed per-packet overhead, expressed as the fraction
+// of a standard MTU that survives encapsulation:
+// effective = total * (mtu - overhead) / mtu. Integer division mirrors the
+// rest of this file's basis-point arithmetic -- no float, and the same
+// input always produces the same output on any machine. A non-positive
+// input (0, or a value that should never occur in practice) is returned
+// unchanged rather than risking a negative or divide-by-zero result.
+func wireGuardEffectiveMbps(totalMbps int64) int64 {
+	if totalMbps <= 0 {
+		return totalMbps
+	}
+	return totalMbps * (DefaultOverlayMTUBytes - WireGuardOverheadBytes) / DefaultOverlayMTUBytes
 }
 
 // cpuMillicores converts a float32 core count (as received on the wire in
