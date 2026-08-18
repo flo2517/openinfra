@@ -9,6 +9,15 @@
 // backing and is only as safe as this browser profile. It proves the
 // same protocol end to end; it is not presented as equivalent to a real
 // wallet extension or hardware key.
+//
+// Everything below is wrapped in an IIFE because classic <script>s share
+// one global lexical environment: a top-level `const` here collides with
+// the same name in app.js, and a collision is not a warning -- it is a
+// redeclaration SyntaxError that stops the *other* script from running at
+// all. That outage happened (this file's `$` versus app.js's) and was
+// invisible to every server-side test. Function scope makes it
+// impossible; assets_browser_harness.js keeps it that way.
+(() => {
 const $ = id => document.getElementById(id);
 
 const LOCAL_KEY_STORAGE = 'openinfra_wallet_key';
@@ -46,6 +55,41 @@ async function getOrCreateLocalKey() {
   localStorage.setItem(LOCAL_KEY_STORAGE, JSON.stringify(jwk));
   const rawPublic = await crypto.subtle.exportKey('raw', pair.publicKey);
   return { privateKey: pair.privateKey, publicKeyHex: toHex(rawPublic) };
+}
+
+// The session bridge other asset scripts read. Each script is now
+// function-scoped (see the IIFE note above), so this one explicit
+// window-level surface is how the operator panel learns there is a
+// session at all -- deliberately narrower than exporting the whole
+// module: a reader gets the key and a change notification, nothing that
+// would let it mint, mutate, or extend one.
+//
+// Sharing the sessionStorage key name across files instead would put the
+// same magic string in two places and let them drift apart silently.
+const sessionListeners = [];
+window.openinfraSession = {
+  // Returns null for an absent OR expired session, so a caller never has
+  // to re-derive the expiry rule (and cannot forget to).
+  key() {
+    const key = sessionStorage.getItem(SESSION_KEY_STORAGE);
+    const expiry = sessionStorage.getItem(SESSION_EXPIRY_STORAGE);
+    if (!key || !expiry || new Date(expiry) <= new Date()) return null;
+    return key;
+  },
+  onChange(listener) {
+    sessionListeners.push(listener);
+  },
+};
+
+function announceSession() {
+  for (const listener of sessionListeners) {
+    // One listener throwing must not stop the others from being told.
+    try {
+      listener();
+    } catch (error) {
+      console.error('session listener failed', error);
+    }
+  }
 }
 
 function renderLoggedIn(account, expiresAt) {
@@ -94,12 +138,14 @@ async function login() {
   sessionStorage.setItem(SESSION_KEY_STORAGE, session.session_key);
   sessionStorage.setItem(SESSION_EXPIRY_STORAGE, session.expires_at);
   renderLoggedIn(key.publicKeyHex, session.expires_at);
+  announceSession();
 }
 
 function logout() {
   sessionStorage.removeItem(SESSION_KEY_STORAGE);
   sessionStorage.removeItem(SESSION_EXPIRY_STORAGE);
   renderLoggedOut();
+  announceSession();
 }
 
 async function issueAPIKey() {
@@ -152,3 +198,4 @@ async function init() {
 }
 
 init();
+})();

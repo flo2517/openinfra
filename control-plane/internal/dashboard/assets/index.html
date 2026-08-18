@@ -57,6 +57,18 @@
       <div id="rounds-warning" class="warning" role="alert" hidden></div>
       <div class="table-wrap" role="region" tabindex="0" aria-label="Rounds ouverts et file de challenges (zone défilable)"><table><caption class="sr-only">Rounds de challenge encore ouverts pour le provider recherché, par dimension</caption><thead><tr><th scope="col">Dimension</th><th scope="col">Round</th><th scope="col">Soumissions</th><th scope="col">Quorum</th><th scope="col">En attente</th><th scope="col">Comité</th><th scope="col">Détail des soumissions</th></tr></thead><tbody id="rounds-rows"></tbody></table></div>
     </section>
+    <section class="panel" id="provider-onchain-panel">
+      <div class="panel-head"><div><span class="eyebrow">PROVIDER · ON-CHAIN</span><h2>Gains et preuves de disponibilité</h2></div></div>
+      <p class="muted">Chargé avec le même identifiant de provider que les tableaux ci-dessus. Points de récompense (pallet-rewards) et dernière preuve de disponibilité soumise (pallet-availability), lus au même bloc finalisé. « Lecture indisponible » n'est pas « zéro » : une source illisible le dit.</p>
+      <div id="onchain-warning" class="warning" role="alert" hidden></div>
+      <dl class="cards">
+        <div><dt>Points de récompense</dt><dd><strong id="onchain-points">—</strong><small>pallet-rewards</small></dd></div>
+        <div><dt>Disponibilité prouvée</dt><dd><strong id="onchain-availability">—</strong><small>dernière preuve</small></dd></div>
+        <div><dt>Échantillons</dt><dd><strong id="onchain-samples">—</strong><small>réussis / total</small></dd></div>
+        <div><dt>Séquence</dt><dd><strong id="onchain-sequence">—</strong><small id="onchain-observed">—</small></dd></div>
+      </dl>
+      <p class="muted">Empreinte de la charge attestée : <code id="onchain-hash">—</code></p>
+    </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">PROVIDERS</span><h2>État du réseau</h2></div><button id="refresh" type="button">Actualiser</button></div>
       <div id="warning" class="warning" role="alert" hidden></div>
       <div class="table-wrap" role="region" tabindex="0" aria-label="Providers enregistrés (zone défilable)"><table><caption class="sr-only">Providers enregistrés, les plus récents en premier</caption><thead><tr><th scope="col">Provider</th><th scope="col">État durable</th><th scope="col">Connexion</th><th scope="col">Agent</th><th scope="col">CPU</th><th scope="col">RAM</th><th scope="col">Stockage</th><th scope="col">Bande passante</th><th scope="col">Réputation</th><th scope="col">Offre on-chain</th><th scope="col">On-chain</th></tr></thead><tbody id="providers"></tbody></table></div>
@@ -66,8 +78,36 @@
         <button id="providers-next" type="button">Suivant →</button>
       </div>
     </section>
+    <section class="panel" id="operator-panel" hidden>
+      <div class="panel-head"><div><span class="eyebrow">OPERATOR</span><h2>Exploitation</h2></div><button id="operator-refresh" type="button">Actualiser</button></div>
+      <p class="muted">Réservé aux comptes de rôle <code>operator_readonly</code> ou supérieur (ADR-016). L'affichage de ce panneau n'accorde aucun droit : chaque source ci-dessous reste gatée côté serveur.</p>
+
+      <h3 id="operator-health-title">Dépendances et alertes</h3>
+      <div id="operator-health-warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-labelledby="operator-health-title"><table><caption class="sr-only">État des dépendances du Control Plane</caption><thead><tr><th scope="col">Dépendance</th><th scope="col">État</th><th scope="col">Latence</th><th scope="col">Détail</th></tr></thead><tbody id="operator-dependencies"></tbody></table></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Alertes opérateur actives (zone défilable)"><table><caption class="sr-only">Alertes actives, avec leur gravité et la source dont elles sont dérivées</caption><thead><tr><th scope="col">Gravité</th><th scope="col">Alerte</th><th scope="col">Occurrences</th><th scope="col">Source</th></tr></thead><tbody id="operator-alerts"></tbody></table></div>
+
+      <h3 id="operator-queue-title">File de workloads</h3>
+      <div id="operator-queue-warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-labelledby="operator-queue-title"><table><caption class="sr-only">Nombre de workloads par état, et plus ancienne relance planifiée dans chaque état</caption><thead><tr><th scope="col">État</th><th scope="col">Nombre</th><th scope="col">Plus ancienne relance planifiée</th></tr></thead><tbody id="operator-queue"></tbody></table></div>
+      <p class="muted">Répartition des tentatives : <span id="operator-attempts">—</span></p>
+
+      <h3 id="operator-workers-title">Claims des workers</h3>
+      <div id="operator-workers-warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-labelledby="operator-workers-title"><table><caption class="sr-only">Processus workers du Control Plane et les workloads qu'ils réclament actuellement</caption><thead><tr><th scope="col">Worker</th><th scope="col">Workloads réclamés</th><th scope="col">Bail jusqu'à</th><th scope="col">État du bail</th></tr></thead><tbody id="operator-workers"></tbody></table></div>
+
+      <h3 id="operator-audit-title">Journal d'audit</h3>
+      <div id="operator-audit-warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-labelledby="operator-audit-title"><table><caption class="sr-only">Événements d'audit, les plus récents en premier</caption><thead><tr><th scope="col">Date</th><th scope="col">Acteur</th><th scope="col">Rôle</th><th scope="col">Action</th><th scope="col">Cible</th><th scope="col">Résultat</th></tr></thead><tbody id="operator-audit"></tbody></table></div>
+      <div class="pagination">
+        <button id="operator-audit-prev" type="button">← Précédent</button>
+        <span id="operator-audit-range" aria-live="polite">—</span>
+        <button id="operator-audit-next" type="button">Suivant →</button>
+      </div>
+    </section>
   </main>
   <script src="auth.js" defer></script>
   <script src="app.js" defer></script>
+  <script src="operator.js" defer></script>
 </body>
 </html>

@@ -1,3 +1,9 @@
+// Wrapped in an IIFE for the reason spelled out at the top of auth.js:
+// classic scripts share one global lexical environment, so a top-level
+// `const` here and in auth.js is a redeclaration SyntaxError that stops
+// this file from executing at all -- which is exactly what silently took
+// this dashboard offline once. Function scope removes the hazard.
+(() => {
 const $=id=>document.getElementById(id);let active;
 function text(id,value){$(id).textContent=value}
 function status(value){const span=document.createElement('span');span.className=`status ${value}`;span.textContent=value;return span}
@@ -163,6 +169,48 @@ async function loadOpenRounds(){
     }
   }catch(error){warning.hidden=false;warning.textContent='Impossible de charger les rounds ouverts.'}
 }
-function loadValidatorViews(){loadValidatorScores();loadOpenRounds()}
+// #107: earnings (pallet-rewards) and availability proofs
+// (pallet-availability) had no data path at all until
+// /api/v1/provider/{id}/onchain -- the last two provider bullets of #14.
+// Driven by the same provider_id control as the two tables above, for the
+// reason given there: a second input would let the panels drift onto
+// different providers while looking like one view.
+async function loadProviderOnChain(){
+  const providerId=$('score-provider-id').value.trim();
+  const warning=$('onchain-warning');
+  warning.hidden=true;warning.textContent='';
+  const unknown='—';
+  // Reset to "unknown" rather than leaving the previous provider's
+  // figures on screen while the next request is in flight.
+  for(const id of ['onchain-points','onchain-availability','onchain-samples','onchain-sequence','onchain-observed','onchain-hash'])$(id).textContent=unknown;
+  if(!providerId)return;
+  try{
+    const response=await fetch(`/api/v1/provider/${encodeURIComponent(providerId)}/onchain`);
+    if(response.status===404)return;
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    const data=await response.json();
+    // available===false is a failed chain read. Showing 0 points would
+    // tell a provider it has earned nothing, which is a much stronger
+    // claim than "we could not ask".
+    $('onchain-points').textContent=data.earnings.available?data.earnings.reward_points:'lecture indisponible';
+    const proof=data.proof;
+    if(!proof.available){
+      $('onchain-availability').textContent='lecture indisponible';
+    }else if(!proof.found){
+      // A provider that has never submitted a proof is a normal state,
+      // not a failure and not 0 % availability.
+      $('onchain-availability').textContent='aucune preuve soumise';
+    }else{
+      $('onchain-availability').textContent=(proof.availability_bps/100).toFixed(2)+' %';
+      $('onchain-samples').textContent=`${proof.successful_samples}/${proof.total_samples}`;
+      $('onchain-sequence').textContent=proof.sequence;
+      $('onchain-observed').textContent=`#${proof.observed_at_block}`;
+      $('onchain-hash').textContent=proof.payload_hash;
+    }
+    if(data.partial){warning.hidden=false;warning.textContent='Lecture partielle — au moins une des deux sources on-chain n\'a pas pu être lue.'}
+  }catch(error){warning.hidden=false;warning.textContent='Impossible de lire les gains et preuves on-chain de ce provider.'}
+}
+function loadValidatorViews(){loadValidatorScores();loadOpenRounds();loadProviderOnChain()}
 $('score-load').addEventListener('click',loadValidatorViews);
 $('score-provider-id').addEventListener('keydown',e=>{if(e.key==='Enter')loadValidatorViews()});
+})();

@@ -190,3 +190,52 @@ fn ensure_active_validator_rejects_root_even_though_it_outranks_everything_else(
 fn ensure_active_validator_rejects_none_origin() {
     assert!(EnsureActiveValidator::<Test>::ensure_origin(RuntimeOrigin::none()).is_err());
 }
+
+/// Pins `AvailabilitySummary`'s SCALE encoding, byte for byte.
+///
+/// The Control Plane decodes this struct straight off chain storage in
+/// `control-plane/internal/blockchainbridge/availability.go`, by hand --
+/// there is no shared schema between the two, so nothing but a test
+/// stops the Rust side from reordering a field, widening a type, or
+/// adding one, and leaving the Go decoder silently reading garbage that
+/// still parses.
+///
+/// `TestDecodeAvailabilitySummaryMatchesThePalletEncoding` asserts the
+/// same bytes decode to the same values on the Go side. Changing this
+/// struct should break both; if you find yourself updating only one,
+/// that is the bug this pair exists to catch.
+///
+/// Instantiated with `u32` rather than `BlockNumberFor<Test>` on purpose:
+/// the encoding that matters is the one the *runtime* produces, and the
+/// runtime's BlockNumber is u32 (the mock's is not necessarily).
+#[test]
+fn availability_summary_encoding_is_stable_for_the_control_plane_decoder() {
+    use codec::Encode;
+
+    let summary = crate::AvailabilitySummary::<u32> {
+        sequence: 7,
+        observed_at: 42,
+        successful_samples: 95,
+        total_samples: 100,
+        availability_bps: 9_500,
+        payload_hash: [0xAB; 32],
+        signature: sp_runtime::BoundedVec::truncate_from(vec![0xCD; 64]),
+    };
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&7u64.to_le_bytes());
+    expected.extend_from_slice(&42u32.to_le_bytes());
+    expected.extend_from_slice(&95u32.to_le_bytes());
+    expected.extend_from_slice(&100u32.to_le_bytes());
+    expected.extend_from_slice(&9_500u16.to_le_bytes());
+    expected.extend_from_slice(&[0xAB; 32]);
+    // BoundedVec carries a SCALE compact length prefix: 64 << 2 | 0b01
+    // == 0x0101, two-byte mode, little-endian. This is the one
+    // variable-length part of the struct and the only place the Go
+    // decoder has to parse rather than slice at a fixed offset.
+    expected.extend_from_slice(&[0x01, 0x01]);
+    expected.extend_from_slice(&[0xCD; 64]);
+
+    assert_eq!(summary.encode(), expected);
+    assert_eq!(summary.encode().len(), 120);
+}

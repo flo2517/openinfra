@@ -18,3 +18,8 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(-
    keyboard is the only reason it is focusable. */
 .table-wrap:focus{outline:2px solid var(--green);outline-offset:2px}
 button:disabled{opacity:.45;cursor:not-allowed}
+/* A row that is itself the problem the table exists to surface (an
+   expired worker lease still holding claims). Marked with a left border
+   and a tinted background rather than colour alone, so it survives
+   WCAG 1.4.1 (Use of Colour) and a monochrome or colour-blind reading. */
+tr.row-alert td{background:#352b15}tr.row-alert td:first-child{box-shadow:inset 3px 0 0 var(--amber)}

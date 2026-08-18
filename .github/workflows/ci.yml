@@ -47,6 +47,16 @@ jobs:
           cache-dependency-path: |
             control-plane/go.sum
             protocol/generated/go/go.sum
+      # internal/dashboard's asset harness evaluates the dashboard's
+      # <script> files the way a browser does, which needs a real JS
+      # engine. That test fails rather than skips when node is absent
+      # (issue #98's lesson: a skipped test reports as a pass), so node is
+      # installed explicitly here instead of relying on whatever the
+      # runner image happens to ship.
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
       - name: Check formatting
         working-directory: control-plane
         run: test -z "$(gofmt -l .)"
