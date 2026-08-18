@@ -78,7 +78,13 @@ func (f *fakeChain) dispatch(method string, params json.RawMessage) (any, error)
 	defer f.mu.Unlock()
 	switch method {
 	case "state_getRuntimeVersion":
-		return map[string]any{"specVersion": 2, "transactionVersion": 1}, nil
+		// specVersion 3, not 2: the real runtime (blockchain/runtime/src/lib.rs)
+		// has been spec_version 3 since #37; blockchainbridge's
+		// supportedSpecVersion guard was stale at 2 until it was corrected
+		// alongside this fixture (see registrar.go), and this fake chain's
+		// value needs to stay in sync with that guard for the fake to model
+		// a real, accepted chain response rather than a rejected one.
+		return map[string]any{"specVersion": 3, "transactionVersion": 1}, nil
 	case "chain_getBlockHash":
 		return fixedHashHex, nil
 	case "chain_getFinalizedHead":
