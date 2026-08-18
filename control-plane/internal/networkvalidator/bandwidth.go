@@ -96,6 +96,19 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 		probes = DefaultBandwidthProbesPerRound
 	}
 
+	// Nothing to score against is not a pass -- and, just as importantly,
+	// not a fail either. Both directions are checked because a provider
+	// declaring only one of them still leaves the other unverifiable, and
+	// a result that verified half of what it claims to verify should not
+	// be submitted as a full pass. Captured once up front, before the
+	// probe loop, so this verdict is not at the mercy of *how* a probe
+	// turns out: a provider with no declared capacity must get Unscored
+	// even when a probe also fails outright (unreachable Agent, bad
+	// signature) -- there was never a judgement to make in the first
+	// place, so a transient network hiccup on top of that must not turn
+	// into a permanent, on-chain failing score. See the loop below.
+	capacityDeclared := endpoint.DeclaredIngressMbps > 0 && endpoint.DeclaredEgressMbps > 0
+
 	var minIngress, minEgress float64
 	var lastPayloadHash [32]byte
 	for i := 0; i < probes; i++ {
@@ -105,6 +118,16 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 		}
 		lastPayloadHash = outcome.payloadHash
 		if outcome.failed {
+			if !capacityDeclared {
+				return ChallengeResult{
+					Unscored:    true,
+					PayloadHash: outcome.payloadHash,
+					Reason: fmt.Sprintf(
+						"unscored: no declared capacity to verify against (declared ingress=%dMbps, egress=%dMbps); probe %d/%d also failed: %s",
+						endpoint.DeclaredIngressMbps, endpoint.DeclaredEgressMbps, i+1, probes, outcome.reason,
+					),
+				}, nil
+			}
 			return ChallengeResult{ScoreBps: failingScoreBps, SampleCount: 1, PayloadHash: outcome.payloadHash, Reason: fmt.Sprintf("probe %d/%d: %s", i+1, probes, outcome.reason)}, nil
 		}
 		if i == 0 || outcome.ingressMbps < minIngress {
@@ -113,6 +136,17 @@ func (c *ChallengeClient) MeasureBandwidth(ctx context.Context, providerID strin
 		if i == 0 || outcome.egressMbps < minEgress {
 			minEgress = outcome.egressMbps
 		}
+	}
+
+	if !capacityDeclared {
+		return ChallengeResult{
+			Unscored:    true,
+			PayloadHash: lastPayloadHash,
+			Reason: fmt.Sprintf(
+				"unscored: no declared capacity to verify against (declared ingress=%dMbps, egress=%dMbps); measured ingress=%.1fMbps egress=%.1fMbps",
+				endpoint.DeclaredIngressMbps, endpoint.DeclaredEgressMbps, minIngress, minEgress,
+			),
+		}, nil
 	}
 
 	ingressPasses := passesBandwidthTolerance(minIngress, endpoint.DeclaredIngressMbps)
@@ -247,15 +281,17 @@ func estimateThroughputMbps(elapsed time.Duration, serverProcessingMs uint32, up
 }
 
 // passesBandwidthTolerance applies ADR-015 §5's tolerance check for one
-// direction. A non-positive declaredMbps means the dashboard had no
-// fresh declared-capacity data for this provider (see
-// AgentEndpoint.DeclaredIngressMbps/DeclaredEgressMbps's doc comment) --
-// indistinguishable from an honest "declared 0 Mbps," but in either case
-// there is nothing to catch as a false declaration, so this trivially
-// passes rather than failing a provider for a gap in discovery data.
+// direction.
+//
+// A non-positive declaredMbps is rejected by MeasureBandwidth before this
+// is ever called, as unscored rather than as a pass -- see the guard
+// there. The check is repeated here so this function is safe on its own
+// terms and can never be the place a "nothing to verify against" case
+// quietly becomes a pass: an unverifiable direction returns false, and
+// the caller is responsible for having already classified it as unscored.
 func passesBandwidthTolerance(measuredMbps float64, declaredMbps int32) bool {
 	if declaredMbps <= 0 {
-		return true
+		return false
 	}
 	threshold := float64(declaredMbps) * float64(bandwidthToleranceBps) / 10000
 	return measuredMbps >= threshold

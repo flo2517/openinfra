@@ -46,6 +46,19 @@ const (
 	DefaultMaxCloseAttempts          = 5
 )
 
+// DefaultUnscoredRetryInterval bounds how often this validator re-attempts
+// a challenge that came back Unscored (see ChallengeResult.Unscored --
+// today, exclusively the Network dimension without a declared bandwidth
+// figure to compare against). The missing input is the provider's next
+// capability-bearing heartbeat reaching the dashboard; retrying faster
+// than that cadence cannot possibly see it sooner, so this backs off
+// instead of re-running a full MeasureBandwidth probe round (real mTLS
+// traffic, several MiB each way) on every PollInterval tick for as long
+// as the round stays open. 20s mirrors DefaultCloseAttemptRetryInterval:
+// both are "nothing relevant changes faster than this" bounds, not a
+// precisely tuned value.
+const DefaultUnscoredRetryInterval = 20 * time.Second
+
 // LoopConfig configures Run. Chain and Registrar are required; the rest
 // have documented defaults applied by NewLoopConfig / Run when zero.
 type LoopConfig struct {
@@ -60,6 +73,7 @@ type LoopConfig struct {
 	CloseAttemptDelay         time.Duration
 	CloseAttemptRetryInterval time.Duration
 	MaxCloseAttempts          int
+	UnscoredRetryInterval     time.Duration
 
 	Logger *slog.Logger
 }
@@ -79,6 +93,9 @@ func (cfg *LoopConfig) applyDefaults() {
 	}
 	if cfg.MaxCloseAttempts == 0 {
 		cfg.MaxCloseAttempts = DefaultMaxCloseAttempts
+	}
+	if cfg.UnscoredRetryInterval == 0 {
+		cfg.UnscoredRetryInterval = DefaultUnscoredRetryInterval
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -120,6 +137,11 @@ func Run(ctx context.Context, cfg LoopConfig) error {
 	// for this feature, not a new corner cut here.
 	done := make(map[roundKey]bool)
 	pending := make(map[roundKey]*pendingClose)
+	// lastUnscored tracks, per key, the last time a challenge for it came
+	// back Unscored -- same in-memory-only, never-persisted lifetime as
+	// done/pending (see their comment above): a process restart just
+	// means one extra unbacked-off attempt, not a correctness problem.
+	lastUnscored := make(map[roundKey]time.Time)
 
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
@@ -129,13 +151,13 @@ func Run(ctx context.Context, cfg LoopConfig) error {
 			return ctx.Err()
 		case <-ticker.C:
 		}
-		if err := tick(ctx, cfg, self, done, pending); err != nil {
+		if err := tick(ctx, cfg, self, done, pending, lastUnscored); err != nil {
 			cfg.Logger.Error("networkvalidator: tick failed", "error", err)
 		}
 	}
 }
 
-func tick(ctx context.Context, cfg LoopConfig, self [32]byte, done map[roundKey]bool, pending map[roundKey]*pendingClose) error {
+func tick(ctx context.Context, cfg LoopConfig, self [32]byte, done map[roundKey]bool, pending map[roundKey]*pendingClose, lastUnscored map[roundKey]time.Time) error {
 	head, err := cfg.Chain.FinalizedHead(ctx)
 	if err != nil {
 		return err
@@ -161,16 +183,28 @@ func tick(ctx context.Context, cfg LoopConfig, self [32]byte, done map[roundKey]
 
 	assignments := AssignedWork(self, providers, round, activeValidators, cfg.TargetCommitteeSize, done)
 	for _, key := range assignments {
-		challengeAndSubmit(ctx, cfg, key, done, pending)
+		challengeAndSubmit(ctx, cfg, key, done, pending, lastUnscored)
 	}
 
 	attemptPendingCloses(ctx, cfg, pending)
 	return nil
 }
 
-func challengeAndSubmit(ctx context.Context, cfg LoopConfig, key roundKey, done map[roundKey]bool, pending map[roundKey]*pendingClose) {
+func challengeAndSubmit(ctx context.Context, cfg LoopConfig, key roundKey, done map[roundKey]bool, pending map[roundKey]*pendingClose, lastUnscored map[roundKey]time.Time) {
 	providerID := providerIDHex(key.provider)
 	logger := cfg.Logger.With("provider_id", providerID, "round", key.round, "dimension", key.dimension.String())
+
+	// Only ever populated by this same function's Unscored branch below,
+	// so a hit here means the last attempt for this exact key came back
+	// Unscored -- back off rather than re-running a full challenge (for
+	// Network, a real multi-MiB probe round) before the backoff window
+	// has passed. Not marked done, so this key keeps being reassigned by
+	// AssignedWork every tick; this check is what keeps that from turning
+	// into unbounded, unbacked-off retries (see DefaultUnscoredRetryInterval).
+	if last, ok := lastUnscored[key]; ok && time.Since(last) < cfg.UnscoredRetryInterval {
+		return
+	}
+
 	logger.Info("networkvalidator: assigned, challenging")
 
 	// ADR-015: the Network dimension's evidence changes from a generic
@@ -190,6 +224,18 @@ func challengeAndSubmit(ctx context.Context, cfg LoopConfig, key roundKey, done 
 		// unreachable) -- do not mark done, so a later tick this same
 		// round can retry.
 		logger.Warn("networkvalidator: could not attempt challenge, will retry next tick", "error", err)
+		return
+	}
+	if result.Unscored {
+		// Judged nothing, so submit nothing. Writing either verdict would
+		// put a claim into consensus state that no measurement supports
+		// (see ChallengeResult.Unscored). Not marked done, so a later
+		// tick retries once the missing input -- currently only the
+		// provider's declared capacity, which arrives with its next
+		// heartbeat -- is available. lastUnscored is what bounds "a later
+		// tick" to no sooner than UnscoredRetryInterval, above.
+		lastUnscored[key] = time.Now()
+		logger.Warn("networkvalidator: challenge unscored, submitting nothing", "reason", result.Reason)
 		return
 	}
 	logger.Info("networkvalidator: challenge scored", "score_bps", result.ScoreBps, "reason", result.Reason)
