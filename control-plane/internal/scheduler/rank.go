@@ -281,8 +281,8 @@ func (r *Ranker) scoreOne(
 		// practice, never see that much throughput.
 		ingressAvailable, egressAvailable := candidate.IngressTotalMbps, candidate.EgressTotalMbps
 		if r.WireGuardOverlayEnabled {
-			ingressAvailable = wireGuardEffectiveMbps(ingressAvailable)
-			egressAvailable = wireGuardEffectiveMbps(egressAvailable)
+			ingressAvailable = WireGuardEffectiveMbps(ingressAvailable)
+			egressAvailable = WireGuardEffectiveMbps(egressAvailable)
 		}
 		ingressFitBps, ok := fitBps(ingressAvailable, int64(bandwidth.IngressMbps))
 		if !ok {
@@ -380,7 +380,7 @@ func fitBps(available, required int64) (bps uint32, ok bool) {
 	return uint32(ratio), true
 }
 
-// wireGuardEffectiveMbps scales a declared raw-interface bandwidth figure
+// WireGuardEffectiveMbps scales a declared raw-interface bandwidth figure
 // down by WireGuard's fixed per-packet overhead, expressed as the fraction
 // of a standard MTU that survives encapsulation:
 // effective = total * (mtu - overhead) / mtu. Integer division mirrors the
@@ -388,7 +388,14 @@ func fitBps(available, required int64) (bps uint32, ok bool) {
 // input always produces the same output on any machine. A non-positive
 // input (0, or a value that should never occur in practice) is returned
 // unchanged rather than risking a negative or divide-by-zero result.
-func wireGuardEffectiveMbps(totalMbps int64) int64 {
+//
+// Exported (not just used internally by scoreOne) so orchestrator.Worker
+// can apply the identical formula when building the persistent capacity
+// ledger's ProviderCapacity -- see rankableCandidates in
+// internal/orchestrator/worker.go and issue #115. Keeping one formula in
+// one place means the single-workload fit-score and the aggregate
+// reservation ceiling can never silently drift apart.
+func WireGuardEffectiveMbps(totalMbps int64) int64 {
 	if totalMbps <= 0 {
 		return totalMbps
 	}

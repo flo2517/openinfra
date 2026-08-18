@@ -57,15 +57,25 @@ type Workload struct {
 	ReservedIngressMbps, ReservedEgressMbps int64
 }
 
-// ProviderCapacity is a provider's declared total capacity, used as the
-// hard ceiling AssignLease checks reservations against -- not its live
-// "available" figure, which lives only in Redis (reconstructible, not
-// authoritative for an atomic Postgres check; see AssignLease's doc
-// comment in postgres.go for the reasoning). TotalIngressMbps/
-// TotalEgressMbps are 0 for a provider that hasn't operator-configured a
-// bandwidth capacity (see agent-core's AgentSettings doc comment) -- a
-// workload with a nonzero bandwidth requirement simply cannot fit such a
-// provider, the same as any other zero-capacity dimension.
+// ProviderCapacity is the hard ceiling AssignLease checks reservations
+// against -- not the provider's live "available" figure, which lives only
+// in Redis (reconstructible, not authoritative for an atomic Postgres
+// check; see AssignLease's doc comment in postgres.go for the reasoning).
+// TotalCPUMillicores/TotalRAMMB/TotalStorageGB are the provider's declared
+// total capacity verbatim -- stable hardware facts. TotalIngressMbps/
+// TotalEgressMbps are also the declared total, *except* when the caller
+// building this struct knows a WireGuard overlay is active for the
+// workload's traffic: orchestrator.Worker.rankableCandidates then applies
+// scheduler.WireGuardEffectiveMbps first, since the ledger otherwise
+// admits reservations the overlay's own per-packet overhead can never
+// actually deliver (issue #115). This is why the field is "the ceiling
+// this transaction should enforce," not "the provider's declared total" --
+// the two agree exactly when there's no overlay, and diverge by ~4% when
+// there is. TotalIngressMbps/TotalEgressMbps are 0 for a provider that
+// hasn't operator-configured a bandwidth capacity (see agent-core's
+// AgentSettings doc comment) -- a workload with a nonzero bandwidth
+// requirement simply cannot fit such a provider, the same as any other
+// zero-capacity dimension.
 type ProviderCapacity struct {
 	TotalCPUMillicores                int64
 	TotalRAMMB, TotalStorageGB        int64
