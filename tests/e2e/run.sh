@@ -146,7 +146,18 @@ cd "$deploy_agent_dir"
 sed -i 's/^  listen_address: .*/  listen_address: 0.0.0.0:50098/' config.yaml
 sed -i "s#^  advertised_endpoint: ''#  advertised_endpoint: https://host.docker.internal:50098#" config.yaml
 
-deploy_join_output="$(timeout 20s "$agent" join)"
+# 45s, not 20s: CompleteJoin's own client-side deadline is already 30s
+# (agent-cli's main.rs, complete_request.set_timeout), on top of
+# BeginJoin's 10s -- a 20s outer wrapper can guillotine a legitimate
+# in-flight CompleteJoin before its own budget elapses, which is exactly
+# what happened here: this is the *second* provider to register in the
+# same run, and its on-chain registration extrinsic queues behind the
+# first provider's (same bridge/sudo account, sequential nonce), pushing
+# the finality wait past 20s even though the RPC call itself was healthy
+# (confirmed via control-plane's logs: the extrinsic was accepted on
+# chain -- "Transaction Already Imported" on the retried attempt -- the
+# client had simply been killed before the response came back).
+deploy_join_output="$(timeout 45s "$agent" join)"
 deploy_provider_id="$(sed -n 's/^Provider ACTIVE: //p' <<<"$deploy_join_output")"
 [[ "$deploy_provider_id" =~ ^[0-9a-f]{64}$ ]]
 
