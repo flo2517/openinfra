@@ -311,9 +311,9 @@ func TestWireGuardEffectiveMbpsIsExactIntegerArithmeticWithNoOverflowOrNegativeS
 		{totalMbps: 1, want: 0}, // rounds down to zero rather than negative or fractional
 	}
 	for _, c := range cases {
-		got := wireGuardEffectiveMbps(c.totalMbps)
+		got := WireGuardEffectiveMbps(c.totalMbps)
 		if got != c.want {
-			t.Errorf("wireGuardEffectiveMbps(%d) = %d, want %d", c.totalMbps, got, c.want)
+			t.Errorf("WireGuardEffectiveMbps(%d) = %d, want %d", c.totalMbps, got, c.want)
 		}
 	}
 }

@@ -272,6 +272,19 @@ func (w *Worker) provider(ctx context.Context, id string) (agentmanager.Schedula
 // w.reputation is configured; a read failure or missing record degrades
 // that one candidate to the ranker's default score rather than excluding
 // it or failing the whole scheduling attempt.
+//
+// candidate.IngressTotalMbps/EgressTotalMbps stay raw: scoreOne itself
+// applies scheduler.WireGuardEffectiveMbps when ranker.WireGuardOverlayEnabled
+// is set, so adjusting them here too would double-discount a single
+// candidate's fit score. capacities' TotalIngressMbps/TotalEgressMbps are
+// different -- they seed the *persistent* ledger AssignLease checks
+// cumulative reservations against across every workload already assigned
+// to a provider, and until this fix they were never adjusted at all. w.overlay
+// != nil is the same "is the overlay active for this deployment" signal
+// main.go already flips ranker.WireGuardOverlayEnabled from (see
+// Worker.SetOverlay's doc comment), so reusing it here keeps both halves of
+// WireGuard-overhead accounting -- single-candidate fit-scoring and the
+// aggregate capacity ledger -- in agreement (issue #115).
 func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanager.SchedulableProvider) ([]scheduler.Candidate, map[string]workloadapi.ProviderCapacity) {
 	candidates := make([]scheduler.Candidate, 0, len(providers))
 	capacities := make(map[string]workloadapi.ProviderCapacity, len(providers))
@@ -286,12 +299,17 @@ func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanage
 				ingressMbps, egressMbps = int64(c.Bandwidth.IngressMbps), int64(c.Bandwidth.EgressMbps)
 			}
 			candidate.IngressTotalMbps, candidate.EgressTotalMbps = ingressMbps, egressMbps
+			capacityIngressMbps, capacityEgressMbps := ingressMbps, egressMbps
+			if w.overlay != nil {
+				capacityIngressMbps = scheduler.WireGuardEffectiveMbps(ingressMbps)
+				capacityEgressMbps = scheduler.WireGuardEffectiveMbps(egressMbps)
+			}
 			capacities[p.ProviderID] = workloadapi.ProviderCapacity{
 				TotalCPUMillicores: workloadapi.CPUCoresToMillicores(c.CpuTotal),
 				TotalRAMMB:         c.RamTotalMb,
 				TotalStorageGB:     c.StorageTotalGb,
-				TotalIngressMbps:   ingressMbps,
-				TotalEgressMbps:    egressMbps,
+				TotalIngressMbps:   capacityIngressMbps,
+				TotalEgressMbps:    capacityEgressMbps,
 			}
 		}
 		if w.reputation != nil && len(p.PublicKey) == 32 {
