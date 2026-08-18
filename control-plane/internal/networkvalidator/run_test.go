@@ -159,7 +159,15 @@ func buildProviderStorageKeyHex(provider [32]byte) string {
 	return "0x" + hex.EncodeToString(key)
 }
 
-func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
+// startValidatorLoop wires a full validator loop against a fake chain and
+// a real loopback Agent, and starts it. Shared by the end-to-end tests so
+// they differ only in the fake Agent they are given -- which is the whole
+// variable under test between "the provider declared a capacity" and "it
+// did not" -- plus an optional configure callback for tests that need to
+// override a LoopConfig field (e.g. UnscoredRetryInterval) beyond the
+// fast-but-otherwise-default values set below.
+func startValidatorLoop(t *testing.T, fake *fakeAgentServer, configure ...func(*LoopConfig)) (*fakeChain, context.CancelFunc, chan error) {
+	t.Helper()
 	_, validatorPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate validator key: %v", err)
@@ -177,15 +185,10 @@ func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
 		providerKeys:   []string{buildProviderStorageKeyHex(provider)},
 	}
 	chainServer := httptest.NewServer(http.HandlerFunc(chain.handler))
-	defer chainServer.Close()
+	t.Cleanup(chainServer.Close)
 
-	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate agent key: %v", err)
-	}
-	fake := &fakeAgentServer{privateKey: agentPriv}
 	harness := startTestAgentHarness(t, fake)
-	defer harness.close()
+	t.Cleanup(harness.close)
 
 	rpc, err := blockchainbridge.NewRPCClient(chainServer.URL, &http.Client{Timeout: 5 * time.Second})
 	if err != nil {
@@ -209,22 +212,62 @@ func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	cfg := LoopConfig{
+		Chain:      rpc,
+		Registrar:  registrar,
+		Challenger: challenger,
+
+		RoundLength:               RoundLength(100),
+		PollInterval:              30 * time.Millisecond,
+		CloseAttemptDelay:         60 * time.Millisecond,
+		CloseAttemptRetryInterval: 30 * time.Millisecond,
+		MaxCloseAttempts:          2,
+		// Fast enough that it never blocks TestRunSubmitsNothingForAn-
+		// UnscorableNetworkDimension's default assertion (several rounds
+		// of probes inside a ~3s budget at a 30ms poll interval); a test
+		// that specifically wants to exercise the backoff itself
+		// overrides this via configure.
+		UnscoredRetryInterval: 10 * time.Millisecond,
+		Logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	for _, apply := range configure {
+		apply(&cfg)
+	}
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, LoopConfig{
-			Chain:                     rpc,
-			Registrar:                 registrar,
-			Challenger:                challenger,
-			RoundLength:               RoundLength(100),
-			PollInterval:              30 * time.Millisecond,
-			CloseAttemptDelay:         60 * time.Millisecond,
-			CloseAttemptRetryInterval: 30 * time.Millisecond,
-			MaxCloseAttempts:          2,
-			Logger:                    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		})
+		done <- Run(ctx, cfg)
 	}()
+	return chain, cancel, done
+}
+
+// countEvidenceCalls counts submit_evidence extrinsics (pallet index 16,
+// call index 5) seen by the fake chain.
+func countEvidenceCalls(chain *fakeChain) int {
+	count := 0
+	for _, call := range chain.calls() {
+		if len(call) >= 2 && call[0] == 16 && call[1] == 5 {
+			count++
+		}
+	}
+	return count
+}
+
+func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	// A declared capacity low enough that any real loopback measurement
+	// clears the tolerance. It has to be declared at all: an undeclared
+	// capacity is now explicitly unscored rather than an automatic pass,
+	// so leaving it at 0 would make this end-to-end test submit four
+	// dimensions instead of five and stop covering the Network path.
+	// TestRunSubmitsNothingForAnUnscorableNetworkDimension covers the
+	// undeclared case on purpose.
+	fake := &fakeAgentServer{privateKey: agentPriv, declaredIngressMbps: 1, declaredEgressMbps: 1}
+	chain, cancel, done := startValidatorLoop(t, fake)
+	defer cancel()
 
 	// Wait for at least one submit_evidence (call_index 5) and one
 	// close_round (call_index 6) to have been submitted.
@@ -260,12 +303,7 @@ func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
 	// Exactly one submit_evidence per dimension (5 dimensions), never
 	// re-submitted across ticks -- the in-memory `done` map must prevent
 	// duplicates within this process's lifetime.
-	evidenceCount := 0
-	for _, call := range chain.calls() {
-		if len(call) >= 2 && call[0] == 16 && call[1] == 5 {
-			evidenceCount++
-		}
-	}
+	evidenceCount := countEvidenceCalls(chain)
 	if evidenceCount != len(Dimensions) {
 		t.Errorf("submit_evidence called %d times, want exactly %d (once per dimension, never re-submitted)", evidenceCount, len(Dimensions))
 	}
@@ -322,4 +360,118 @@ func loadRegistrarFromPrivateKey(t *testing.T, rpc *blockchainbridge.RPCClient, 
 		t.Fatalf("load registrar: %v", err)
 	}
 	return registrar
+}
+
+// The daemon must submit nothing at all for a dimension it could not
+// score, and must keep retrying it rather than marking it done.
+//
+// This is the loop-level half of the hardening: MeasureBandwidth
+// returning Unscored is only useful if challengeAndSubmit actually
+// declines to submit it. Before this, a provider that never heartbeated
+// its ResourceCapability.Bandwidth had a full-marks Network score written
+// to chain every round, on the strength of a tolerance check that had
+// nothing to compare against.
+func TestRunSubmitsNothingForAnUnscorableNetworkDimension(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	// No declared capacity: exactly the state a provider is in before its
+	// first capability-bearing heartbeat reaches the dashboard.
+	fake := &fakeAgentServer{privateKey: agentPriv}
+	chain, cancel, done := startValidatorLoop(t, fake)
+	defer cancel()
+
+	// Wait until the four scorable dimensions have all been submitted,
+	// then keep the loop running long enough that a Network submission
+	// would have had several further ticks to appear.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && countEvidenceCalls(chain) < len(Dimensions)-1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	if got := countEvidenceCalls(chain); got != len(Dimensions)-1 {
+		t.Errorf("submit_evidence called %d times, want %d -- every dimension except Network, which could not be scored", got, len(Dimensions)-1)
+	}
+
+	fake.mu.Lock()
+	measureBandwidthCalls := fake.measureBandwidthCalls
+	solveChallengeTypes := append([]agentv1.SolveChallengeRequest_Type{}, fake.solveChallengeTypes...)
+	fake.mu.Unlock()
+
+	// The probe still runs -- the measurement is fine, it is the
+	// *judgement* that cannot be made -- and, because the dimension is
+	// never marked done, it is retried on later ticks rather than
+	// abandoned. More than one round's worth of probes proves the retry.
+	if measureBandwidthCalls <= DefaultBandwidthProbesPerRound {
+		t.Errorf("MeasureBandwidth called %d times, want more than one round's %d: an unscored dimension must be retried, not marked done",
+			measureBandwidthCalls, DefaultBandwidthProbesPerRound)
+	}
+	// The other four dimensions must be untouched by this: they are
+	// scored and submitted exactly once each, as always.
+	counts := map[agentv1.SolveChallengeRequest_Type]int{}
+	for _, solveChallengeType := range solveChallengeTypes {
+		counts[solveChallengeType]++
+	}
+	for _, solveChallengeType := range []agentv1.SolveChallengeRequest_Type{
+		agentv1.SolveChallengeRequest_TYPE_COMPUTE,
+		agentv1.SolveChallengeRequest_TYPE_STORAGE,
+		agentv1.SolveChallengeRequest_TYPE_AVAILABILITY,
+		agentv1.SolveChallengeRequest_TYPE_RELIABILITY,
+	} {
+		if counts[solveChallengeType] != 1 {
+			t.Errorf("SolveChallenge(%s) called %d times, want 1", solveChallengeType, counts[solveChallengeType])
+		}
+	}
+}
+
+// An unscored Network dimension must still be retried eventually (proven
+// above), but not on every single poll tick: that reruns a full
+// multi-probe MeasureBandwidth round (real mTLS traffic, several MiB each
+// way) against a signal -- the provider's declared capacity -- that only
+// changes with the provider's next heartbeat, far slower than the poll
+// cadence. This pins the bound: within one UnscoredRetryInterval window,
+// at most one round of probes runs no matter how many poll ticks land
+// inside it; once the window elapses, a further round runs.
+func TestChallengeAndSubmitBacksOffRetryingAnUnscoredNetworkDimension(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	// No declared capacity: exactly TestRunSubmitsNothingForAnUnscorable-
+	// NetworkDimension's setup, but with a backoff window wide enough to
+	// observe directly instead of the default fast-test value.
+	fake := &fakeAgentServer{privateKey: agentPriv}
+	const backoff = 300 * time.Millisecond
+	_, cancel, done := startValidatorLoop(t, fake, func(cfg *LoopConfig) {
+		cfg.UnscoredRetryInterval = backoff
+	})
+	defer cancel()
+
+	// Several poll ticks (30ms cadence) land inside this window; only the
+	// first should have actually run a probe round.
+	time.Sleep(backoff - 60*time.Millisecond)
+	fake.mu.Lock()
+	withinWindow := fake.measureBandwidthCalls
+	fake.mu.Unlock()
+	if withinWindow > DefaultBandwidthProbesPerRound {
+		t.Errorf("measureBandwidthCalls = %d within one UnscoredRetryInterval window, want at most %d (one round)",
+			withinWindow, DefaultBandwidthProbesPerRound)
+	}
+
+	// Now past the window: a further round must have been attempted.
+	time.Sleep(2 * backoff)
+	cancel()
+	<-done
+
+	fake.mu.Lock()
+	afterWindow := fake.measureBandwidthCalls
+	fake.mu.Unlock()
+	if afterWindow <= withinWindow {
+		t.Errorf("measureBandwidthCalls = %d after the backoff window elapsed, want more than %d: a retry should have happened",
+			afterWindow, withinWindow)
+	}
 }
