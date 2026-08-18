@@ -162,9 +162,10 @@ func (r *PostgresRepository) BeginScheduling(ctx context.Context, item Workload)
 	return nil
 }
 
-// AssignLease commits this workload to providerID, but only if the
-// provider's declared total capacity (capacity, from its latest heartbeat
-// -- stable hardware facts, not the live "available" figure that only
+// AssignLease commits this workload to providerID, but only if capacity
+// (the ceiling the caller built for this provider -- see ProviderCapacity's
+// own doc comment for why that is not always the provider's raw declared
+// total capacity verbatim, not the live "available" figure that only
 // lives in Redis) still has headroom over every other open workload
 // already assigned to it. The check and the commit happen in one
 // Serializable transaction: two concurrent AssignLease calls racing to
@@ -174,8 +175,8 @@ func (r *PostgresRepository) BeginScheduling(ctx context.Context, item Workload)
 // retries the whole scheduling step (a different, or by-then-recovered,
 // provider may be chosen next attempt).
 //
-// This is deliberately a hard ceiling against declared total capacity,
-// not an attempt to reconcile with Redis's live "available" number --
+// This is deliberately a hard ceiling against capacity as given, not an
+// attempt to reconcile with Redis's live "available" number --
 // Postgres is the only store this transaction can make atomic guarantees
 // about (AGENTS.md: PostgreSQL is authoritative off-chain, Redis is
 // reconstructible), and mixing an eventually-consistent Redis read into

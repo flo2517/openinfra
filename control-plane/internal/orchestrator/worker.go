@@ -89,7 +89,22 @@ func NewWorker(store PersistentStore, directory ProviderDirectory, leases LeaseR
 // SetOverlay enables the optional WireGuard overlay. It is intentionally a
 // setter to keep existing worker tests and deployments that lack CAP_NET_ADMIN
 // fully functional; production deployments configure it explicitly.
-func (w *Worker) SetOverlay(overlay OverlayManager) { w.overlay = overlay }
+//
+// This also flips w.ranker.WireGuardOverlayEnabled, rather than leaving that
+// as a second call callers must remember to make alongside this one. Before
+// this, "is the overlay active" was two independently-set booleans
+// (w.overlay != nil here, Ranker.WireGuardOverlayEnabled there) kept in
+// agreement only by main.go happening to call both setters in the same
+// if-block -- a future second call site that configured the overlay without
+// discovering and calling both would silently desync single-candidate
+// fit-scoring from the aggregate capacity ledger (see rankableCandidates'
+// own doc comment), reintroducing the exact overcommit issue #115 fixed.
+// Worker already holds the same *scheduler.Ranker passed into it via
+// NewWorker, so there is no reason for the two to disagree.
+func (w *Worker) SetOverlay(overlay OverlayManager) {
+	w.overlay = overlay
+	w.ranker.SetWireGuardOverlayEnabled(overlay != nil)
+}
 
 // SetReputationSource enables real on-chain reputation-aware ranking. See
 // ReputationSource's doc comment for the degraded-mode behavior when unset.

@@ -105,6 +105,26 @@ func TestRankableCandidatesAppliesWireGuardOverheadToCapacityLedgerOnlyWhenOverl
 	}
 }
 
+// TestSetOverlaySyncsTheRankersWireGuardFlag pins that SetOverlay is the
+// only place that needs calling: a caller that sets the overlay must never
+// have to remember a second call to keep the ranker's own bandwidth
+// fit-scoring in agreement with the capacity ledger SetOverlay now also
+// adjusts (see SetOverlay's doc comment, issue #115).
+func TestSetOverlaySyncsTheRankersWireGuardFlag(t *testing.T) {
+	ranker := testRanker()
+	worker := NewWorker(nil, nil, nil, nil, ranker)
+
+	worker.SetOverlay(stubOverlay{})
+	if !ranker.WireGuardOverlayEnabled {
+		t.Fatal("SetOverlay(non-nil) must enable the ranker's WireGuardOverlayEnabled flag")
+	}
+
+	worker.SetOverlay(nil)
+	if ranker.WireGuardOverlayEnabled {
+		t.Fatal("SetOverlay(nil) must disable the ranker's WireGuardOverlayEnabled flag")
+	}
+}
+
 func TestCanonicalResourceHashIsStable(t *testing.T) {
 	first := canonicalResourceHash([]byte{1, 2, 3}, "image@sha256:abc")
 	if first != canonicalResourceHash([]byte{1, 2, 3}, "image@sha256:abc") {
