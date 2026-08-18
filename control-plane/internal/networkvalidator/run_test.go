@@ -342,6 +342,78 @@ func TestRunEndToEndSubmitsEvidenceThenAttemptsCloseRound(t *testing.T) {
 	}
 }
 
+// TestRunEndToEndHandlesAFullAgentPartitionWithoutHangingOrHotLooping is
+// the loop-level network-partition case (issue #73): the Agent is
+// unreachable for the whole run, on every dimension, not just the Network
+// one. This must resolve the same way any other reachable-but-failing
+// challenge does -- one failing evidence submission per dimension, marked
+// done so it is never retried within this round -- rather than hanging
+// (ctx cancellation must still return promptly) or hot-looping (retrying
+// the same unreachable Agent on every single poll tick forever).
+func TestRunEndToEndHandlesAFullAgentPartitionWithoutHangingOrHotLooping(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	// Declared capacity makes the Network dimension judgeable too -- a
+	// partition must be scored as a genuine failure there as everywhere
+	// else, not conflated with Unscored (see TestMeasureBandwidthReports-
+	// FailureForUnreachableAgent's same assertion at the unit level).
+	fake := &fakeAgentServer{
+		privateKey:                   agentPriv,
+		declaredIngressMbps:          1,
+		declaredEgressMbps:           1,
+		advertiseUnreachableEndpoint: true,
+	}
+	chain, cancel, done := startValidatorLoop(t, fake)
+	defer cancel()
+
+	// Every dimension resolves to a failing evidence submission (marked
+	// done, never retried), but the wait budget has to be generous: each
+	// dimension's dial attempt against the closed port isn't rejected
+	// instantly -- grpc-go's WithBlock dial keeps retrying with backoff
+	// for the full DialTimeout (startValidatorLoop's 2s) before giving
+	// up, and tick() drives all 5 dimensions sequentially within one
+	// tick, so the first tick alone can take up to ~5*2s in the worst
+	// case.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && countEvidenceCalls(chain) < len(Dimensions) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	firstRoundCount := countEvidenceCalls(chain)
+	if firstRoundCount != len(Dimensions) {
+		t.Errorf("submit_evidence called %d times, want %d: even a fully unreachable Agent must be evidenced as a failing score for every dimension, not silently skipped", firstRoundCount, len(Dimensions))
+	}
+
+	// Not a hot loop: once every dimension is marked done, further poll
+	// ticks (30ms cadence) must not keep re-submitting evidence for a
+	// round that is already fully evidenced.
+	time.Sleep(300 * time.Millisecond)
+	if got := countEvidenceCalls(chain); got != firstRoundCount {
+		t.Errorf("submit_evidence called %d times after settling, want unchanged at %d: an unreachable Agent must not be retried once its dimensions are already done", got, firstRoundCount)
+	}
+
+	cancel()
+	select {
+	case runErr := <-done:
+		if runErr != context.Canceled {
+			t.Errorf("Run returned %v, want context.Canceled", runErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation -- a full Agent partition must not hang the loop")
+	}
+
+	// The harness's real grpc server was never actually reached: the
+	// advertised endpoint is a closed port, so every attempt fails at
+	// dial, not inside a MeasureBandwidth/SolveChallenge call.
+	fake.mu.Lock()
+	measureBandwidthCalls := fake.measureBandwidthCalls
+	fake.mu.Unlock()
+	if measureBandwidthCalls != 0 {
+		t.Errorf("measureBandwidthCalls = %d, want 0: the advertised endpoint is unreachable, so the real Agent must never have been dialed", measureBandwidthCalls)
+	}
+}
+
 // loadRegistrarFromPrivateKey writes privateKey to a temp PKCS8 PEM file
 // and loads it through the real production loader, matching
 // testValidatorClientCert's reasoning in challenge_test.go.

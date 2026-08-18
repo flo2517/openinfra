@@ -214,6 +214,25 @@ func (c *ChallengeClient) runOneBandwidthProbe(ctx context.Context, endpoint Age
 		return bandwidthProbeOutcome{payloadHash: payloadHash, failed: true, reason: "signature verification failed"}, nil
 	}
 
+	// A server_processing_ms claim that exceeds the validator's own
+	// observed round trip is physically impossible -- processing happens
+	// inside the round trip, never outside it -- and, left unchecked, is
+	// exploitable: estimateThroughputMbps's networkMs floor (see its own
+	// doc comment) would silently turn an implausible claim into an
+	// artificially tiny network time and therefore an artificially huge
+	// reported throughput. A dishonest but correctly-signed Agent (one
+	// that has the real private key but lies about how it spent the
+	// round trip) could use this to manufacture a passing tolerance
+	// check for a link that never delivered the claimed throughput.
+	// Rejected here as an ordinary failed-probe outcome, the same
+	// treatment as a bad hash or a bad signature, not a special case.
+	if int64(response.ServerProcessingMs) > elapsed.Milliseconds() {
+		return bandwidthProbeOutcome{
+			payloadHash: payloadHash, failed: true,
+			reason: fmt.Sprintf("response server_processing_ms (%dms) exceeds the observed round trip (%dms) -- implausible, rejecting", response.ServerProcessingMs, elapsed.Milliseconds()),
+		}, nil
+	}
+
 	ingressMbps, egressMbps := estimateThroughputMbps(elapsed, response.ServerProcessingMs, len(uploadPayload), len(response.DownloadPayload))
 	return bandwidthProbeOutcome{ingressMbps: ingressMbps, egressMbps: egressMbps, payloadHash: payloadHash}, nil
 }

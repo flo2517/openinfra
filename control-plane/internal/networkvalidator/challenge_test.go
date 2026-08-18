@@ -23,7 +23,9 @@ import (
 	"github.com/openinfra/network/internal/blockchainbridge"
 	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 // fakeAgentServer reproduces agent-api's real solve_challenge and
@@ -57,6 +59,38 @@ type fakeAgentServer struct {
 	// scores a MeasureBandwidth probe against.
 	declaredIngressMbps int32
 	declaredEgressMbps  int32
+	// artificialLatency, if non-zero, is slept before responding to a
+	// MeasureBandwidth call, simulating a congested/degraded link without
+	// misrepresenting the *real* server_processing_ms (which stays fixed
+	// at 1ms) -- the extra time shows up as reduced measured throughput
+	// exactly the way real network congestion would, since
+	// estimateThroughputMbps treats anything beyond server_processing_ms
+	// as network-attributable time. artificialLatencyOnCall, if non-zero,
+	// restricts the sleep to only the Nth MeasureBandwidth call
+	// (1-indexed), mirroring tamperBandwidthOnCall's pattern for
+	// isolating one degraded probe within an otherwise-healthy round; a
+	// zero value applies the latency to every call.
+	artificialLatency       time.Duration
+	artificialLatencyOnCall int
+	// spoofServerProcessingMs, if non-zero, overrides the *reported and
+	// signed* server_processing_ms field instead of the real 1ms --
+	// simulating a correctly-signed but dishonest Agent (one that has the
+	// real private key but lies about how it spent the round trip), as
+	// opposed to tamperBandwidthSignature's "signature doesn't even match
+	// what was sent" case.
+	spoofServerProcessingMs uint32
+	// failBandwidthFromCall, if non-zero, makes MeasureBandwidth return a
+	// gRPC error from the Nth call onward (1-indexed) instead of any
+	// response at all -- simulating a network partition/Agent crash
+	// mid-round, distinct from tamperBandwidthOnCall's "responds, but the
+	// response is corrupt."
+	failBandwidthFromCall int
+	// advertiseUnreachableEndpoint, if true, makes startTestAgentHarness's
+	// dashboard advertise a closed/unreachable address instead of this
+	// harness's real listener -- simulating a full network partition
+	// (Agent entirely unreachable) while still exercising the rest of the
+	// harness (declared capacity, provider ID) unchanged.
+	advertiseUnreachableEndpoint bool
 
 	mu                    sync.Mutex
 	solveChallengeTypes   []agentv1.SolveChallengeRequest_Type
@@ -98,13 +132,23 @@ func (s *fakeAgentServer) MeasureBandwidth(_ context.Context, req *agentv1.Measu
 	callNumber := s.measureBandwidthCalls
 	s.mu.Unlock()
 
+	if s.failBandwidthFromCall != 0 && callNumber >= s.failBandwidthFromCall {
+		return nil, status.Error(codes.Unavailable, "simulated network partition")
+	}
+	if s.artificialLatency > 0 && (s.artificialLatencyOnCall == 0 || callNumber == s.artificialLatencyOnCall) {
+		time.Sleep(s.artificialLatency)
+	}
+
 	sum := sha256.Sum256(req.UploadPayload)
 	uploadPayloadHash := sum[:]
 	downloadPayload := make([]byte, req.RequestedDownloadBytes)
 	if _, err := rand.Read(downloadPayload); err != nil {
 		return nil, err
 	}
-	const serverProcessingMs = 1
+	serverProcessingMs := uint32(1)
+	if s.spoofServerProcessingMs != 0 {
+		serverProcessingMs = s.spoofServerProcessingMs
+	}
 	signed := bandwidthSignedBytes(req.ProbeId, uploadPayloadHash, downloadPayload, serverProcessingMs)
 	signature := ed25519.Sign(s.privateKey, signed)
 	if s.tamperBandwidthUploadHash {
@@ -164,9 +208,15 @@ func startTestAgentHarness(t *testing.T, fake *fakeAgentServer) *testAgentHarnes
 
 	publicKey := fake.privateKey.Public().(ed25519.PublicKey)
 	providerID := "test-provider-id"
+	agentEndpoint := "https://" + listener.Addr().String()
+	if fake.advertiseUnreachableEndpoint {
+		// Reserved, nothing listens here -- a full network partition: the
+		// real grpc server above stays up but is never actually dialed.
+		agentEndpoint = "https://127.0.0.1:1"
+	}
 	dashboard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"agent_endpoint":         "https://" + listener.Addr().String(),
+			"agent_endpoint":         agentEndpoint,
 			"public_key":             hex.EncodeToString(publicKey),
 			"bandwidth_ingress_mbps": fake.declaredIngressMbps,
 			"bandwidth_egress_mbps":  fake.declaredEgressMbps,
