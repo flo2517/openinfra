@@ -214,22 +214,15 @@ func (c *ChallengeClient) runOneBandwidthProbe(ctx context.Context, endpoint Age
 		return bandwidthProbeOutcome{payloadHash: payloadHash, failed: true, reason: "signature verification failed"}, nil
 	}
 
-	// A server_processing_ms claim that exceeds the validator's own
-	// observed round trip is physically impossible -- processing happens
-	// inside the round trip, never outside it -- and, left unchecked, is
-	// exploitable: estimateThroughputMbps's networkMs floor (see its own
-	// doc comment) would silently turn an implausible claim into an
-	// artificially tiny network time and therefore an artificially huge
-	// reported throughput. A dishonest but correctly-signed Agent (one
-	// that has the real private key but lies about how it spent the
-	// round trip) could use this to manufacture a passing tolerance
-	// check for a link that never delivered the claimed throughput.
-	// Rejected here as an ordinary failed-probe outcome, the same
-	// treatment as a bad hash or a bad signature, not a special case.
-	if int64(response.ServerProcessingMs) > elapsed.Milliseconds() {
+	// A server_processing_ms claim that leaves less than 1ms of network
+	// time within the validator's own observed round trip is rejected
+	// here, not just a claim that exceeds the round trip outright -- see
+	// implausibleServerProcessingClaim's doc comment for why the floor,
+	// not "exceeds elapsed", is the right boundary.
+	if implausibleServerProcessingClaim(elapsed, response.ServerProcessingMs) {
 		return bandwidthProbeOutcome{
 			payloadHash: payloadHash, failed: true,
-			reason: fmt.Sprintf("response server_processing_ms (%dms) exceeds the observed round trip (%dms) -- implausible, rejecting", response.ServerProcessingMs, elapsed.Milliseconds()),
+			reason: fmt.Sprintf("response server_processing_ms (%dms) leaves no plausible network time within the observed round trip (%.3fms) -- implausible, rejecting", response.ServerProcessingMs, elapsed.Seconds()*1000),
 		}, nil
 	}
 
@@ -264,6 +257,35 @@ func (c *ChallengeClient) callMeasureBandwidth(ctx context.Context, endpoint Age
 		return nil, 0, fmt.Errorf("MeasureBandwidth RPC: %w", err)
 	}
 	return response, elapsed, nil
+}
+
+// implausibleServerProcessingClaim reports whether serverProcessingMs claims
+// so much of elapsed that estimateThroughputMbps's networkMs floor (below)
+// would kick in -- i.e. less than 1ms of network time would remain. That
+// floor exists to guard honest clock-skew/rounding noise, but left as the
+// only check, it is exploitable: a dishonest but correctly-signed Agent
+// (one that has the real private key but lies about how it spent the round
+// trip) can claim any serverProcessingMs close enough to elapsed -- not
+// necessarily exceeding it -- to force networkMs down to that same 1ms
+// floor and manufacture an artificially huge reported throughput for a
+// link that never delivered it. So this rejects at the floor boundary
+// itself, not only at outright-impossible (serverProcessingMs > elapsed)
+// claims.
+//
+// This does mean a genuinely honest, very fast probe whose real network
+// time is itself sub-millisecond gets rejected as a failed probe rather
+// than scored -- indistinguishable, from a single round trip, from the
+// spoofing case above. That is an intentional fail-closed choice: a
+// wrongly-failed probe costs one probe (rounds retry across multiple
+// probes -- see MeasureBandwidth's probe loop and run.go's retry/backoff),
+// while a wrongly-passed spoofed one manufactures a false reward-bearing
+// score. Computed in the same floating-point milliseconds
+// estimateThroughputMbps itself uses (not elapsed.Milliseconds(), which
+// truncates while ServerProcessingMs does not), so the two can never
+// disagree at a rounding boundary.
+func implausibleServerProcessingClaim(elapsed time.Duration, serverProcessingMs uint32) bool {
+	networkMs := elapsed.Seconds()*1000 - float64(serverProcessingMs)
+	return networkMs < 1
 }
 
 // estimateThroughputMbps is ADR-015 §2's approximation, spelled out: a

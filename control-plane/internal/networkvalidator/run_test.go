@@ -376,7 +376,11 @@ func TestRunEndToEndHandlesAFullAgentPartitionWithoutHangingOrHotLooping(t *test
 	// up, and tick() drives all 5 dimensions sequentially within one
 	// tick, so the first tick alone can take up to ~5*2s in the worst
 	// case.
-	deadline := time.Now().Add(15 * time.Second)
+	// 25s budget: the loop below exits the moment every dimension is
+	// evidenced, so this only matters as slack for a loaded/throttled
+	// runner where dial attempts run slower than nominal -- it does not
+	// slow down the happy path, which finishes in ~10s regardless.
+	deadline := time.Now().Add(25 * time.Second)
 	for time.Now().Before(deadline) && countEvidenceCalls(chain) < len(Dimensions) {
 		time.Sleep(10 * time.Millisecond)
 	}

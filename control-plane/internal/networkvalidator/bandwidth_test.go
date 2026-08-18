@@ -181,8 +181,12 @@ func TestMeasureBandwidthFailsOnContextDeadlineDuringProbe(t *testing.T) {
 		declaredEgressMbps:  1,
 		// Longer than the client's ChallengeTimeout below, so the RPC's
 		// own context expires mid-flight rather than the connection ever
-		// being refused.
-		artificialLatency: 3 * time.Second,
+		// being refused. Kept just comfortably above ChallengeTimeout
+		// (not seconds above it) -- the fake handler ignores ctx and
+		// sleeps for the full duration regardless of the client giving
+		// up, so harness.close()'s graceful grpcServer.Stop() has to
+		// wait out whatever is left of this sleep on every run.
+		artificialLatency: 700 * time.Millisecond,
 	}
 	harness := startTestAgentHarness(t, fake)
 	defer harness.close()
@@ -388,6 +392,45 @@ func TestEstimateThroughputMbpsSplitsProportionallyBySize(t *testing.T) {
 	}
 	if egressOnly != 0 {
 		t.Fatalf("expected exactly zero egress throughput when downloadBytes is 0, got %v", egressOnly)
+	}
+}
+
+// TestImplausibleServerProcessingClaim pins the exact boundary
+// implausibleServerProcessingClaim rejects at, with deterministic
+// time.Duration values -- no real gRPC round trip involved, so these are
+// fast and exact rather than timing-dependent. Two things this exercises
+// that the full-harness TestMeasureBandwidthRejectsImplausibleServerProcessingTime
+// (60_000ms, nowhere near the boundary) does not:
+//
+//   - a claim that stays clearly below elapsed but still leaves under 1ms
+//     of network time must be rejected too, not just a claim that exceeds
+//     elapsed outright -- the whole point of matching estimateThroughputMbps's
+//     floor rather than a bare ">" comparison (see the function's doc
+//     comment for the exploit this closes).
+//   - the boundary is computed identically to estimateThroughputMbps's own
+//     networkMs, in floating milliseconds, so elapsed.Milliseconds()'s
+//     truncation can never make this check disagree with what the floor
+//     would actually have done.
+func TestImplausibleServerProcessingClaim(t *testing.T) {
+	cases := []struct {
+		name               string
+		elapsed            time.Duration
+		serverProcessingMs uint32
+		want               bool
+	}{
+		{"comfortable margin", 100 * time.Millisecond, 50, false},
+		{"exactly 1ms of network time remains: at the floor, not below it", 51 * time.Millisecond, 50, false},
+		{"just under 1ms of network time remains", 50*time.Millisecond + 500*time.Microsecond, 50, true},
+		{"claim equals the round trip exactly: zero network time", 50 * time.Millisecond, 50, true},
+		{"claim exceeds the round trip: outright impossible", 50 * time.Millisecond, 51, true},
+		{"sub-millisecond fractional elapsed the old integer-truncated check would have hidden", 6*time.Millisecond + 900*time.Microsecond, 6, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := implausibleServerProcessingClaim(tc.elapsed, tc.serverProcessingMs); got != tc.want {
+				t.Fatalf("implausibleServerProcessingClaim(%v, %d) = %v, want %v", tc.elapsed, tc.serverProcessingMs, got, tc.want)
+			}
+		})
 	}
 }
 
