@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -151,6 +152,114 @@ func TestMeasureBandwidthReportsFailureForUnreachableAgent(t *testing.T) {
 	if result.Reason == "" {
 		t.Fatal("expected a non-empty failure reason")
 	}
+	// A declared capacity (1/1 Mbps above) makes this dimension judgeable:
+	// an unreachable Agent is a genuine failure, not a gap in discovery
+	// data, and must never be conflated with Unscored (see
+	// ChallengeResult.Unscored's doc comment) just because the network
+	// partition and the "nothing to verify against" case both surface as
+	// a failed probe internally.
+	if result.Unscored {
+		t.Fatal("Unscored = true; capacity was declared, so an unreachable Agent must be a genuine failure, not an unscored gap")
+	}
+}
+
+// TestMeasureBandwidthFailsOnContextDeadlineDuringProbe is the "agent
+// accepts the connection but never responds in time" partition variant,
+// distinct from TestMeasureBandwidthReportsFailureForUnreachableAgent's
+// immediate connection-refused: the Agent here is reachable and the gRPC
+// call is genuinely in flight, but it exceeds the validator's own
+// deadline. Must resolve the same way -- a failed, judged result, not a
+// hang and not an error returned from MeasureBandwidth itself.
+func TestMeasureBandwidthFailsOnContextDeadlineDuringProbe(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey:          agentPriv,
+		declaredIngressMbps: 1,
+		declaredEgressMbps:  1,
+		// Longer than the client's ChallengeTimeout below, so the RPC's
+		// own context expires mid-flight rather than the connection ever
+		// being refused. Kept just comfortably above ChallengeTimeout
+		// (not seconds above it) -- the fake handler ignores ctx and
+		// sleeps for the full duration regardless of the client giving
+		// up, so harness.close()'s graceful grpcServer.Stop() has to
+		// wait out whatever is left of this sleep on every run.
+		artificialLatency: 700 * time.Millisecond,
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	resolver, err := NewEndpointResolver(harness.dashboard.URL)
+	if err != nil {
+		t.Fatalf("new endpoint resolver: %v", err)
+	}
+	client := NewChallengeClient(ChallengeClientConfig{
+		Resolver:                resolver,
+		ClientCertificate:       testValidatorClientCert(t),
+		DialTimeout:             1 * time.Second,
+		ChallengeTimeout:        300 * time.Millisecond,
+		BandwidthProbesPerRound: 1,
+	})
+
+	started := time.Now()
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("MeasureBandwidth took %v to return after a deadline-exceeded probe; a partition must not hang the caller", elapsed)
+	}
+	if result.ScoreBps != failingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d for a probe that exceeded its deadline", result.ScoreBps, failingScoreBps)
+	}
+	if result.Unscored {
+		t.Fatal("Unscored = true; capacity was declared, a deadline-exceeded probe must be a genuine failure")
+	}
+	if result.Reason == "" {
+		t.Fatal("expected a non-empty failure reason")
+	}
+}
+
+// TestMeasureBandwidthFailsWhenAgentPartitionsMidRound simulates a
+// partition that starts partway through a multi-probe round (the Agent
+// answers the first probe normally, then goes unreachable) rather than
+// being down for the whole round -- the anti-gaming "one failed probe
+// fails the whole round" property (see MeasureBandwidth's doc comment)
+// must hold for a genuine mid-round partition exactly as it does for a
+// tampered probe.
+func TestMeasureBandwidthFailsWhenAgentPartitionsMidRound(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey:            agentPriv,
+		declaredIngressMbps:   1,
+		declaredEgressMbps:    1,
+		failBandwidthFromCall: 2, // the first of 3 probes succeeds, then the partition begins
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClientWithProbes(t, harness, 3)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.ScoreBps != failingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d when the Agent partitions mid-round", result.ScoreBps, failingScoreBps)
+	}
+	if result.Unscored {
+		t.Fatal("Unscored = true; capacity was declared, a mid-round partition must be a genuine failure")
+	}
+	fake.mu.Lock()
+	calls := fake.measureBandwidthCalls
+	fake.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("measureBandwidthCalls = %d, want 2 (stops at the partitioned call, does not run probe 3)", calls)
+	}
 }
 
 // newChallengeClientWithProbes is newChallengeClient plus an explicit
@@ -286,6 +395,45 @@ func TestEstimateThroughputMbpsSplitsProportionallyBySize(t *testing.T) {
 	}
 }
 
+// TestImplausibleServerProcessingClaim pins the exact boundary
+// implausibleServerProcessingClaim rejects at, with deterministic
+// time.Duration values -- no real gRPC round trip involved, so these are
+// fast and exact rather than timing-dependent. Two things this exercises
+// that the full-harness TestMeasureBandwidthRejectsImplausibleServerProcessingTime
+// (60_000ms, nowhere near the boundary) does not:
+//
+//   - a claim that stays clearly below elapsed but still leaves under 1ms
+//     of network time must be rejected too, not just a claim that exceeds
+//     elapsed outright -- the whole point of matching estimateThroughputMbps's
+//     floor rather than a bare ">" comparison (see the function's doc
+//     comment for the exploit this closes).
+//   - the boundary is computed identically to estimateThroughputMbps's own
+//     networkMs, in floating milliseconds, so elapsed.Milliseconds()'s
+//     truncation can never make this check disagree with what the floor
+//     would actually have done.
+func TestImplausibleServerProcessingClaim(t *testing.T) {
+	cases := []struct {
+		name               string
+		elapsed            time.Duration
+		serverProcessingMs uint32
+		want               bool
+	}{
+		{"comfortable margin", 100 * time.Millisecond, 50, false},
+		{"exactly 1ms of network time remains: at the floor, not below it", 51 * time.Millisecond, 50, false},
+		{"just under 1ms of network time remains", 50*time.Millisecond + 500*time.Microsecond, 50, true},
+		{"claim equals the round trip exactly: zero network time", 50 * time.Millisecond, 50, true},
+		{"claim exceeds the round trip: outright impossible", 50 * time.Millisecond, 51, true},
+		{"sub-millisecond fractional elapsed the old integer-truncated check would have hidden", 6*time.Millisecond + 900*time.Microsecond, 6, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := implausibleServerProcessingClaim(tc.elapsed, tc.serverProcessingMs); got != tc.want {
+				t.Fatalf("implausibleServerProcessingClaim(%v, %d) = %v, want %v", tc.elapsed, tc.serverProcessingMs, got, tc.want)
+			}
+		})
+	}
+}
+
 // An undeclared capacity must produce an explicitly unscored result, not
 // a pass. Scoring it as a pass wrote 10_000 basis points into consensus
 // state on the strength of no verification at all, which is the false
@@ -406,6 +554,227 @@ func TestMeasureBandwidthFailsAnAsymmetricLinkInEitherDirection(t *testing.T) {
 				t.Fatalf("ScoreBps = %d, want %d: one failing direction must fail the round outright, never average to a partial pass (reason=%q)",
 					result.ScoreBps, failingScoreBps, result.Reason)
 			}
+			// The Reason must still report both directions' figures, not
+			// just the failing one -- proof the passing direction's
+			// measurement was not silently dropped or corrupted by the
+			// other direction's failure.
+			if !strings.Contains(result.Reason, "ingress=") || !strings.Contains(result.Reason, "egress=") {
+				t.Fatalf("Reason %q does not report both directions", result.Reason)
+			}
 		})
+	}
+}
+
+// TestMeasureBandwidthPassesAsymmetricLinkWhenBothDirectionsClearTheirOwnThreshold
+// is the pass-side complement to TestMeasureBandwidthFailsAnAsymmetric-
+// LinkInEitherDirection: genuinely different (not extreme/unattainable)
+// declared ingress and egress figures, both independently clearable by a
+// real loopback link, must both independently pass -- proving the two
+// thresholds are applied to their own direction and not, say, swapped or
+// collapsed into a single shared check.
+func TestMeasureBandwidthPassesAsymmetricLinkWhenBothDirectionsClearTheirOwnThreshold(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	harness := startTestAgentHarness(t, &fakeAgentServer{
+		privateKey: agentPriv,
+		// Different figures in each direction -- any real loopback link
+		// clears both, so a bug that applied the wrong threshold to the
+		// wrong direction (or averaged them) would only be caught by a
+		// case like TestMeasureBandwidthFailsAnAsymmetricLinkInEither-
+		// Direction above; this case instead pins that two merely
+		// *different* (not swapped-to-fail) declared figures still both
+		// pass together.
+		declaredIngressMbps: 1,
+		declaredEgressMbps:  2,
+	})
+	defer harness.close()
+
+	client := newChallengeClient(t, harness)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.Unscored {
+		t.Fatalf("Unscored = true; both directions were declared (reason=%q)", result.Reason)
+	}
+	if result.ScoreBps != passingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d: both directions independently clear their own (different) threshold (reason=%q)", result.ScoreBps, passingScoreBps, result.Reason)
+	}
+}
+
+// --- Congestion (issue #73): probes that succeed but are slow/degraded.
+//
+// The scoring itself stays the binary pass/fail ADR-015 §5 specifies --
+// there is no partial credit in this design -- but the *measurement* that
+// feeds that decision must reflect degradation proportionally (a slower
+// probe produces a lower Mbps figure, not a crash or a hard-coded value),
+// and the tolerance check must be what separates "slower but still
+// acceptable" from "too slow," not an unrelated hard failure mode. The
+// three tests below exercise that with fakeAgentServer's artificialLatency
+// knob, which inflates a real measured round trip the same way a
+// congested link would (see the knob's doc comment).
+
+// TestMeasureBandwidthPassesDespiteElevatedLatencyWithinTolerance: a
+// probe slowed down by injected latency still measures comfortably above
+// a low declared figure -- congestion that stays within tolerance must
+// not be treated as an automatic fail just because it is slower than an
+// unloaded link would be.
+func TestMeasureBandwidthPassesDespiteElevatedLatencyWithinTolerance(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey: agentPriv,
+		// 10 Mbps (7 Mbps at the 70% threshold) stays clearable even in a
+		// pessimistic worst case for this injected delay -- see the
+		// congestion tests' shared reasoning in this file's PR description.
+		declaredIngressMbps: 10,
+		declaredEgressMbps:  10,
+		artificialLatency:   400 * time.Millisecond,
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClientWithProbes(t, harness, 1)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.Unscored {
+		t.Fatalf("Unscored = true; capacity was declared (reason=%q)", result.Reason)
+	}
+	if result.ScoreBps != passingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d: congestion that stays within tolerance must still pass (reason=%q)", result.ScoreBps, passingScoreBps, result.Reason)
+	}
+}
+
+// TestMeasureBandwidthFailsWhenElevatedLatencyDropsBelowTolerance: the
+// same injected delay against a declared figure the degraded link cannot
+// plausibly clear -- congestion severe enough to breach the tolerance
+// must still fail cleanly (a scored 0 with a reason), the same as any
+// other failing measurement, not a different/special-cased outcome.
+func TestMeasureBandwidthFailsWhenElevatedLatencyDropsBelowTolerance(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey: agentPriv,
+		// 1000 Mbps (700 Mbps at the 70% threshold) is above what an 8MiB
+		// probe can measure once >=400ms of the round trip is pure
+		// injected delay, even in the most favorable (near-zero transfer
+		// overhead) case: networkMs >= ~399ms split 50/50 by direction
+		// caps each direction at roughly 67_108_864 bits / 199.5ms/1000 ~=
+		// 336 Mbps, safely under the 700 Mbps threshold regardless of test
+		// environment variance.
+		declaredIngressMbps: 1000,
+		declaredEgressMbps:  1000,
+		artificialLatency:   400 * time.Millisecond,
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClientWithProbes(t, harness, 1)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.Unscored {
+		t.Fatalf("Unscored = true; capacity was declared (reason=%q)", result.Reason)
+	}
+	if result.ScoreBps != failingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d: congestion severe enough to breach tolerance must fail (reason=%q)", result.ScoreBps, failingScoreBps, result.Reason)
+	}
+}
+
+// TestMeasureBandwidthRoundReflectsTheSlowestProbeAmongMultiple: only the
+// middle of 3 probes is congested. ADR-025 §1's minimum-across-probes
+// anti-gaming property (already pinned for tampered/failed probes by
+// TestMeasureBandwidthFailsTheWholeRoundIfAnySingleProbeFails) must apply
+// identically to a probe that is merely slow, not corrupt: two fast probes
+// cannot average out one genuinely congested one.
+func TestMeasureBandwidthRoundReflectsTheSlowestProbeAmongMultiple(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey: agentPriv,
+		// Same reasoning as TestMeasureBandwidthFailsWhenElevatedLatency-
+		// DropsBelowTolerance: 1000 Mbps is unreachable by the one
+		// congested probe no matter how fast the other two are.
+		declaredIngressMbps:     1000,
+		declaredEgressMbps:      1000,
+		artificialLatency:       400 * time.Millisecond,
+		artificialLatencyOnCall: 2, // only the middle of 3 probes
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClientWithProbes(t, harness, 3)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.ScoreBps != failingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d: one congested probe among two fast ones must still fail the round (reason=%q)", result.ScoreBps, failingScoreBps, result.Reason)
+	}
+	fake.mu.Lock()
+	calls := fake.measureBandwidthCalls
+	fake.mu.Unlock()
+	if calls != 3 {
+		t.Fatalf("measureBandwidthCalls = %d, want 3: unlike a failed/tampered probe, a merely slow one still completes and all 3 probes run", calls)
+	}
+}
+
+// --- Spoofed/tampered results (issue #73).
+
+// TestMeasureBandwidthRejectsImplausibleServerProcessingTime pins the
+// bug fix in this PR: a correctly-signed response (the Agent has the
+// real private key -- this is not a signature-tamper case, see
+// TestMeasureBandwidthFailsOnTamperedSignature for that) that claims a
+// server_processing_ms wildly exceeding the validator's own observed
+// round trip must be rejected as physically implausible, not trusted at
+// face value. Before the fix, estimateThroughputMbps's networkMs floor
+// (see its doc comment) silently turned this into a near-zero network
+// time and therefore an astronomically inflated -- and passing --
+// throughput figure, letting a dishonest Agent manufacture a pass for a
+// link that was never actually measured.
+func TestMeasureBandwidthRejectsImplausibleServerProcessingTime(t *testing.T) {
+	_, agentPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate agent key: %v", err)
+	}
+	fake := &fakeAgentServer{
+		privateKey: agentPriv,
+		// Low enough that an honest probe would trivially pass -- so a
+		// pass here can only be explained by the spoofed processing time,
+		// not a genuinely fast link.
+		declaredIngressMbps: 1,
+		declaredEgressMbps:  1,
+		// 60s claimed processing time, correctly signed, against a
+		// loopback round trip that in reality takes a small fraction of a
+		// second.
+		spoofServerProcessingMs: 60_000,
+	}
+	harness := startTestAgentHarness(t, fake)
+	defer harness.close()
+
+	client := newChallengeClient(t, harness)
+	result, err := client.MeasureBandwidth(context.Background(), harness.providerID)
+	if err != nil {
+		t.Fatalf("MeasureBandwidth: %v", err)
+	}
+	if result.ScoreBps != failingScoreBps {
+		t.Fatalf("ScoreBps = %d, want %d: an implausible server_processing_ms must be rejected, not scored as a pass (reason=%q)", result.ScoreBps, failingScoreBps, result.Reason)
+	}
+	if result.Unscored {
+		t.Fatal("Unscored = true; capacity was declared, this must be a genuine rejection, not an unscored gap")
+	}
+	if result.Reason == "" {
+		t.Fatal("expected a non-empty failure reason")
 	}
 }
