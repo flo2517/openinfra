@@ -30,7 +30,7 @@ cleanup() {
   if [[ -n "$deploy_workload_id" && -n "$deploy_api_key" ]]; then
     OPENINFRA_API_KEY="$deploy_api_key" "$workloadctl_bin" stop "$deploy_workload_id" >/dev/null 2>&1 || true
     for _ in $(seq 1 20); do
-      state="$(OPENINFRA_API_KEY="$deploy_api_key" "$workloadctl_bin" get "$deploy_workload_id" 2>/dev/null | sed -n 's/^state: //p')"
+      state="$(OPENINFRA_API_KEY="$deploy_api_key" "$workloadctl_bin" get "$deploy_workload_id" 2>/dev/null | sed -n 's/^state: //p')" || true
       [[ "$state" == "WORKLOAD_STATE_STOPPED" || "$state" == "WORKLOAD_STATE_FAILED" ]] && break
       sleep 3
     done
@@ -56,14 +56,14 @@ cleanup() {
       "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"DELETE FROM api_keys WHERE user_id='$deploy_user_id'; DELETE FROM users WHERE user_id='$deploy_user_id';\"" >/dev/null || true
   fi
   if [[ -n "$deploy_agent_dir" ]]; then
-    rm -rf "$deploy_agent_dir"
+    rm -rf "$deploy_agent_dir" || true
   fi
   if [[ -n "$provider_id" ]]; then
     "${compose[@]}" exec -T redis redis-cli DEL "openinfra:heartbeat:$provider_id" >/dev/null || true
     "${compose[@]}" exec -T postgres sh -c \
       "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"DELETE FROM provider_chain_registrations WHERE provider_id='$provider_id'; DELETE FROM provider_join_completions WHERE provider_id='$provider_id'; DELETE FROM provider_join_challenges WHERE provider_id='$provider_id'; DELETE FROM providers WHERE provider_id='$provider_id';\"" >/dev/null || true
   fi
-  rm -rf "$test_dir"
+  rm -rf "$test_dir" || true
 }
 trap cleanup EXIT
 
@@ -157,7 +157,22 @@ sed -i "s#^  advertised_endpoint: ''#  advertised_endpoint: https://host.docker.
 # (confirmed via control-plane's logs: the extrinsic was accepted on
 # chain -- "Transaction Already Imported" on the retried attempt -- the
 # client had simply been killed before the response came back).
-deploy_join_output="$(timeout 45s "$agent" join)"
+if ! deploy_join_output="$(timeout 45s "$agent" join)"; then
+  # Capture whatever provider_id we can before failing: per the 45s comment
+  # above, the extrinsic can land server-side even after the client gives
+  # up, and cleanup()'s "if -n deploy_provider_id" guard needs a non-empty
+  # value to have any chance of removing that state. If the client was
+  # killed before ever printing "Provider ACTIVE: ...", this still comes up
+  # empty and that server-side state is orphaned -- flagged loudly here
+  # rather than left as a silent leak, since there is no way to derive the
+  # provider_id from a join call that never got far enough to report one.
+  deploy_provider_id="$(sed -n 's/^Provider ACTIVE: //p' <<<"$deploy_join_output")"
+  echo "deploy agent join failed or timed out (output: ${deploy_join_output:-<none>})" >&2
+  if [[ -z "$deploy_provider_id" ]]; then
+    echo "no provider_id was ever printed -- if the extrinsic landed server-side anyway, that state cannot be automatically cleaned up by this script" >&2
+  fi
+  exit 1
+fi
 deploy_provider_id="$(sed -n 's/^Provider ACTIVE: //p' <<<"$deploy_join_output")"
 [[ "$deploy_provider_id" =~ ^[0-9a-f]{64}$ ]]
 
@@ -193,6 +208,14 @@ get_output=""
 for _ in $(seq 1 90); do
   get_output="$(OPENINFRA_API_KEY="$deploy_api_key" "$workloadctl_bin" get "$deploy_workload_id")"
   deploy_state="$(sed -n 's/^state: //p' <<<"$get_output")"
+  # Captured on every iteration, not just after a confirmed RUNNING: the
+  # Agent can already have `docker run`'d a real container while Postgres
+  # still shows an earlier state (DEPLOYING), and BollardEngine's containers
+  # are independent dockerd-managed processes -- killing deploy_agent_pid
+  # does not stop them. If this loop times out below, cleanup() still needs
+  # whatever container_id was last observed to reach in and remove it,
+  # rather than leaking it because the RUNNING state was never reached.
+  deploy_container_id="$(sed -n 's/^container_id: //p' <<<"$get_output")"
   [[ "$deploy_state" == "WORKLOAD_STATE_RUNNING" || "$deploy_state" == "WORKLOAD_STATE_FAILED" ]] && break
   sleep 3
 done
@@ -201,7 +224,6 @@ if [[ "$deploy_state" != "WORKLOAD_STATE_RUNNING" ]]; then
   echo "$get_output" >&2
   exit 1
 fi
-deploy_container_id="$(sed -n 's/^container_id: //p' <<<"$get_output")"
 [[ -n "$deploy_container_id" ]]
 
 # Verify the container is real on the provider (Docker) side, not just a

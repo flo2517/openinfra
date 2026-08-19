@@ -52,6 +52,29 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return usageError()
 	}
+	// Validated before connect() dials anything: a typo'd subcommand or a
+	// wrong arg count is a usage mistake, not a connectivity problem, and
+	// should be reported as one even when TLS_CERT_FILE/TLS_KEY_FILE/
+	// TLS_CA_FILE/TLS_SERVER_NAME aren't set -- an anticipated case for
+	// ad-hoc interactive use (see this file's header comment), where an
+	// unrelated TLS/dial error would otherwise mask the actual mistake.
+	switch args[0] {
+	case "submit":
+		if len(args) != 6 {
+			return errors.New("usage: workloadctl submit <image@sha256:digest> <cpu-cores> <ram-mb> <storage-gb> <duration-seconds>")
+		}
+	case "get":
+		if len(args) != 2 {
+			return errors.New("usage: workloadctl get <workload-id>")
+		}
+	case "stop":
+		if len(args) != 2 {
+			return errors.New("usage: workloadctl stop <workload-id>")
+		}
+	default:
+		return usageError()
+	}
+
 	apiKey := os.Getenv("OPENINFRA_API_KEY")
 	if apiKey == "" {
 		return errors.New("OPENINFRA_API_KEY is required (mint one with `controlplane-admin create-user`)")
@@ -66,19 +89,10 @@ func run(args []string) error {
 
 	switch args[0] {
 	case "submit":
-		if len(args) != 6 {
-			return errors.New("usage: workloadctl submit <image@sha256:digest> <cpu-cores> <ram-mb> <storage-gb> <duration-seconds>")
-		}
 		return submit(ctx, client, apiKey, args[1], args[2], args[3], args[4], args[5])
 	case "get":
-		if len(args) != 2 {
-			return errors.New("usage: workloadctl get <workload-id>")
-		}
 		return get(ctx, client, apiKey, args[1])
 	case "stop":
-		if len(args) != 2 {
-			return errors.New("usage: workloadctl stop <workload-id>")
-		}
 		return stop(ctx, client, apiKey, args[1])
 	default:
 		return usageError()
@@ -86,7 +100,7 @@ func run(args []string) error {
 }
 
 func usageError() error {
-	return errors.New("usage: workloadctl <submit <image@sha256:digest> <cpu-cores> <ram-mb> <storage-gb> <duration-seconds> | get <workload-id> | stop <workload-id>>")
+	return errors.New("usage: workloadctl {submit <image@sha256:digest> <cpu-cores> <ram-mb> <storage-gb> <duration-seconds> | get <workload-id> | stop <workload-id>}")
 }
 
 // connect dials the Control Plane over mTLS using the same
