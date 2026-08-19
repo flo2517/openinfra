@@ -207,6 +207,46 @@ func TestDeployRetryReconcilesStatusBeforeIdempotentReplay(t *testing.T) {
 	}
 }
 
+// TestDeployingCarriesReservedEgressMbpsIntoTheDeployRequest is ADR-025
+// §3's control-plane-side wiring: DEPLOYING must carry the workload's
+// declared Bandwidth.EgressMbps (WorkloadDefinition.Requirements,
+// scheduling-side) through into DeployRequest.Limits.EgressMbps (agent-
+// executor's tc-enforcement input) unchanged, and must degrade to 0 --
+// "no reservation, no tc rule" -- when the workload declared no
+// bandwidth requirement at all, never a hard failure.
+func TestDeployingCarriesReservedEgressMbpsIntoTheDeployRequest(t *testing.T) {
+	tests := []struct {
+		name         string
+		requirements *sharedv1.ResourceRequirements
+		want         int32
+	}{
+		{"with bandwidth requirement", &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256, Bandwidth: &sharedv1.Bandwidth{EgressMbps: 75}}, 75},
+		{"without bandwidth requirement", &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256}, 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			definition, err := proto.Marshal(&sharedv1.WorkloadDefinition{Requirements: test.requirements})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item := workloadapi.Workload{WorkloadID: "workload", State: "DEPLOYING", Definition: definition, ProviderID: "provider", LeaseID: "42", Version: 1}
+			store := &recordingStore{item: item}
+			provider := agentmanager.SchedulableProvider{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "provider", AgentEndpoint: "https://agent:50052"}}
+			dispatcher := &capturingDispatcher{}
+			worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, dispatcher, testRanker())
+			if err := worker.processOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if dispatcher.request == nil {
+				t.Fatal("no DeployRequest captured")
+			}
+			if got := dispatcher.request.Limits.EgressMbps; got != test.want {
+				t.Fatalf("EgressMbps = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 type recordingStore struct {
 	item                workloadapi.Workload
 	action, claimWorker string
@@ -271,6 +311,18 @@ func (successfulDispatcher) DeployAndConfirm(context.Context, agentmanager.Regis
 	return "container", nil
 }
 func (successfulDispatcher) StopAndConfirm(context.Context, agentmanager.RegisteredProvider, string) error {
+	return nil
+}
+
+// capturingDispatcher records the last DeployRequest it received so a
+// test can assert on Limits without needing a real Agent.
+type capturingDispatcher struct{ request *agentv1.DeployRequest }
+
+func (d *capturingDispatcher) DeployAndConfirm(_ context.Context, _ agentmanager.RegisteredProvider, req *agentv1.DeployRequest) (string, error) {
+	d.request = req
+	return "container", nil
+}
+func (d *capturingDispatcher) StopAndConfirm(context.Context, agentmanager.RegisteredProvider, string) error {
 	return nil
 }
 

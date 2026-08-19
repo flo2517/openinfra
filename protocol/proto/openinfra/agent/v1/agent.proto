@@ -65,6 +65,18 @@ message DeployRequest {
 message ResourceLimits {
   float cpu_cores = 1;
   int64 memory_mb = 2;
+  // ADR-025 §3: the workload's *reserved* egress rate, megabits per
+  // second -- sourced from the same WorkloadDefinition.Requirements.
+  // Bandwidth.egress_mbps (shared.proto) the scheduler already fit-scores
+  // against, carried through to the Agent alongside cpu_cores/memory_mb
+  // so agent-executor can apply a host-side `tc` ceiling at container
+  // start, the same way memory_mb/cpu_cores become Docker's HostConfig
+  // quotas. 0 means the workload declared no bandwidth requirement --
+  // no `tc` rule is applied, matching Bandwidth's existing "0 means not
+  // advertised" convention elsewhere on this message. Egress only in
+  // this slice; ingress shaping is a known, deliberately deferred
+  // asymmetry (see the ADR).
+  int32 egress_mbps = 3;
 }
 
 message DeployResponse {

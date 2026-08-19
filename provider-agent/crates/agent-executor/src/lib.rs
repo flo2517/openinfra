@@ -1,4 +1,5 @@
 mod bandwidth;
+mod rate_limit;
 
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
 use agent_api::{Executor, WorkloadStatus};
@@ -14,6 +15,7 @@ use bollard::container::{
 };
 use bollard::models::HostConfig;
 use bollard::Docker;
+pub use rate_limit::{CommandRunner, RateLimiter, SystemCommandRunner};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,6 +37,10 @@ pub struct ContainerSpec {
     pub memory_bytes: i64,
     pub nano_cpus: i64,
     pub pids_limit: i64,
+    /// ADR-025 §3: the workload's reserved egress rate, Mbps. 0 means
+    /// "no bandwidth requirement declared" -- no `tc` rule is applied,
+    /// matching `ResourceLimits.egress_mbps`'s own wire convention.
+    pub egress_mbps: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,10 +60,17 @@ pub trait ContainerEngine: Send + Sync {
     /// from the host side of its veth pair. See `bandwidth::read_bandwidth`
     /// for the exact mechanism.
     async fn bandwidth(&self, container_id: &str) -> Result<WorkloadBandwidth, ExecutorError>;
+    /// ADR-025 §3: applies this workload's reserved egress rate as a host-
+    /// side `tc` ceiling against its veth pair. Callers must only invoke
+    /// this when `egress_mbps > 0` (see `RateLimiter::apply`'s doc
+    /// comment) -- `DockerExecutor::deploy` is the single call site and
+    /// already guards on that.
+    async fn rate_limit(&self, container_id: &str, egress_mbps: i32) -> Result<(), ExecutorError>;
 }
 
 pub struct BollardEngine {
     docker: Docker,
+    rate_limiter: RateLimiter,
 }
 
 impl BollardEngine {
@@ -65,7 +78,28 @@ impl BollardEngine {
         Ok(Self {
             docker: Docker::connect_with_local_defaults()
                 .map_err(|error| ExecutorError::Engine(error.to_string()))?,
+            rate_limiter: RateLimiter::new(Arc::new(SystemCommandRunner)),
         })
+    }
+
+    /// Resolves `container_id`'s host-visible PID via Docker inspect --
+    /// the same lookup `bandwidth()` needs (for `read_bandwidth`) and
+    /// `rate_limit()` needs (for `RateLimiter::apply`), factored out so
+    /// neither re-implements "container has no state"/"container has no
+    /// pid" error handling independently.
+    async fn container_pid(&self, container_id: &str) -> Result<i64, ExecutorError> {
+        let response = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|error| ExecutorError::Engine(error.to_string()))?;
+        let state = response
+            .state
+            .ok_or_else(|| ExecutorError::Engine("container has no state".to_string()))?;
+        state
+            .pid
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| ExecutorError::Engine("container has no pid".to_string()))
     }
 }
 
@@ -161,6 +195,11 @@ impl ContainerEngine for BollardEngine {
             .ok_or_else(|| ExecutorError::Engine("container has no started_at".to_string()))
             .and_then(parse_docker_timestamp)?;
         bandwidth::read_bandwidth(Path::new("/"), pid, started_at)
+    }
+
+    async fn rate_limit(&self, container_id: &str, egress_mbps: i32) -> Result<(), ExecutorError> {
+        let pid = self.container_pid(container_id).await?;
+        self.rate_limiter.apply(Path::new("/"), pid, egress_mbps)
     }
 }
 
@@ -286,6 +325,16 @@ impl DockerExecutor {
                 "memory_mb must be positive and within policy".to_string(),
             ));
         }
+        // ADR-025 §3: 0 is the valid, common "no bandwidth requirement
+        // declared" case (see ResourceLimits.egress_mbps's doc comment) --
+        // only negative is rejected, unlike cpu_cores/memory_mb above
+        // which require strictly positive because every workload has some
+        // real CPU/memory footprint.
+        if limits.egress_mbps < 0 {
+            return Err(ExecutorError::InvalidRequest(
+                "egress_mbps must not be negative".to_string(),
+            ));
+        }
         let memory_bytes = limits.memory_mb.checked_mul(MIB).ok_or_else(|| {
             ExecutorError::InvalidRequest("memory limit overflows bytes".to_string())
         })?;
@@ -328,6 +377,7 @@ impl DockerExecutor {
                 memory_bytes,
                 nano_cpus,
                 pids_limit: self.settings.pids_limit,
+                egress_mbps: limits.egress_mbps,
             },
         ))
     }
@@ -475,6 +525,23 @@ impl Executor for DockerExecutor {
             self.state.store_workload(&record)?;
             return Err(ExecutorError::StateConfirmation(container_id).into());
         }
+        // ADR-025 §3: the fourth quota, applied only now that Docker has
+        // actually allocated the container's veth pair (start + a
+        // confirmed running observation, same ordering the ADR requires).
+        // egress_mbps == 0 means the workload declared no bandwidth
+        // requirement -- skip entirely rather than apply a nonsensical
+        // zero-rate ceiling.
+        if spec.egress_mbps > 0 {
+            if let Err(error) = self
+                .engine
+                .rate_limit(&container_id, spec.egress_mbps)
+                .await
+            {
+                record.phase = WorkloadPhase::Failed;
+                self.state.store_workload(&record)?;
+                return Err(error.into());
+            }
+        }
         record.phase = WorkloadPhase::Running;
         self.state.store_workload(&record)?;
         info!(workload_id = %record.workload_id, %container_id, "Docker confirmed workload running");
@@ -532,6 +599,14 @@ mod tests {
         // for a configured reading, `Err` (or simply absent) to exercise
         // collect_workload_bandwidth's skip-and-warn degrade path.
         bandwidth_readings: StdMutex<HashMap<String, Result<WorkloadBandwidth, String>>>,
+        // ADR-025 §3: every rate_limit() call this engine received, in
+        // order, as (container_id, egress_mbps) -- lets tests assert
+        // deploy() invoked it with exactly the right target and rate (or
+        // not at all).
+        rate_limit_calls: StdMutex<Vec<(String, i32)>>,
+        // Per-container_id configured failure for rate_limit(); absent
+        // means succeed.
+        rate_limit_failures: StdMutex<HashMap<String, String>>,
     }
 
     #[async_trait]
@@ -612,6 +687,26 @@ mod tests {
                 ))),
             }
         }
+
+        async fn rate_limit(
+            &self,
+            container_id: &str,
+            egress_mbps: i32,
+        ) -> Result<(), ExecutorError> {
+            self.rate_limit_calls
+                .lock()
+                .expect("rate limit calls lock")
+                .push((container_id.to_string(), egress_mbps));
+            if let Some(reason) = self
+                .rate_limit_failures
+                .lock()
+                .expect("rate limit failures lock")
+                .get(container_id)
+            {
+                return Err(ExecutorError::Engine(reason.clone()));
+            }
+            Ok(())
+        }
     }
 
     fn request(workload_id: Uuid, lease_id: Uuid) -> DeployRequest {
@@ -622,6 +717,7 @@ mod tests {
             limits: Some(ResourceLimits {
                 cpu_cores: 1.5,
                 memory_mb: 256,
+                egress_mbps: 0,
             }),
         }
     }
@@ -799,6 +895,91 @@ mod tests {
         assert_eq!(readings[0].1, reading);
     }
 
+    // ADR-025 §3: deploy() must apply the fourth quota (egress rate) only
+    // when the workload actually reserved bandwidth, targeting the exact
+    // container Docker just confirmed running.
+    #[tokio::test]
+    async fn deploy_applies_rate_limit_when_bandwidth_is_reserved() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        request.limits.as_mut().expect("limits").egress_mbps = 50;
+
+        let container_id = executor.deploy(request).await.expect("deploy");
+
+        let calls = engine
+            .rate_limit_calls
+            .lock()
+            .expect("rate limit calls lock");
+        assert_eq!(calls.as_slice(), &[(container_id, 50)]);
+    }
+
+    #[tokio::test]
+    async fn deploy_skips_rate_limit_when_no_bandwidth_is_reserved() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        // request()'s default egress_mbps is 0 -- "no bandwidth
+        // requirement declared" must mean "no tc rule applied", not "a
+        // zero-rate ceiling".
+        let request = request(Uuid::new_v4(), Uuid::new_v4());
+
+        executor.deploy(request).await.expect("deploy");
+
+        assert!(engine
+            .rate_limit_calls
+            .lock()
+            .expect("rate limit calls lock")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deploy_marks_workload_failed_when_rate_limit_application_fails() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        // FakeEngine::create names containers deterministically
+        // ("container-<n>" by creation order), so the first container a
+        // fresh engine creates in this test is known ahead of deploy().
+        engine
+            .rate_limit_failures
+            .lock()
+            .expect("rate limit failures lock")
+            .insert(
+                "container-1".to_string(),
+                "tc: RTNETLINK answers: Permission denied".to_string(),
+            );
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        request.limits.as_mut().expect("limits").egress_mbps = 50;
+        let workload_id = request.workload_id.clone();
+
+        let result = executor.deploy(request).await;
+
+        assert!(result.is_err(), "a failed tc application must fail deploy");
+        // get_status derives its answer from a live Docker/engine
+        // inspection (see DockerExecutor::get_status), which still shows
+        // the container as running -- the persisted WorkloadPhase in
+        // local_state is the source of truth for "did the Agent consider
+        // this deploy successful", so assert on that directly instead.
+        let record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record after failed deploy");
+        assert_eq!(record.phase, WorkloadPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_negative_egress_mbps() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        request.limits.as_mut().expect("limits").egress_mbps = -1;
+
+        assert!(executor.deploy(request).await.is_err());
+    }
+
     #[tokio::test]
     async fn docker_integration_applies_mandatory_controls() {
         let image = match std::env::var("OPENINFRA_TEST_DOCKER_IMAGE") {
@@ -826,6 +1007,13 @@ mod tests {
             limits: Some(ResourceLimits {
                 cpu_cores: 0.5,
                 memory_mb: 64,
+                // 0: this integration test targets Docker's own
+                // HostConfig quotas (mandatory even without CAP_NET_ADMIN,
+                // which this test environment is not guaranteed to have);
+                // ADR-025 §3's tc ceiling is covered by the CommandRunner-
+                // level unit tests in rate_limit.rs instead, see this
+                // module's own tests for the invocation-level coverage.
+                egress_mbps: 0,
             }),
         };
         let container_id = executor.deploy(request.clone()).await.expect("deploy");

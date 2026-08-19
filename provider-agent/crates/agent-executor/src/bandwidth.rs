@@ -2,11 +2,10 @@
 //! Linux interface byte counters of each workload's own network
 //! namespace -- `/sys/class/net/<veth>/statistics/{rx,tx}_bytes`.
 //!
-//! `resolve_veth_name` is also the intended home for ADR-025 §3's `tc`
-//! rate-limit enforcement (not implemented here -- sequenced after this
-//! slice by the ADR itself, which needs `CAP_NET_ADMIN` and its own
-//! explicit sign-off): the ADR calls this "the same lookup serves both",
-//! so §3 can call this function directly instead of re-deriving it.
+//! `resolve_veth_name` is also used by ADR-025 §3's `tc` rate-limit
+//! enforcement (`rate_limit.rs`), exactly as this module's original doc
+//! comment anticipated ("the same lookup serves both") -- `rate_limit.rs`
+//! calls it directly rather than re-deriving veth resolution.
 
 use crate::ExecutorError;
 use std::fs;
@@ -68,7 +67,10 @@ pub fn read_bandwidth(
 /// and traversing to it via `/proc/<pid>/root` reads that same mount,
 /// not the host's. This is the same technique `nsenter -t <pid> -n cat
 /// /sys/class/net/eth0/iflink` and `ip link` use internally.
-fn resolve_veth_name(sys_root: &Path, container_pid: i64) -> Result<String, ExecutorError> {
+pub(crate) fn resolve_veth_name(
+    sys_root: &Path,
+    container_pid: i64,
+) -> Result<String, ExecutorError> {
     let iflink_path = sys_root
         .join("proc")
         .join(container_pid.to_string())
