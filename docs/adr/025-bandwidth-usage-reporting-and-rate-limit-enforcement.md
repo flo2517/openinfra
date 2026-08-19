@@ -110,14 +110,13 @@ dashboard tenant boundaries.
   typical WireGuard framing/encryption overhead), subtracted from the tolerance threshold before
   comparison — so a provider is not penalized for overhead the overlay itself imposes. No new
   mechanism; a second constant read alongside the existing tolerance factor.
-- **Regional endpoint selection**: the scheduler already fit-scores providers (`internal/
-  scheduler`); §2's new usage-reporting path and ADR-015's existing measurement both already
-  produce a validator-observed round-trip time per probe. Feed the most recent measured RTT into
-  the scheduler's existing scoring inputs, weighted alongside price/reputation the same way those
-  already are, rather than adding a new region-tagging system — `agent-inventory`/
-  `ResourceCapability` gain no new required field; a provider that never had a probe run simply
-  scores as "unknown latency," treated as neutral, not penalized, matching #29's "explicit
-  unavailable state, never false success" convention.
+- **Regional endpoint selection**: superseded by
+  [ADR-026](026-availability-zone-selection.md). The RTT-based design sketched in the paragraph
+  this replaces turned out to solve the wrong problem — "regional endpoint selection" in an
+  infrastructure-scheduling context means a workload naming a zone and being placed only on a
+  provider in that zone (a placement constraint the requester declares), not a network-quality
+  signal a validator measures. ADR-026 builds the actual feature; RTT-based latency-aware routing
+  remains a distinct, still-open idea named there as future work, not resurrected here.
 
 ### 5. Required test coverage (implementation checklist, not new decisions)
 
