@@ -144,6 +144,13 @@ func run() error {
 	// RPCClient.LatestActiveNetworkValidators; a read failure degrades to
 	// an empty list inside Service, it never fails ReportHeartbeat itself.
 	service.SetValidatorSource(chainClient)
+	// ADR-025 §2: persist each heartbeat's signed WorkloadBandwidthUsage
+	// entries once the heartbeat signature itself has verified. A store
+	// failure degrades to a warning log inside Service (see
+	// SetBandwidthUsageStore's doc comment), the same fail-open posture
+	// SetValidatorSource above already uses -- this is telemetry, not a
+	// liveness-critical path.
+	service.SetBandwidthUsageStore(providerjoin.NewPostgresBandwidthUsageStore(pool))
 	// Independently drives provider_chain_registrations rows left in
 	// READY/RETRY (e.g. after a Control Plane or chain restart) to
 	// FINALIZED, without depending on the Agent retrying CompleteJoin.

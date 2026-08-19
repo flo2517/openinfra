@@ -80,6 +80,43 @@ message HeartbeatSigningPayload {
   uint64 sequence = 3;
   google.protobuf.Timestamp observed_at = 4;
   openinfra.shared.v1.ResourceCapability capabilities = 5;
+  // ADR-025 §2: per-workload bandwidth usage observed by the Agent since
+  // each container started. Bounded by the Agent's own max_workloads
+  // setting; the Control Plane enforces its own ceiling regardless.
+  //
+  // Carried inside the signing payload rather than alongside it, so the
+  // existing heartbeat signature covers it. ADR-025 §2 sketches a
+  // per-entry `signature` field and says the exact signed bytes are
+  // "pinned by the implementing PR": a second signature here would be the
+  // same key signing the same data on the same transport, and two
+  // verifications that can disagree are worse than one that cannot.
+  repeated WorkloadBandwidthUsage workload_bandwidth = 6;
+}
+
+// WorkloadBandwidthUsage is one workload's cumulative byte counters, as
+// read by the Agent from the Linux interface counters of that workload's
+// own network namespace.
+//
+// Cumulative since container start, never a delta (ADR-025 §2): the
+// Control Plane computes deltas across successive heartbeats itself, so a
+// dropped heartbeat cannot be used to hide a window's usage. A counter
+// that decreases between reports is discarded rather than trusted.
+//
+// Directions are stated from the *workload's* point of view: ingress is
+// traffic into the workload, egress is traffic out of it.
+//
+// Not billing-grade (ADR-025 §2): this is Agent-self-reported telemetry,
+// not independently cross-checked the way MeasureBandwidth evidence is.
+// Anything financial is deferred to the metering/settlement work (v1.1).
+message WorkloadBandwidthUsage {
+  string workload_id = 1;
+  uint64 ingress_bytes_total = 2;
+  uint64 egress_bytes_total = 3;
+  // When the counters started accumulating -- i.e. when this container
+  // started. A change in this value tells the Control Plane the counters
+  // were reset by a restart, so the next reading is a new series and not
+  // a decrease to be discarded.
+  google.protobuf.Timestamp window_started_at = 4;
 }
 
 message ReportHeartbeatResponse {

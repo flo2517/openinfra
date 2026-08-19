@@ -40,3 +40,6 @@ x509-parser = "0.16"
 # existing chain-verification path unchanged) and a self-signed Ed25519
 # cert (to exercise the new allowlist path), per ADR-011 §2.
 rcgen = "0.13"
+# Test-only: a fixed-seed identity key file for the ADR-025 §2
+# cross-language heartbeat wire-bytes fixture.
+tempfile = "3"

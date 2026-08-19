@@ -257,6 +257,7 @@ async fn report_heartbeat_with_state(
             nanos: observed_at.subsec_nanos().try_into()?,
         }),
         capabilities: Some(resource_capability(config, &inventory)),
+        workload_bandwidth: workload_bandwidth_usage(state).await,
     };
     let mut signed = Vec::with_capacity(HEARTBEAT_DOMAIN.len() + payload.encoded_len());
     signed.extend_from_slice(HEARTBEAT_DOMAIN);
@@ -298,6 +299,68 @@ async fn report_heartbeat_with_state(
     info!(%provider_id, sequence, "heartbeat accepted");
     println!("Provider ACTIVE: {provider_id} (heartbeat {sequence})");
     Ok(())
+}
+
+/// ADR-025 §2: this heartbeat's `workload_bandwidth` entries.
+///
+/// No per-entry signature exists on `WorkloadBandwidthUsage` (see that
+/// message's proto doc comment): it lives inside `HeartbeatSigningPayload`,
+/// so the one Ed25519 signature `report_heartbeat_with_state` already
+/// computes over the whole payload (`HEARTBEAT_DOMAIN` ++
+/// `payload.encode()`) covers these entries too. A second signature here
+/// would be the same key signing the same data on the same transport --
+/// deliberately not built, per the WIP commit that added this field.
+///
+/// Connecting to Docker is attempted fresh on every call rather than
+/// reusing a long-lived engine, so this works uniformly from both
+/// `handle_start`'s background loop and the one-shot `handle_heartbeat`
+/// CLI command (which never otherwise touches Docker). A connection
+/// failure degrades to an empty list with a warning rather than failing
+/// the heartbeat -- liveness (this RPC's core job) must not depend on
+/// Docker being reachable, the same reasoning the Control Plane's
+/// `activeValidators` already applies to its own optional heartbeat data.
+async fn workload_bandwidth_usage(
+    state: &LocalState,
+) -> Vec<controlplanev1::WorkloadBandwidthUsage> {
+    let engine = match agent_executor::BollardEngine::connect() {
+        Ok(engine) => engine,
+        Err(error) => {
+            warn!(%error, "Docker unavailable; reporting this heartbeat without workload bandwidth usage");
+            return Vec::new();
+        }
+    };
+    agent_executor::collect_workload_bandwidth(state, &engine)
+        .await
+        .into_iter()
+        .filter_map(|(workload_id, reading)| {
+            let window_started_at = match reading
+                .window_started_at
+                .duration_since(std::time::UNIX_EPOCH)
+            {
+                Ok(duration) => duration,
+                Err(error) => {
+                    warn!(%workload_id, %error, "workload window_started_at predates the UNIX epoch; omitting from this heartbeat");
+                    return None;
+                }
+            };
+            let (seconds, nanos) = match (
+                i64::try_from(window_started_at.as_secs()),
+                i32::try_from(window_started_at.subsec_nanos()),
+            ) {
+                (Ok(seconds), Ok(nanos)) => (seconds, nanos),
+                _ => {
+                    warn!(%workload_id, "workload window_started_at overflows a protobuf Timestamp; omitting from this heartbeat");
+                    return None;
+                }
+            };
+            Some(controlplanev1::WorkloadBandwidthUsage {
+                workload_id,
+                ingress_bytes_total: reading.ingress_bytes_total,
+                egress_bytes_total: reading.egress_bytes_total,
+                window_started_at: Some(prost_types::Timestamp { seconds, nanos }),
+            })
+        })
+        .collect()
 }
 
 /// Builds the ResourceCapability reported on both CompleteJoin and every
@@ -532,5 +595,82 @@ mod tests {
             .expect_err("unparseable value must be rejected, not silently ignored");
         assert!(error.to_string().contains("OPENINFRA_AGENT_MAX_WORKLOADS"));
         assert!(error.to_string().contains("not-a-number"));
+    }
+
+    // ADR-025 §2's exact signed byte layout: this fixture is the
+    // cross-language pin. `WorkloadBandwidthUsage` has no signature field
+    // of its own (see its proto doc comment) -- it rides inside
+    // `HeartbeatSigningPayload`, so the ONE existing heartbeat signature
+    // (HEARTBEAT_DOMAIN ++ payload.encode(), exactly what
+    // report_heartbeat_with_state computes above) already covers it. The
+    // actual cross-language risk is therefore not a hand-rolled byte
+    // layout (there isn't one) but whether prost's `encode` here and
+    // protobuf-go's `proto.MarshalOptions{Deterministic: true}.Marshal`
+    // agree byte-for-byte on the same field values, including the new
+    // repeated `workload_bandwidth` field.
+    //
+    // This test builds a fixed payload (literal, not random, field
+    // values -- so it's reproducible) and pins its encoded hex and the
+    // Ed25519 signature over it with a fixed 32-byte seed key. Both
+    // constants are asserted byte-for-byte identical in
+    // control-plane/internal/providerjoin/bandwidth_test.go's
+    // TestHeartbeatSigningPayloadWireBytesMatchRustFixture -- a mismatch
+    // there means Go's deterministic marshal has drifted from prost's
+    // encode, which would silently break every heartbeat signature
+    // verification once an Agent starts sending workload_bandwidth.
+    #[tokio::test]
+    async fn heartbeat_signing_payload_wire_bytes_are_a_pinned_cross_language_fixture() {
+        let payload = controlplanev1::HeartbeatSigningPayload {
+            request_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            provider_id: "a".repeat(64),
+            sequence: 7,
+            observed_at: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            capabilities: Some(sharedv1::ResourceCapability {
+                cpu_total: 8.0,
+                cpu_available: 6.0,
+                ram_total_mb: 16_384,
+                ram_available_mb: 12_000,
+                ..Default::default()
+            }),
+            workload_bandwidth: vec![controlplanev1::WorkloadBandwidthUsage {
+                workload_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                ingress_bytes_total: 123_456,
+                egress_bytes_total: 654_321,
+                window_started_at: Some(prost_types::Timestamp {
+                    seconds: 1_699_999_000,
+                    nanos: 0,
+                }),
+            }],
+        };
+        let mut signed = Vec::with_capacity(HEARTBEAT_DOMAIN.len() + payload.encoded_len());
+        signed.extend_from_slice(HEARTBEAT_DOMAIN);
+        payload.encode(&mut signed).expect("encode payload");
+
+        const EXPECTED_WIRE_BYTES_HEX: &str = "6f70656e696e6672612d6865617274626561742d7631000a2431313131313131312d313131312d313131312d313131312d313131313131313131313131124061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161180722060880e2cfaa062a110d00000041150000c0401880800120e05d32360a2432323232323232322d323232322d323232322d323232322d32323232323232323232323210c0c40718f1f72722060898dacfaa06";
+        assert_eq!(
+            hex::encode(&signed),
+            EXPECTED_WIRE_BYTES_HEX,
+            "encoded wire bytes changed -- update this fixture and the \
+             mirrored one in bandwidth_test.go together"
+        );
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let key_path = directory.path().join("identity.key");
+        std::fs::write(&key_path, [0x01u8; 32]).expect("write fixed key");
+        let identity = Ed25519IdentityManager::new(key_path).expect("load fixed-seed identity");
+        let public_key = identity.get_public_key().await.expect("public key");
+        let signature = identity.sign(&signed).await.expect("sign fixture payload");
+
+        assert!(identity
+            .verify(&signed, &signature, &hex::decode(&public_key).expect("hex"))
+            .await
+            .expect("verify"));
+
+        println!("wire_bytes_hex = {}", hex::encode(&signed));
+        println!("public_key_hex = {public_key}");
+        println!("signature_hex = {}", hex::encode(&signature));
     }
 }

@@ -15,6 +15,13 @@ agent-core = { path = "../agent-core" }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
+# ADR-025 §2: parses Docker's RFC3339 `started_at` container timestamp
+# into a `SystemTime` for `WorkloadBandwidth.window_started_at`. Already
+# a transitive dependency of this workspace (bollard itself uses it
+# internally); pinned here directly rather than assumed, since a version
+# drift silently breaking timestamp parsing would corrupt bandwidth
+# telemetry, not just fail loudly.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -116,6 +116,7 @@ type Service struct {
 	heartbeatInterval time.Duration
 	workloads         WorkloadService
 	validators        ValidatorSource
+	bandwidthUsage    BandwidthUsageStore
 }
 
 func (s *Service) SetWorkloadService(workloads WorkloadService) { s.workloads = workloads }
@@ -270,6 +271,7 @@ func (s *Service) ReportHeartbeat(ctx context.Context, request *controlplanev1.R
 	if err := s.heartbeats.Accept(ctx, request.Payload.ProviderId, request.Payload.RequestId, request.Payload.Sequence, payloadHash, payloadBytes, defaultHeartbeatTTL); err != nil {
 		return nil, repositoryError(err)
 	}
+	s.recordBandwidthUsage(ctx, request.Payload.ProviderId, request.Payload.WorkloadBandwidth)
 	now := s.now().UTC()
 	return &controlplanev1.ReportHeartbeatResponse{
 		Status:               sharedv1.NodeStatus_NODE_STATUS_ACTIVE,
@@ -334,6 +336,9 @@ func validateHeartbeat(request *controlplanev1.ReportHeartbeatRequest, now time.
 		return errors.New("capabilities are required")
 	}
 	if err := validateCapabilities(request.Payload.Capabilities); err != nil {
+		return err
+	}
+	if err := validateWorkloadBandwidth(request.Payload.WorkloadBandwidth); err != nil {
 		return err
 	}
 	if len(request.Signature) != ed25519.SignatureSize {
