@@ -31,6 +31,13 @@ const (
 	// (blockchain/runtime/src/lib.rs) confirms the pallet/call indices
 	// below did not change across that bump, so this version number is
 	// the only thing that needed correcting.
+	//
+	// TestSupportedSpecVersionMatchesRuntime (specversion_drift_test.go,
+	// this package) reads blockchain/runtime/src/lib.rs's real
+	// spec_version and fails if it no longer matches this constant, so a
+	// future bump that forgets to update this line is caught by `go
+	// test` instead of only surfacing in a live e2e run (issue #123). If
+	// you're changing one side, check the other.
 	supportedSpecVersion        = 3
 	supportedTransactionVersion = 1
 	runtimeExtrinsicVersion     = 4
