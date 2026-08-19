@@ -36,6 +36,17 @@ pub struct AgentSettings {
     pub bandwidth_ingress_mbps: i32,
     #[serde(default)]
     pub bandwidth_egress_mbps: i32,
+    // Operator-declared availability zone (ADR-026), an opaque, free-form
+    // string matched by exact equality against a workload's
+    // WorkloadConstraints.required_zone -- no hierarchy, no allowlist.
+    // Like bandwidth, a zone isn't auto-detectable from the machine
+    // itself, so this is operator-configured, the same trust boundary as
+    // the price/reputation/bandwidth claims a provider already
+    // self-declares, and deliberately has no env-var override (unlike
+    // ExecutorSettings's four fields). Empty string means "no zone
+    // declared".
+    #[serde(default)]
+    pub zone: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -88,6 +99,7 @@ impl Default for AgentConfig {
                 advertised_endpoint: String::new(),
                 bandwidth_ingress_mbps: 0,
                 bandwidth_egress_mbps: 0,
+                zone: String::new(),
             },
             security: SecuritySettings {
                 key_path: PathBuf::from("identity.key"),
