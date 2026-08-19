@@ -402,7 +402,7 @@ fn load_config() -> Result<AgentConfig> {
     Ok(config)
 }
 
-// Overrides the four ExecutorSettings fields from environment variables when
+// Overrides the five ExecutorSettings fields from environment variables when
 // set, matching the docker-compose.yml OPENINFRA_AGENT_* vars an operator
 // expects to take effect. An unset var leaves config.yaml's value untouched;
 // a set-but-unparseable var is a hard error rather than a silently ignored
@@ -419,6 +419,9 @@ fn apply_executor_env_overrides(config: &mut AgentConfig) -> Result<()> {
     }
     if let Some(value) = parse_env("OPENINFRA_AGENT_PIDS_LIMIT")? {
         config.executor.pids_limit = value;
+    }
+    if let Some(value) = parse_env("OPENINFRA_AGENT_MAX_EGRESS_MBPS")? {
+        config.executor.max_egress_mbps = value;
     }
     Ok(())
 }
@@ -565,18 +568,29 @@ mod tests {
     }
 
     #[test]
+    fn max_egress_mbps_env_override_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_MAX_EGRESS_MBPS", "500");
+        let mut config = AgentConfig::default();
+        apply_executor_env_overrides(&mut config).expect("override should apply");
+        assert_eq!(config.executor.max_egress_mbps, 500);
+    }
+
+    #[test]
     fn unset_env_leaves_config_value_untouched() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         env::remove_var("OPENINFRA_AGENT_MAX_WORKLOADS");
         env::remove_var("OPENINFRA_AGENT_MAX_CPU_CORES");
         env::remove_var("OPENINFRA_AGENT_MAX_MEMORY_MB");
         env::remove_var("OPENINFRA_AGENT_PIDS_LIMIT");
+        env::remove_var("OPENINFRA_AGENT_MAX_EGRESS_MBPS");
 
         let mut config = AgentConfig::default();
         config.executor.max_workloads = 3;
         config.executor.max_cpu_cores = 1.5;
         config.executor.max_memory_mb = 2048;
         config.executor.pids_limit = 64;
+        config.executor.max_egress_mbps = 100;
 
         apply_executor_env_overrides(&mut config).expect("no env vars set, nothing to apply");
 
@@ -584,6 +598,7 @@ mod tests {
         assert_eq!(config.executor.max_cpu_cores, 1.5);
         assert_eq!(config.executor.max_memory_mb, 2048);
         assert_eq!(config.executor.pids_limit, 64);
+        assert_eq!(config.executor.max_egress_mbps, 100);
     }
 
     #[test]

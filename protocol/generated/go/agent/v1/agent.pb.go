@@ -436,9 +436,21 @@ func (x *DeployRequest) GetLimits() *ResourceLimits {
 }
 
 type ResourceLimits struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CpuCores      float32                `protobuf:"fixed32,1,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`
-	MemoryMb      int64                  `protobuf:"varint,2,opt,name=memory_mb,json=memoryMb,proto3" json:"memory_mb,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	CpuCores float32                `protobuf:"fixed32,1,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`
+	MemoryMb int64                  `protobuf:"varint,2,opt,name=memory_mb,json=memoryMb,proto3" json:"memory_mb,omitempty"`
+	// ADR-025 §3: the workload's *reserved* egress rate, megabits per
+	// second -- sourced from the same WorkloadDefinition.Requirements.
+	// Bandwidth.egress_mbps (shared.proto) the scheduler already fit-scores
+	// against, carried through to the Agent alongside cpu_cores/memory_mb
+	// so agent-executor can apply a host-side `tc` ceiling at container
+	// start, the same way memory_mb/cpu_cores become Docker's HostConfig
+	// quotas. 0 means the workload declared no bandwidth requirement --
+	// no `tc` rule is applied, matching Bandwidth's existing "0 means not
+	// advertised" convention elsewhere on this message. Egress only in
+	// this slice; ingress shaping is a known, deliberately deferred
+	// asymmetry (see the ADR).
+	EgressMbps    int32 `protobuf:"varint,3,opt,name=egress_mbps,json=egressMbps,proto3" json:"egress_mbps,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -483,6 +495,13 @@ func (x *ResourceLimits) GetCpuCores() float32 {
 func (x *ResourceLimits) GetMemoryMb() int64 {
 	if x != nil {
 		return x.MemoryMb
+	}
+	return 0
+}
+
+func (x *ResourceLimits) GetEgressMbps() int32 {
+	if x != nil {
+		return x.EgressMbps
 	}
 	return 0
 }
@@ -1245,10 +1264,12 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"workloadId\x12\x19\n" +
 	"\blease_id\x18\x02 \x01(\tR\aleaseId\x12\x14\n" +
 	"\x05image\x18\x03 \x01(\tR\x05image\x12:\n" +
-	"\x06limits\x18\x04 \x01(\v2\".openinfra.agent.v1.ResourceLimitsR\x06limits\"J\n" +
+	"\x06limits\x18\x04 \x01(\v2\".openinfra.agent.v1.ResourceLimitsR\x06limits\"k\n" +
 	"\x0eResourceLimits\x12\x1b\n" +
 	"\tcpu_cores\x18\x01 \x01(\x02R\bcpuCores\x12\x1b\n" +
-	"\tmemory_mb\x18\x02 \x01(\x03R\bmemoryMb\"c\n" +
+	"\tmemory_mb\x18\x02 \x01(\x03R\bmemoryMb\x12\x1f\n" +
+	"\vegress_mbps\x18\x03 \x01(\x05R\n" +
+	"egressMbps\"c\n" +
 	"\x0eDeployResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12!\n" +
 	"\fcontainer_id\x18\x02 \x01(\tR\vcontainerId\x12\x14\n" +

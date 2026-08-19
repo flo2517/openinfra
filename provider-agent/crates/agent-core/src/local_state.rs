@@ -51,6 +51,28 @@ pub struct WorkloadRecord {
     pub spec_hash: [u8; 32],
     pub container_id: Option<String>,
     pub phase: WorkloadPhase,
+    /// ADR-025 §3: the workload's reserved egress rate, Mbps, persisted
+    /// (not just held transiently in the DeployRequest) so a process
+    /// restart's `recover()` and a retried `deploy()` call both know
+    /// whether a `tc` rule needs (re)applying without needing the
+    /// original request again. 0 means "no bandwidth requirement
+    /// declared", matching `ContainerSpec::egress_mbps`'s own convention.
+    /// `#[serde(default)]` so records persisted before this field existed
+    /// deserialize to 0 (no rate limit expected), not a hard error.
+    #[serde(default)]
+    pub egress_mbps: i32,
+    /// Whether `rate_limit()` has actually succeeded for this workload's
+    /// current container. Deliberately separate from `phase`: a rate
+    /// limit failure must never be conflated with the *container itself*
+    /// failing (see `WorkloadPhase::consumes_capacity` -- marking a
+    /// still-running container `Failed` would silently free a capacity
+    /// slot for a container that is, in fact, still consuming real
+    /// resources unthrottled). `deploy()`'s retry path and `recover()`
+    /// both check this to decide whether a `tc` rule still needs
+    /// (re)applying. `#[serde(default)]` for the same backward-compat
+    /// reason as `egress_mbps`.
+    #[serde(default)]
+    pub rate_limited: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +227,8 @@ mod tests {
             spec_hash: [7; 32],
             container_id: Some("container-1".to_string()),
             phase: WorkloadPhase::Running,
+            egress_mbps: 0,
+            rate_limited: false,
         };
         {
             let state = LocalState::open(directory.path()).expect("open state");

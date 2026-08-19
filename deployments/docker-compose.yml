@@ -192,6 +192,7 @@ services:
       OPENINFRA_AGENT_MAX_CPU_CORES: ${PROVIDER_AGENT_MAX_CPU_CORES:-8.0}
       OPENINFRA_AGENT_MAX_MEMORY_MB: ${PROVIDER_AGENT_MAX_MEMORY_MB:-16384}
       OPENINFRA_AGENT_PIDS_LIMIT: ${PROVIDER_AGENT_PIDS_LIMIT:-128}
+      OPENINFRA_AGENT_MAX_EGRESS_MBPS: ${PROVIDER_AGENT_MAX_EGRESS_MBPS:-10000}
       TLS_CERT_FILE: /run/openinfra-tls/client.crt
       TLS_KEY_FILE: /run/openinfra-tls/client.key
       TLS_CA_FILE: /run/openinfra-tls/ca.crt
@@ -225,6 +226,16 @@ services:
       - /tmp:size=8m,noexec,nosuid
     cap_drop:
       - ALL
+    # ADR-025 §3: the Agent process runs `tc qdisc replace` against the
+    # host side of each workload's veth pair to enforce its reserved
+    # egress rate, which needs CAP_NET_ADMIN. This is the one capability
+    # added back after `cap_drop: ALL` above -- the workload containers
+    # the Agent creates via Docker are unaffected (their own HostConfig
+    # keeps `cap_drop: ALL`/`no-new-privileges` independently, applied by
+    # agent-executor, not by this file). See deployments/provider-agent.md
+    # for the full trust-boundary note.
+    cap_add:
+      - NET_ADMIN
     security_opt:
       - no-new-privileges:true
 

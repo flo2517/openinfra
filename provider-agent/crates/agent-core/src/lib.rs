@@ -55,6 +55,13 @@ pub struct ExecutorSettings {
     pub max_cpu_cores: f32,
     pub max_memory_mb: i64,
     pub pids_limit: i64,
+    /// ADR-025 §3: policy ceiling on a workload's declared egress_mbps,
+    /// the same defense-in-depth role max_cpu_cores/max_memory_mb already
+    /// play against a buggy or compromised scheduler sending an
+    /// unreasonable reservation -- without this, egress_mbps was the only
+    /// one of the four quotas with no local check before being handed to
+    /// `tc`.
+    pub max_egress_mbps: i32,
 }
 
 impl Default for ExecutorSettings {
@@ -65,6 +72,7 @@ impl Default for ExecutorSettings {
             max_cpu_cores: 8.0,
             max_memory_mb: 16_384,
             pids_limit: 128,
+            max_egress_mbps: 10_000,
         }
     }
 }

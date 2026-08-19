@@ -202,7 +202,7 @@ func (w *Worker) processOne(ctx context.Context) error {
 				return w.retry(ctx, item, "AGENT_STATUS_UNKNOWN", statusErr)
 			}
 		}
-		request := &agentv1.DeployRequest{WorkloadId: item.WorkloadID, LeaseId: item.LeaseID, Image: item.Image, Limits: &agentv1.ResourceLimits{CpuCores: definition.Requirements.Cpu, MemoryMb: definition.Requirements.RamMb}}
+		request := &agentv1.DeployRequest{WorkloadId: item.WorkloadID, LeaseId: item.LeaseID, Image: item.Image, Limits: &agentv1.ResourceLimits{CpuCores: definition.Requirements.Cpu, MemoryMb: definition.Requirements.RamMb, EgressMbps: workloadEgressMbps(definition)}}
 		deployCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
 		defer cancel()
 		containerID, err := w.dispatcher.DeployAndConfirm(deployCtx, provider.RegisteredProvider, request)
@@ -344,6 +344,21 @@ func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanage
 	}
 	return candidates, capacities
 }
+
+// workloadEgressMbps is the workload's *reserved* egress rate (ADR-025
+// §3), carried into DeployRequest.Limits alongside cpu_cores/memory_mb so
+// agent-executor can apply a host-side `tc` ceiling at container start.
+// definition.Requirements.Bandwidth is optional (nil means the workload
+// declared no bandwidth requirement, per ResourceRequirements' own doc
+// comment) -- that degrades to 0, agent-executor's own "no reservation,
+// no `tc` rule" convention, not a zero-cap that would stall the workload.
+func workloadEgressMbps(definition *sharedv1.WorkloadDefinition) int32 {
+	if definition.Requirements == nil || definition.Requirements.Bandwidth == nil {
+		return 0
+	}
+	return definition.Requirements.Bandwidth.EgressMbps
+}
+
 func decodeDefinition(encoded []byte) (*sharedv1.WorkloadDefinition, error) {
 	var definition sharedv1.WorkloadDefinition
 	if err := proto.Unmarshal(encoded, &definition); err != nil {
