@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -143,7 +145,7 @@ func (w *Worker) processOne(ctx context.Context) error {
 		candidates, capacities := w.rankableCandidates(ctx, providers)
 		decision := w.ranker.Rank(definition.Profile, definition.Requirements, definition.Constraints, candidates)
 		if decision.Selected == nil {
-			return w.retry(ctx, item, "NO_CAPACITY", fmt.Errorf("no eligible provider (%d candidates excluded)", len(decision.Excluded)))
+			return w.retry(ctx, item, "NO_CAPACITY", noEligibleProviderError(decision.Excluded, candidates, definition.Constraints.GetRequiredZone()))
 		}
 		_, err = w.store.AssignLease(ctx, item, decision.Selected.ProviderID, canonicalResourceHash(item.Definition, item.Image), capacities[decision.Selected.ProviderID])
 		if errors.Is(err, workloadapi.ErrCapacityExceeded) || errors.Is(err, workloadapi.ErrConflict) {
@@ -309,6 +311,7 @@ func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanage
 			candidate.CPUAvailableCores, candidate.CPUTotalCores = c.CpuAvailable, c.CpuTotal
 			candidate.RAMAvailableMB, candidate.RAMTotalMB = c.RamAvailableMb, c.RamTotalMb
 			candidate.StorageAvailableGB, candidate.StorageTotalGB = c.StorageAvailableGb, c.StorageTotalGb
+			candidate.Zone = c.Zone
 			var ingressMbps, egressMbps int64
 			if c.Bandwidth != nil {
 				ingressMbps, egressMbps = int64(c.Bandwidth.IngressMbps), int64(c.Bandwidth.EgressMbps)
@@ -343,6 +346,75 @@ func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanage
 		candidates = append(candidates, candidate)
 	}
 	return candidates, capacities
+}
+
+// maxDistinctExclusionReasons bounds how many distinct exclusion reasons
+// noEligibleProviderError lists, so a NO_CAPACITY error over a large
+// candidate pool stays readable instead of growing one line per reason
+// ever observed.
+const maxDistinctExclusionReasons = 5
+
+// noEligibleProviderError builds the NO_CAPACITY error surfaced when
+// scheduler.Rank selects no candidate. Before ADR-026 this only reported
+// the *count* of excluded candidates, discarding
+// scheduler.Decision.Excluded[i].Reason entirely -- a general gap, not
+// specific to zone, that predates this ADR (see its §3/"Consequences").
+// This surfaces the distinct reasons actually seen instead (deduplicated,
+// bounded by maxDistinctExclusionReasons, in first-seen order so the
+// message is deterministic for a given ranking pass), and, specifically,
+// when every exclusion is a zone mismatch, the set of zones actually
+// declared among the excluded candidates -- e.g. `requested zone "us-eas"
+// matched none; zones present: us-east, us-west, eu-central` -- which
+// directly answers "why did my zone request fail" without a
+// Control-Plane-owned zone allowlist (ADR-026 §3).
+func noEligibleProviderError(excluded []scheduler.Exclusion, candidates []scheduler.Candidate, requiredZone string) error {
+	if len(excluded) == 0 {
+		return fmt.Errorf("no eligible provider (0 candidates excluded)")
+	}
+
+	reasons := make([]string, 0, len(excluded))
+	seenReasons := make(map[string]bool, len(excluded))
+	allZoneMismatch := true
+	for _, e := range excluded {
+		if e.Reason != "zone mismatch" {
+			allZoneMismatch = false
+		}
+		if !seenReasons[e.Reason] {
+			seenReasons[e.Reason] = true
+			reasons = append(reasons, e.Reason)
+		}
+	}
+
+	if allZoneMismatch && requiredZone != "" {
+		zonesByProvider := make(map[string]string, len(candidates))
+		for _, c := range candidates {
+			zonesByProvider[c.ProviderID] = c.Zone
+		}
+		seenZones := make(map[string]bool, len(excluded))
+		var zones []string
+		for _, e := range excluded {
+			zone := zonesByProvider[e.ProviderID]
+			if zone == "" || seenZones[zone] {
+				continue
+			}
+			seenZones[zone] = true
+			zones = append(zones, zone)
+		}
+		sort.Strings(zones)
+		if len(zones) == 0 {
+			return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; no excluded candidate declared a zone",
+				len(excluded), requiredZone)
+		}
+		return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; zones present: %s",
+			len(excluded), requiredZone, strings.Join(zones, ", "))
+	}
+
+	if len(reasons) > maxDistinctExclusionReasons {
+		return fmt.Errorf("no eligible provider: %d candidates excluded — reasons: %s, and %d more",
+			len(excluded), strings.Join(reasons[:maxDistinctExclusionReasons], ", "), len(reasons)-maxDistinctExclusionReasons)
+	}
+	return fmt.Errorf("no eligible provider: %d candidates excluded — reasons: %s",
+		len(excluded), strings.Join(reasons, ", "))
 }
 
 // workloadEgressMbps is the workload's *reserved* egress rate (ADR-025
