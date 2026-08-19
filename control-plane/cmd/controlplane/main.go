@@ -168,13 +168,14 @@ func run() error {
 		if overlayErr != nil {
 			return fmt.Errorf("configure WireGuard overlay: %w", overlayErr)
 		}
-		worker.SetOverlay(overlay)
 		// Every DEPLOYING workload gets an overlay peer attached once this is
 		// set (see Worker.SetOverlay), so the ranker's bandwidth fit-scoring
-		// must account for the same overhead every one of those workloads
-		// will actually pay -- otherwise a candidate ranked as "fits" at
-		// scheduling time can under-deliver once its traffic is encapsulated.
-		ranker.SetWireGuardOverlayEnabled(true)
+		// and the capacity ledger both need to account for the same overhead
+		// every one of those workloads will actually pay -- otherwise a
+		// candidate ranked (or admitted) as "fits" at scheduling time can
+		// under-deliver once its traffic is encapsulated. SetOverlay flips
+		// both itself; there is no separate ranker call to make here.
+		worker.SetOverlay(overlay)
 		slog.Info("WireGuard workload overlay enabled", "interface", interfaceName, "first_port", firstPort, "last_port", lastPort)
 	}
 	go worker.Run(ctx)

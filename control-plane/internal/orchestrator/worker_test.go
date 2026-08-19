@@ -69,6 +69,62 @@ func TestRankableCandidatesWiresBandwidthCapacityThrough(t *testing.T) {
 	}
 }
 
+// TestRankableCandidatesAppliesWireGuardOverheadToCapacityLedgerOnlyWhenOverlayActive
+// covers issue #115: AssignLease's persistent, atomic capacity ledger
+// (workloadapi.ProviderCapacity) must reflect the same post-overhead
+// throughput ceiling scoreOne already uses for single-candidate fit
+// scoring, once a WireGuard overlay is actually configured on this
+// worker -- otherwise two workloads that each individually clear both
+// checks can jointly reserve more than the overlay can ever deliver (the
+// exact scenario #114 fixed for scoring alone). scheduler.Candidate's own
+// Ingress/EgressTotalMbps must stay raw regardless, since scoreOne applies
+// the same adjustment itself when the ranker is overlay-enabled --
+// double-applying it here would under-score every candidate.
+func TestRankableCandidatesAppliesWireGuardOverheadToCapacityLedgerOnlyWhenOverlayActive(t *testing.T) {
+	providers := []agentmanager.SchedulableProvider{
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "with-bandwidth", AgentEndpoint: "https://a:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuTotal: 4, CpuAvailable: 4, RamTotalMb: 4096, RamAvailableMb: 4096, Bandwidth: &sharedv1.Bandwidth{IngressMbps: 1000, EgressMbps: 1000}}},
+	}
+
+	withoutOverlay := NewWorker(nil, nil, nil, nil, testRanker())
+	_, capacitiesNoOverlay := withoutOverlay.rankableCandidates(context.Background(), providers)
+	if capacitiesNoOverlay["with-bandwidth"].TotalIngressMbps != 1000 || capacitiesNoOverlay["with-bandwidth"].TotalEgressMbps != 1000 {
+		t.Fatalf("expected raw capacity with no overlay configured, got %+v", capacitiesNoOverlay["with-bandwidth"])
+	}
+
+	withOverlay := NewWorker(nil, nil, nil, nil, testRanker())
+	withOverlay.SetOverlay(stubOverlay{})
+	candidates, capacitiesWithOverlay := withOverlay.rankableCandidates(context.Background(), providers)
+	// 1000 * (1500-60)/1500 = 960, matching scheduler.WireGuardEffectiveMbps.
+	if capacitiesWithOverlay["with-bandwidth"].TotalIngressMbps != 960 || capacitiesWithOverlay["with-bandwidth"].TotalEgressMbps != 960 {
+		t.Fatalf("expected overhead-adjusted capacity with overlay configured, got %+v", capacitiesWithOverlay["with-bandwidth"])
+	}
+	for _, c := range candidates {
+		if c.ProviderID == "with-bandwidth" && (c.IngressTotalMbps != 1000 || c.EgressTotalMbps != 1000) {
+			t.Fatalf("candidate bandwidth must stay raw so scoreOne doesn't double-adjust it: %+v", c)
+		}
+	}
+}
+
+// TestSetOverlaySyncsTheRankersWireGuardFlag pins that SetOverlay is the
+// only place that needs calling: a caller that sets the overlay must never
+// have to remember a second call to keep the ranker's own bandwidth
+// fit-scoring in agreement with the capacity ledger SetOverlay now also
+// adjusts (see SetOverlay's doc comment, issue #115).
+func TestSetOverlaySyncsTheRankersWireGuardFlag(t *testing.T) {
+	ranker := testRanker()
+	worker := NewWorker(nil, nil, nil, nil, ranker)
+
+	worker.SetOverlay(stubOverlay{})
+	if !ranker.WireGuardOverlayEnabled {
+		t.Fatal("SetOverlay(non-nil) must enable the ranker's WireGuardOverlayEnabled flag")
+	}
+
+	worker.SetOverlay(nil)
+	if ranker.WireGuardOverlayEnabled {
+		t.Fatal("SetOverlay(nil) must disable the ranker's WireGuardOverlayEnabled flag")
+	}
+}
+
 func TestCanonicalResourceHashIsStable(t *testing.T) {
 	first := canonicalResourceHash([]byte{1, 2, 3}, "image@sha256:abc")
 	if first != canonicalResourceHash([]byte{1, 2, 3}, "image@sha256:abc") {
@@ -231,3 +287,12 @@ func (d *reconcilingDispatcher) DeployAndConfirm(context.Context, agentmanager.R
 func (d *reconcilingDispatcher) StopAndConfirm(context.Context, agentmanager.RegisteredProvider, string) error {
 	return nil
 }
+
+// stubOverlay is a no-op OverlayManager: worker.overlay only needs to be
+// non-nil for the tests that exercise "is the WireGuard overlay configured
+// for this deployment" (see SetOverlay's doc comment) -- none of them
+// actually call Attach/Revoke.
+type stubOverlay struct{}
+
+func (stubOverlay) Attach(context.Context, string, string, string, time.Time) error { return nil }
+func (stubOverlay) Revoke(context.Context, string) error                            { return nil }
