@@ -1,3 +1,5 @@
+mod bandwidth;
+
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
 use agent_api::{Executor, WorkloadStatus};
 use agent_core::local_state::{
@@ -6,6 +8,7 @@ use agent_core::local_state::{
 use agent_core::ExecutorSettings;
 use anyhow::Result;
 use async_trait::async_trait;
+pub use bandwidth::WorkloadBandwidth;
 use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
 };
@@ -13,7 +16,9 @@ use bollard::models::HostConfig;
 use bollard::Docker;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -45,6 +50,10 @@ pub trait ContainerEngine: Send + Sync {
     async fn stop(&self, container_id: &str) -> Result<(), ExecutorError>;
     async fn inspect(&self, container_id: &str) -> Result<ContainerObservation, ExecutorError>;
     async fn remove(&self, container_id: &str) -> Result<(), ExecutorError>;
+    /// ADR-025 §2: this workload's cumulative bandwidth counters, read
+    /// from the host side of its veth pair. See `bandwidth::read_bandwidth`
+    /// for the exact mechanism.
+    async fn bandwidth(&self, container_id: &str) -> Result<WorkloadBandwidth, ExecutorError>;
 }
 
 pub struct BollardEngine {
@@ -132,6 +141,41 @@ impl ContainerEngine for BollardEngine {
             .await
             .map_err(|error| ExecutorError::Engine(error.to_string()))
     }
+
+    async fn bandwidth(&self, container_id: &str) -> Result<WorkloadBandwidth, ExecutorError> {
+        let response = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|error| ExecutorError::Engine(error.to_string()))?;
+        let state = response
+            .state
+            .ok_or_else(|| ExecutorError::Engine("container has no state".to_string()))?;
+        let pid = state
+            .pid
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| ExecutorError::Engine("container has no pid".to_string()))?;
+        let started_at = state
+            .started_at
+            .as_deref()
+            .ok_or_else(|| ExecutorError::Engine("container has no started_at".to_string()))
+            .and_then(parse_docker_timestamp)?;
+        bandwidth::read_bandwidth(Path::new("/"), pid, started_at)
+    }
+}
+
+/// Docker's API reports container timestamps as RFC3339 strings (not a
+/// typed timestamp -- bollard's `ContainerState.started_at` is a plain
+/// `Option<String>`). Parsed with `chrono` rather than hand-rolled, since
+/// a wrong parse here would silently corrupt `window_started_at`, and
+/// with it every future heartbeat's "did the counters reset" comparison
+/// downstream (control-plane/internal/providerjoin).
+fn parse_docker_timestamp(value: &str) -> Result<SystemTime, ExecutorError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(SystemTime::from)
+        .map_err(|error| {
+            ExecutorError::Engine(format!("parse container started_at {value:?}: {error}"))
+        })
 }
 
 #[derive(Debug, Error)]
@@ -333,6 +377,53 @@ impl DockerExecutor {
     }
 }
 
+/// ADR-025 §2: reads bandwidth for every locally-known workload the
+/// Agent currently believes is `Running`, using `engine` (a caller-
+/// supplied `ContainerEngine` so this stays testable against `FakeEngine`
+/// without a real Docker daemon or a full `DockerExecutor`).
+///
+/// A workload whose reading fails (container briefly unreachable, veth
+/// not resolvable, etc.) is skipped with a warning rather than aborting
+/// the whole heartbeat -- one bad workload must not blank out every
+/// other workload's legitimate data for this round, mirroring
+/// `active_validators`' identical single-bad-entry tolerance on the
+/// Control Plane side. A workload that never successfully reads is
+/// simply absent from this round's report, which the Control Plane must
+/// render as "no data", never as "zero usage" (ADR-025 §5).
+pub async fn collect_workload_bandwidth(
+    state: &LocalState,
+    engine: &dyn ContainerEngine,
+) -> Vec<(String, WorkloadBandwidth)> {
+    let workloads = match state.workloads() {
+        Ok(workloads) => workloads,
+        Err(error) => {
+            warn!(%error, "failed to list local workloads; omitting bandwidth from this heartbeat");
+            return Vec::new();
+        }
+    };
+
+    let mut readings = Vec::new();
+    for record in workloads {
+        if record.phase != WorkloadPhase::Running {
+            continue;
+        }
+        let Some(container_id) = record.container_id.as_deref() else {
+            continue;
+        };
+        match engine.bandwidth(container_id).await {
+            Ok(reading) => readings.push((record.workload_id, reading)),
+            Err(error) => {
+                warn!(
+                    workload_id = %record.workload_id,
+                    %error,
+                    "bandwidth usage unavailable for workload; omitting from this heartbeat"
+                );
+            }
+        }
+    }
+    readings
+}
+
 #[async_trait]
 impl Executor for DockerExecutor {
     async fn deploy(&self, request: DeployRequest) -> Result<String> {
@@ -437,6 +528,10 @@ mod tests {
         started: StdMutex<Vec<String>>,
         stopped: StdMutex<Vec<String>>,
         observations: StdMutex<HashMap<String, ContainerObservation>>,
+        // ADR-025 §2: per-container_id canned bandwidth outcome -- `Ok`
+        // for a configured reading, `Err` (or simply absent) to exercise
+        // collect_workload_bandwidth's skip-and-warn degrade path.
+        bandwidth_readings: StdMutex<HashMap<String, Result<WorkloadBandwidth, String>>>,
     }
 
     #[async_trait]
@@ -501,6 +596,21 @@ mod tests {
 
         async fn remove(&self, _container_id: &str) -> Result<(), ExecutorError> {
             Ok(())
+        }
+
+        async fn bandwidth(&self, container_id: &str) -> Result<WorkloadBandwidth, ExecutorError> {
+            match self
+                .bandwidth_readings
+                .lock()
+                .expect("bandwidth readings lock")
+                .get(container_id)
+            {
+                Some(Ok(reading)) => Ok(reading.clone()),
+                Some(Err(reason)) => Err(ExecutorError::Engine(reason.clone())),
+                None => Err(ExecutorError::Engine(format!(
+                    "no bandwidth reading configured for {container_id}"
+                ))),
+            }
         }
     }
 
@@ -611,6 +721,82 @@ mod tests {
             container_id
         );
         assert_eq!(engine.created.lock().expect("created lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_workload_bandwidth_reports_only_running_workloads() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 2);
+
+        let running = request(Uuid::new_v4(), Uuid::new_v4());
+        let running_container = executor
+            .deploy(running.clone())
+            .await
+            .expect("deploy running");
+        let reading = WorkloadBandwidth {
+            ingress_bytes_total: 111,
+            egress_bytes_total: 222,
+            window_started_at: std::time::UNIX_EPOCH,
+        };
+        engine
+            .bandwidth_readings
+            .lock()
+            .expect("bandwidth readings lock")
+            .insert(running_container, Ok(reading.clone()));
+
+        // A second workload is deployed and then stopped -- its bandwidth
+        // must not appear in the report even though it still has a
+        // container_id on record, matching "cumulative since container
+        // start" (a stopped container's counters are stale, not current).
+        let stopped = request(Uuid::new_v4(), Uuid::new_v4());
+        executor
+            .deploy(stopped.clone())
+            .await
+            .expect("deploy stopped");
+        executor.stop(&stopped.workload_id).await.expect("stop");
+
+        let readings = collect_workload_bandwidth(&executor.state, engine.as_ref()).await;
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].0, running.workload_id);
+        assert_eq!(readings[0].1, reading);
+    }
+
+    #[tokio::test]
+    async fn collect_workload_bandwidth_skips_a_workload_whose_reading_fails() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 2);
+
+        let ok_request = request(Uuid::new_v4(), Uuid::new_v4());
+        let ok_container = executor
+            .deploy(ok_request.clone())
+            .await
+            .expect("deploy ok");
+        let reading = WorkloadBandwidth {
+            ingress_bytes_total: 1,
+            egress_bytes_total: 2,
+            window_started_at: std::time::UNIX_EPOCH,
+        };
+        engine
+            .bandwidth_readings
+            .lock()
+            .expect("bandwidth readings lock")
+            .insert(ok_container, Ok(reading.clone()));
+
+        // failing_request's container is deliberately left unconfigured in
+        // bandwidth_readings, so FakeEngine::bandwidth returns an error for
+        // it -- collect_workload_bandwidth must skip it, not fail the call.
+        let failing_request = request(Uuid::new_v4(), Uuid::new_v4());
+        executor
+            .deploy(failing_request.clone())
+            .await
+            .expect("deploy failing");
+
+        let readings = collect_workload_bandwidth(&executor.state, engine.as_ref()).await;
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].0, ok_request.workload_id);
+        assert_eq!(readings[0].1, reading);
     }
 
     #[tokio::test]
