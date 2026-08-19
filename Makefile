@@ -25,7 +25,15 @@ test-agent:
 	cd provider-agent && cargo test --workspace
 
 test-control-plane:
-	cd control-plane && $(GO) test ./...
+	# -count=1 disables the test result cache for this package tree: at
+	# least one test here (blockchainbridge's spec_version drift check)
+	# reads a file outside the Go module (blockchain/runtime/src/lib.rs)
+	# that go test's cache has no visibility into, so a stale PASS can be
+	# replayed after that file changes with no Go source touched at all --
+	# defeating exactly the drift detector it was written to be. The whole
+	# suite runs in a couple of seconds, so disabling caching here has no
+	# meaningful cost.
+	cd control-plane && $(GO) test -count=1 ./...
 
 test-blockchain:
 	cd blockchain && cargo test --workspace

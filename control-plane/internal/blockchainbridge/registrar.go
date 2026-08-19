@@ -31,6 +31,18 @@ const (
 	// (blockchain/runtime/src/lib.rs) confirms the pallet/call indices
 	// below did not change across that bump, so this version number is
 	// the only thing that needed correcting.
+	//
+	// TestSupportedSpecVersionMatchesRuntime (specversion_drift_test.go,
+	// this package) reads blockchain/runtime/src/lib.rs's real
+	// spec_version and fails if it no longer matches this constant, so a
+	// future bump that forgets to update this line is caught here
+	// instead of only surfacing in a live e2e run (issue #123). This test
+	// reads a file outside the Go module, which go test's result cache
+	// has no visibility into -- `make test-control-plane` and CI both
+	// run with -count=1 for exactly this reason, so a stale cached PASS
+	// can't hide a real drift. Running `go test ./...` directly (bypassing
+	// both) does not get that guarantee. If you're changing one side,
+	// check the other.
 	supportedSpecVersion        = 3
 	supportedTransactionVersion = 1
 	runtimeExtrinsicVersion     = 4
