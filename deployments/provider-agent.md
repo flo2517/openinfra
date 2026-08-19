@@ -1,8 +1,12 @@
 # Provider Agent local service
 
-The local Compose stack runs the Provider Agent as an unprivileged service. `make dev-up` creates development-only certificates, then Compose builds the digest-pinned image. On its first start the entrypoint creates a mode `0600` Ed25519 seed and `config.yaml` under `deployments/local/agent/`, joins the Control Plane over mTLS, and starts signed heartbeats. The directory persists the identity, assigned provider ID, heartbeat sequence, and exact workload-to-container mappings across restarts.
+The local Compose stack runs the Provider Agent as a near-unprivileged service: `cap_drop: ALL` plus one capability added back, `CAP_NET_ADMIN` (see "Host network privilege" below). `make dev-up` creates development-only certificates, then Compose builds the digest-pinned image. On its first start the entrypoint creates a mode `0600` Ed25519 seed and `config.yaml` under `deployments/local/agent/`, joins the Control Plane over mTLS, and starts signed heartbeats. The directory persists the identity, assigned provider ID, heartbeat sequence, and exact workload-to-container mappings across restarts.
 
 The Agent listens on `127.0.0.1:50052` at the host boundary and advertises `https://provider-agent:50052` inside the Compose network. It starts only after the Control Plane and Docker proxy are healthy. Its healthcheck verifies persistent initialization and the local gRPC listener; application RPCs remain protected by mandatory mTLS.
+
+## Host network privilege
+
+ADR-025 §3 gives the Agent process `CAP_NET_ADMIN` (`cap_add: [NET_ADMIN]` in `docker-compose.yml`, added back after `cap_drop: ALL`) so it can run `tc qdisc replace ... tbf` against the host side of a workload's veth pair, enforcing that workload's reserved egress rate as a fourth quota alongside the CPU/memory/PID limits Docker's own `HostConfig` already applies. This is a standing capability increase for the Agent's own process, explicitly signed off (see the ADR's Status line) rather than self-accepted, because it is new privilege over host networking, not just the Docker socket access the Agent already had via the proxy. It does **not** extend to the workload containers the Agent creates: their own `HostConfig` keeps `cap_drop: ALL` / `no-new-privileges` independently, applied by `agent-executor` per container, unaffected by this Compose-level grant to the Agent's own process.
 
 ## Docker boundary
 
