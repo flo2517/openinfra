@@ -289,6 +289,7 @@ type ResourceCapability struct {
 	StorageAvailableGb int64                  `protobuf:"varint,6,opt,name=storage_available_gb,json=storageAvailableGb,proto3" json:"storage_available_gb,omitempty"`
 	Gpu                *GPUCapability         `protobuf:"bytes,7,opt,name=gpu,proto3" json:"gpu,omitempty"`
 	Bandwidth          *Bandwidth             `protobuf:"bytes,8,opt,name=bandwidth,proto3" json:"bandwidth,omitempty"`
+	Zone               string                 `protobuf:"bytes,9,opt,name=zone,proto3" json:"zone,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -377,6 +378,13 @@ func (x *ResourceCapability) GetBandwidth() *Bandwidth {
 		return x.Bandwidth
 	}
 	return nil
+}
+
+func (x *ResourceCapability) GetZone() string {
+	if x != nil {
+		return x.Zone
+	}
+	return ""
 }
 
 type GPUCapability struct {
@@ -806,6 +814,7 @@ type WorkloadConstraints struct {
 	MaxLatencyMs  int32                  `protobuf:"varint,1,opt,name=max_latency_ms,json=maxLatencyMs,proto3" json:"max_latency_ms,omitempty"`
 	MinReputation float32                `protobuf:"fixed32,2,opt,name=min_reputation,json=minReputation,proto3" json:"min_reputation,omitempty"`
 	MaxPrice      float32                `protobuf:"fixed32,3,opt,name=max_price,json=maxPrice,proto3" json:"max_price,omitempty"`
+	RequiredZone  string                 `protobuf:"bytes,4,opt,name=required_zone,json=requiredZone,proto3" json:"required_zone,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -859,6 +868,13 @@ func (x *WorkloadConstraints) GetMaxPrice() float32 {
 		return x.MaxPrice
 	}
 	return 0
+}
+
+func (x *WorkloadConstraints) GetRequiredZone() string {
+	if x != nil {
+		return x.RequiredZone
+	}
+	return ""
 }
 
 // --- Lease Object ---
@@ -1051,7 +1067,7 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\x10protocol_version\x18\x03 \x01(\tR\x0fprotocolVersion\x12#\n" +
 	"\ragent_version\x18\x04 \x01(\tR\fagentVersion\x12K\n" +
 	"\fcapabilities\x18\x05 \x01(\v2'.openinfra.shared.v1.ResourceCapabilityR\fcapabilities\x127\n" +
-	"\x06status\x18\x06 \x01(\x0e2\x1f.openinfra.shared.v1.NodeStatusR\x06status\"\xf2\x02\n" +
+	"\x06status\x18\x06 \x01(\x0e2\x1f.openinfra.shared.v1.NodeStatusR\x06status\"\x86\x03\n" +
 	"\x12ResourceCapability\x12\x1b\n" +
 	"\tcpu_total\x18\x01 \x01(\x02R\bcpuTotal\x12#\n" +
 	"\rcpu_available\x18\x02 \x01(\x02R\fcpuAvailable\x12 \n" +
@@ -1061,7 +1077,8 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\x10storage_total_gb\x18\x05 \x01(\x03R\x0estorageTotalGb\x120\n" +
 	"\x14storage_available_gb\x18\x06 \x01(\x03R\x12storageAvailableGb\x124\n" +
 	"\x03gpu\x18\a \x01(\v2\".openinfra.shared.v1.GPUCapabilityR\x03gpu\x12<\n" +
-	"\tbandwidth\x18\b \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\"\x8b\x01\n" +
+	"\tbandwidth\x18\b \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\x12\x12\n" +
+	"\x04zone\x18\t \x01(\tR\x04zone\"\x8b\x01\n" +
 	"\rGPUCapability\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\"\n" +
 	"\rvram_total_mb\x18\x02 \x01(\x03R\vvramTotalMb\x12*\n" +
@@ -1098,11 +1115,12 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\n" +
 	"storage_gb\x18\x03 \x01(\x03R\tstorageGb\x12\x1b\n" +
 	"\tgpu_count\x18\x04 \x01(\x05R\bgpuCount\x12<\n" +
-	"\tbandwidth\x18\x05 \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\"\x7f\n" +
+	"\tbandwidth\x18\x05 \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\"\xa4\x01\n" +
 	"\x13WorkloadConstraints\x12$\n" +
 	"\x0emax_latency_ms\x18\x01 \x01(\x05R\fmaxLatencyMs\x12%\n" +
 	"\x0emin_reputation\x18\x02 \x01(\x02R\rminReputation\x12\x1b\n" +
-	"\tmax_price\x18\x03 \x01(\x02R\bmaxPrice\"\x9c\x02\n" +
+	"\tmax_price\x18\x03 \x01(\x02R\bmaxPrice\x12#\n" +
+	"\rrequired_zone\x18\x04 \x01(\tR\frequiredZone\"\x9c\x02\n" +
 	"\x05Lease\x12\x19\n" +
 	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
