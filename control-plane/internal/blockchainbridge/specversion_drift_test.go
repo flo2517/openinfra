@@ -9,23 +9,27 @@ import (
 	"testing"
 )
 
-// specVersionPattern matches the exact `spec_version: 3,` field of the
-// RuntimeVersion struct literal in blockchain/runtime/src/lib.rs, e.g.:
+// runtimeVersionBlockPattern anchors to the actual `pub const VERSION:
+// RuntimeVersion = RuntimeVersion { ... };` struct literal in
+// blockchain/runtime/src/lib.rs (non-greedy up to the first `};`, since
+// the literal itself contains no nested braces). specVersionPattern is
+// then applied only within that anchored block, not the whole file: a
+// bare `spec_version:\s*(\d+)` search across the entire file would match
+// the *first* occurrence anywhere -- silently validating against the
+// wrong value if the file ever gains another spec_version-shaped literal
+// above the real one (a test fixture, a doc example, a second runtime
+// config), with no signal that the wrong occurrence was picked.
 //
-//	#[runtime_version]
-//	pub const VERSION: RuntimeVersion = RuntimeVersion {
-//	    ...
-//	    spec_version: 3,
-//	    ...
-//	};
-//
-// This is deliberately a line-scan, not a Rust parser: it exists only to
+// Both are deliberately line-scans, not a Rust parser: they exist only to
 // detect drift between this constant and the runtime's real spec_version,
 // not to understand Rust syntax in general. If the RuntimeVersion literal
 // is ever restructured (field renamed, no longer a bare `spec_version: N,`
-// line), this pattern -- and TestSupportedSpecVersionMatchesRuntime below --
-// will need updating too.
-var specVersionPattern = regexp.MustCompile(`spec_version:\s*(\d+)`)
+// line, or the literal grows nested braces), these patterns -- and
+// TestSupportedSpecVersionMatchesRuntime below -- will need updating too.
+var (
+	runtimeVersionBlockPattern = regexp.MustCompile(`(?s)pub const VERSION: RuntimeVersion = RuntimeVersion \{.*?\};`)
+	specVersionPattern         = regexp.MustCompile(`spec_version:\s*(\d+)`)
+)
 
 // TestSupportedSpecVersionMatchesRuntime is a drift detector for the class
 // of bug filed as issue #123: supportedSpecVersion above is a hand-maintained
@@ -63,11 +67,21 @@ func TestSupportedSpecVersionMatchesRuntime(t *testing.T) {
 		)
 	}
 
-	match := specVersionPattern.FindSubmatch(contents)
+	block := runtimeVersionBlockPattern.Find(contents)
+	if block == nil {
+		t.Fatalf(
+			"could not find `pub const VERSION: RuntimeVersion = RuntimeVersion { ... };` in %q; "+
+				"it may have been restructured -- update runtimeVersionBlockPattern in this "+
+				"test to match its new shape",
+			runtimeLibPath,
+		)
+	}
+
+	match := specVersionPattern.FindSubmatch(block)
 	if match == nil {
 		t.Fatalf(
-			"could not find a `spec_version: N` field in %q; the RuntimeVersion struct "+
-				"literal may have been restructured -- update specVersionPattern in this "+
+			"could not find a `spec_version: N` field within the RuntimeVersion literal in %q; "+
+				"the literal may have been restructured -- update specVersionPattern in this "+
 				"test to match its new shape",
 			runtimeLibPath,
 		)

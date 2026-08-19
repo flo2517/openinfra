@@ -70,7 +70,13 @@ jobs:
           # this database and applies the migrations itself, so no fixture
           # loading or ordering between packages is needed.
           OPENINFRA_TEST_DATABASE_URL: postgres://openinfra:openinfra@127.0.0.1:5432/openinfra_test?sslmode=disable
-        run: go test ./...
+        # -count=1: setup-go's cache: true (default) restores GOCACHE
+        # across runs keyed on go.sum, and blockchainbridge's spec_version
+        # drift test reads a file outside the Go module that go test's
+        # cache has no visibility into -- without this, a stale PASS could
+        # be replayed here across CI runs after that file changes with no
+        # Go source touched, defeating the drift detector it exists to be.
+        run: go test -count=1 ./...
 
   provider-agent:
     name: Provider Agent / Rust
