@@ -65,6 +65,24 @@ func seedProvider(t *testing.T, ctx context.Context, pool *pgxpool.Pool, provide
 	}
 }
 
+// seedWorkload inserts the minimum workloads row RecordUsage's own query
+// requires to accept a workload_id at all: it INNER JOINs against
+// workloads (see RecordUsage's doc comment for why a JOIN, not a foreign
+// key, does the filtering), so a workload_id with no matching row here is
+// silently excluded, not persisted -- exactly the property under test
+// elsewhere, but every *other* test in this file needs a real row for its
+// workload_id to survive that filter at all.
+func seedWorkload(t *testing.T, ctx context.Context, pool *pgxpool.Pool, workloadID string) {
+	t.Helper()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO workloads (workload_id, request_id, request_hash, definition, image, state)
+		VALUES ($1, $2, $3, 'definition', 'test-image', 'REQUESTED')`,
+		workloadID, uuid.NewString(), []byte("01234567890123456789012345678901"))
+	if err != nil {
+		t.Fatalf("seed workload: %v", err)
+	}
+}
+
 func readUsage(t *testing.T, ctx context.Context, pool *pgxpool.Pool, providerID, workloadID string) (ingress, egress uint64, windowStartedAt time.Time) {
 	t.Helper()
 	err := pool.QueryRow(ctx, `
@@ -88,6 +106,7 @@ func TestRecordUsageUpsertsLatestCumulativeCounters(t *testing.T) {
 	providerID := uuid.NewString()
 	seedProvider(t, ctx, pool, providerID)
 	workloadID := uuid.NewString()
+	seedWorkload(t, ctx, pool, workloadID)
 	windowStartedAt := timestamppb.New(time.Unix(1_700_000_000, 0).UTC())
 
 	if err := store.RecordUsage(ctx, providerID, []*controlplanev1.WorkloadBandwidthUsage{{
@@ -123,6 +142,7 @@ func TestRecordUsageDiscardsADecreasedCounterWithinTheSameWindow(t *testing.T) {
 	providerID := uuid.NewString()
 	seedProvider(t, ctx, pool, providerID)
 	workloadID := uuid.NewString()
+	seedWorkload(t, ctx, pool, workloadID)
 	windowStartedAt := timestamppb.New(time.Unix(1_700_000_000, 0).UTC())
 
 	if err := store.RecordUsage(ctx, providerID, []*controlplanev1.WorkloadBandwidthUsage{{
@@ -156,6 +176,7 @@ func TestRecordUsageTreatsAChangedWindowAsANewSeriesEvenIfLower(t *testing.T) {
 	providerID := uuid.NewString()
 	seedProvider(t, ctx, pool, providerID)
 	workloadID := uuid.NewString()
+	seedWorkload(t, ctx, pool, workloadID)
 	firstWindow := timestamppb.New(time.Unix(1_700_000_000, 0).UTC())
 	restartedWindow := timestamppb.New(time.Unix(1_700_001_000, 0).UTC())
 
@@ -196,7 +217,14 @@ func TestRecordUsageIsolatesOneBadEntryFromTheRestOfTheSameHeartbeat(t *testing.
 	providerID := uuid.NewString()
 	seedProvider(t, ctx, pool, providerID)
 	goodWorkloadID := uuid.NewString()
+	seedWorkload(t, ctx, pool, goodWorkloadID)
 	overflowingWorkloadID := uuid.NewString()
+	// Seeded too, deliberately: this test's isolation property is about
+	// the range overflow specifically, not incidentally about the JOIN's
+	// separate existence filter (see TestRecordUsageSkipsAnEntryForAn-
+	// UnknownWorkload for that one) -- both entries are otherwise
+	// well-formed rows.
+	seedWorkload(t, ctx, pool, overflowingWorkloadID)
 	windowStartedAt := timestamppb.New(time.Unix(1_700_000_000, 0).UTC())
 
 	err := store.RecordUsage(ctx, providerID, []*controlplanev1.WorkloadBandwidthUsage{
@@ -218,5 +246,50 @@ func TestRecordUsageIsolatesOneBadEntryFromTheRestOfTheSameHeartbeat(t *testing.
 	}
 	if count != 0 {
 		t.Fatalf("the out-of-range entry must not have been persisted, found %d rows", count)
+	}
+}
+
+// TestRecordUsageSkipsAnEntryForAnUnknownWorkload is the other class of
+// per-entry problem RecordUsage must isolate, distinct from the overflow
+// case above: workload_bandwidth rides inside the already-authenticated
+// heartbeat, so a validly-signed but buggy/compromised Agent could
+// otherwise report usage for a syntactically-valid but nonexistent
+// workload forever. RecordUsage's INNER JOIN against workloads excludes
+// it from the row set entirely (see RecordUsage's own doc comment for why
+// a JOIN, not letting the workload_id foreign key reject it, is what
+// keeps this from also taking down the rest of the same heartbeat's
+// otherwise-valid entries).
+func TestRecordUsageSkipsAnEntryForAnUnknownWorkload(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	store := providerjoin.NewPostgresBandwidthUsageStore(pool)
+	providerID := uuid.NewString()
+	seedProvider(t, ctx, pool, providerID)
+	knownWorkloadID := uuid.NewString()
+	seedWorkload(t, ctx, pool, knownWorkloadID)
+	unknownWorkloadID := uuid.NewString() // deliberately never seeded into workloads
+	windowStartedAt := timestamppb.New(time.Unix(1_700_000_000, 0).UTC())
+
+	if err := store.RecordUsage(ctx, providerID, []*controlplanev1.WorkloadBandwidthUsage{
+		{WorkloadId: unknownWorkloadID, IngressBytesTotal: 1, EgressBytesTotal: 1, WindowStartedAt: windowStartedAt},
+		{WorkloadId: knownWorkloadID, IngressBytesTotal: 42, EgressBytesTotal: 43, WindowStartedAt: windowStartedAt},
+	}); err != nil {
+		// Unlike the overflow case, an unknown workload_id is not
+		// reported as an error at all -- it is exactly as unremarkable
+		// to RecordUsage as a workload that simply isn't running on this
+		// provider yet, which is not an error condition.
+		t.Fatalf("an unknown workload_id must not itself cause an error: %v", err)
+	}
+
+	ingress, egress, _ := readUsage(t, ctx, pool, providerID, knownWorkloadID)
+	if ingress != 42 || egress != 43 {
+		t.Fatalf("the well-formed entry in the same heartbeat: ingress=%d egress=%d, want 42/43", ingress, egress)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workload_bandwidth_usage WHERE workload_id = $1`, unknownWorkloadID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("the unknown workload_id must not have been persisted, found %d rows", count)
 	}
 }

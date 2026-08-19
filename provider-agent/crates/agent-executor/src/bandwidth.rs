@@ -31,20 +31,24 @@ pub struct WorkloadBandwidth {
 /// at a fake sysfs/procfs tree without root or a real container/Docker).
 ///
 /// Directions are named from the *workload's* point of view to match the
-/// proto: `ingress` is `rx_bytes` (traffic arriving at the container's
-/// `eth0`), `egress` is `tx_bytes` (traffic leaving it) -- read from the
-/// *host* side of the veth pair, where the byte counts are identical to
-/// the container-side counters (a veth pair mirrors traffic, it does not
-/// duplicate or drop it) but reachable without entering the container's
-/// own namespace a second time.
+/// proto: `ingress` is traffic arriving at the container's `eth0`,
+/// `egress` is traffic leaving it. Read from the *host* side of the veth
+/// pair (reachable without entering the container's own namespace a
+/// second time), where the counters are the *opposite* of what their
+/// names suggest relative to the container: a veth pair is a
+/// point-to-point link, so whatever the container's `eth0` transmits is
+/// what the host-side peer *receives*, and vice versa. The host side's
+/// `rx_bytes` is therefore the container's egress, and the host side's
+/// `tx_bytes` is the container's ingress -- not "identical counters",
+/// each is the other end's mirror image.
 pub fn read_bandwidth(
     sys_root: &Path,
     container_pid: i64,
     window_started_at: SystemTime,
 ) -> Result<WorkloadBandwidth, ExecutorError> {
     let veth = resolve_veth_name(sys_root, container_pid)?;
-    let ingress_bytes_total = read_counter(sys_root, &veth, "rx_bytes")?;
-    let egress_bytes_total = read_counter(sys_root, &veth, "tx_bytes")?;
+    let ingress_bytes_total = read_counter(sys_root, &veth, "tx_bytes")?;
+    let egress_bytes_total = read_counter(sys_root, &veth, "rx_bytes")?;
     Ok(WorkloadBandwidth {
         ingress_bytes_total,
         egress_bytes_total,
@@ -132,6 +136,12 @@ mod tests {
             "17\n",
         );
         write(&root.join("sys/class/net/veth-abc123/ifindex"), "17\n");
+        // Host-side rx_bytes is the container's *egress* and host-side
+        // tx_bytes is the container's *ingress* -- a veth pair mirrors,
+        // it does not duplicate (see read_bandwidth's doc comment). These
+        // two values are deliberately different so a direction swap in
+        // the implementation fails this assertion instead of passing by
+        // coincidence.
         write(
             &root.join("sys/class/net/veth-abc123/statistics/rx_bytes"),
             "1024\n",
@@ -144,8 +154,14 @@ mod tests {
         write(&root.join("sys/class/net/eth0/ifindex"), "1\n");
 
         let reading = read_bandwidth(root, 4242, UNIX_EPOCH).expect("read bandwidth");
-        assert_eq!(reading.ingress_bytes_total, 1024);
-        assert_eq!(reading.egress_bytes_total, 2048);
+        assert_eq!(
+            reading.ingress_bytes_total, 2048,
+            "container ingress must come from the host side's tx_bytes"
+        );
+        assert_eq!(
+            reading.egress_bytes_total, 1024,
+            "container egress must come from the host side's rx_bytes"
+        );
         assert_eq!(reading.window_started_at, UNIX_EPOCH);
     }
 
@@ -191,7 +207,13 @@ mod tests {
         );
 
         let reading = read_bandwidth(root, 4242, UNIX_EPOCH).expect("read bandwidth");
-        assert_eq!(reading.ingress_bytes_total, 5);
-        assert_eq!(reading.egress_bytes_total, 6);
+        assert_eq!(
+            reading.ingress_bytes_total, 6,
+            "container ingress must come from the host side's tx_bytes"
+        );
+        assert_eq!(
+            reading.egress_bytes_total, 5,
+            "container egress must come from the host side's rx_bytes"
+        );
     }
 }
