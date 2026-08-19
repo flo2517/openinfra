@@ -18,7 +18,20 @@ import (
 )
 
 const (
-	supportedSpecVersion        = 2
+	// supportedSpecVersion is 3, not 2: #37 (commit d9d8df6, "add local
+	// Aura GRANDPA testnet") bumped runtime/src/lib.rs's spec_version
+	// from 2 to 3 for the move off manual sealing but never updated this
+	// guard, so every on-chain registrar call (EnsureActive, lease
+	// finalization, Network Validator registration) unconditionally
+	// failed with "unsupported runtime version spec=3 transaction=1"
+	// against any post-#37 node -- caught only by actually running the
+	// join -> deploy path end to end (issue #117), not by any unit test:
+	// nothing here mocks a real spec_version. The runtime's own
+	// bridge_call_indices_remain_stable_in_spec_version_three test
+	// (blockchain/runtime/src/lib.rs) confirms the pallet/call indices
+	// below did not change across that bump, so this version number is
+	// the only thing that needed correcting.
+	supportedSpecVersion        = 3
 	supportedTransactionVersion = 1
 	runtimeExtrinsicVersion     = 4
 	sudoPalletIndex             = 2
