@@ -132,6 +132,12 @@ type Candidate struct {
 	// scored as zero.
 	Reputation    ReputationVector
 	HasReputation bool
+
+	// Zone is the provider's operator-declared availability zone (ADR-026),
+	// "" when undeclared. Unlike HasReputation, an undeclared zone is not
+	// given a neutral default when a workload requires one -- see
+	// scoreOne's zone check for why the two cases differ.
+	Zone string
 }
 
 // Score is one candidate's fully-computed, auditable result.
@@ -237,6 +243,18 @@ func (r *Ranker) Rank(
 	return decision
 }
 
+// ReasonZoneMismatch is scoreOne's exclusion reason for ADR-026 §4's zone
+// hard-exclusion (below). Exported, not a bare string literal repeated at
+// its only other use site, orchestrator.Worker.noEligibleProviderError
+// (internal/orchestrator/worker.go): that function pattern-matches on this
+// exact reason to build its zone-specific "zones present: ..." error
+// message (ADR-026 §3's typo-diagnosis mitigation). A hand-duplicated
+// string in each file would compile and pass both packages' own tests
+// even if one side's wording drifted from the other -- silently breaking
+// the zone-specific messaging with no compiler or test signal, since
+// nothing would tie the two literals together.
+const ReasonZoneMismatch = "zone mismatch"
+
 func (r *Ranker) scoreOne(
 	weights ProfileWeights,
 	requirements *sharedv1.ResourceRequirements,
@@ -306,6 +324,16 @@ func (r *Ranker) scoreOne(
 	}
 	reputationBps := weightedReputationBps(weights, reputation, r.MaxReputationScore)
 
+	// ADR-026 §4: a hard exclusion, same shape as MinReputation below --
+	// no neutral default for an undeclared zone. Unlike reputation (chain-
+	// assigned, with a real timing gap a new provider doesn't control),
+	// zone is provider-declared at zero cost from a provider's very first
+	// heartbeat, so a candidate with no declared zone cannot satisfy an
+	// explicit "run this in zone X" request and is excluded, not treated
+	// as "matches anything".
+	if constraints != nil && constraints.RequiredZone != "" && candidate.Zone != constraints.RequiredZone {
+		return Score{}, true, ReasonZoneMismatch
+	}
 	if constraints != nil && constraints.MinReputation > 0 {
 		// Documented convention: min_reputation is on the same
 		// 0..MaxReputationScore scale as the on-chain vector (matching

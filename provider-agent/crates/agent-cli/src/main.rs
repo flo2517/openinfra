@@ -391,6 +391,7 @@ fn resource_capability(
         storage_total_gb: inventory.total_storage_gb,
         storage_available_gb: inventory.available_storage_gb,
         bandwidth,
+        zone: config.agent.zone.clone(),
         ..Default::default()
     }
 }

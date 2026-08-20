@@ -118,6 +118,46 @@ func TestRankEnforcesMinReputationConstraint(t *testing.T) {
 	}
 }
 
+func TestRankIgnoresZoneEntirelyWhenNotRequested(t *testing.T) {
+	requirements := &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 512}
+	candidates := []Candidate{
+		{ProviderID: "zoned", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096, Zone: "us-east"},
+		{ProviderID: "unzoned", AgentEndpoint: "https://b", CPUAvailableCores: 4, RAMAvailableMB: 4096, Zone: ""},
+	}
+	decision := testRanker().Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, candidates)
+	if len(decision.Ranked) != 2 {
+		t.Fatalf("expected both candidates to survive when no required_zone is set, got %+v (excluded: %+v)", decision.Ranked, decision.Excluded)
+	}
+}
+
+func TestRankEnforcesRequiredZoneConstraint(t *testing.T) {
+	requirements := &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 512}
+	constraints := &sharedv1.WorkloadConstraints{RequiredZone: "us-east"}
+	candidates := []Candidate{
+		{ProviderID: "matching-zone", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096, Zone: "us-east"},
+		{ProviderID: "wrong-zone", AgentEndpoint: "https://b", CPUAvailableCores: 4, RAMAvailableMB: 4096, Zone: "us-west"},
+		{ProviderID: "no-zone", AgentEndpoint: "https://c", CPUAvailableCores: 4, RAMAvailableMB: 4096, Zone: ""},
+	}
+	decision := testRanker().Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, constraints, candidates)
+	if len(decision.Ranked) != 1 || decision.Ranked[0].ProviderID != "matching-zone" {
+		t.Fatalf("expected only 'matching-zone' to survive the required_zone constraint, got %+v", decision.Ranked)
+	}
+	reasons := map[string]string{}
+	for _, e := range decision.Excluded {
+		reasons[e.ProviderID] = e.Reason
+	}
+	if reasons["wrong-zone"] != ReasonZoneMismatch {
+		t.Fatalf("expected 'wrong-zone' excluded with reason %q, got %q", ReasonZoneMismatch, reasons["wrong-zone"])
+	}
+	// A candidate with no declared zone is excluded too, not treated as a
+	// neutral default the way HasReputation is -- ADR-026 §4 is explicit
+	// that this differs from the reputation convention because zone is
+	// provider-declared at zero cost, unlike chain-assigned reputation.
+	if reasons["no-zone"] != ReasonZoneMismatch {
+		t.Fatalf("expected 'no-zone' excluded with reason %q, got %q", ReasonZoneMismatch, reasons["no-zone"])
+	}
+}
+
 func TestRankReturnsNoSelectionWhenEverythingIsExcluded(t *testing.T) {
 	requirements := &sharedv1.ResourceRequirements{Cpu: 100, RamMb: 100_000}
 	candidates := []Candidate{

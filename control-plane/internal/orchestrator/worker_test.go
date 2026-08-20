@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +68,30 @@ func TestRankableCandidatesWiresBandwidthCapacityThrough(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected the with-bandwidth candidate to be present")
+	}
+}
+
+// TestRankableCandidatesWiresZoneThrough covers ADR-026 §4/§5: zone is
+// extracted from ResourceCapability.Zone into Candidate.Zone alongside the
+// existing CPU/RAM/storage/bandwidth fields, and an undeclared zone stays
+// the empty string rather than some other sentinel.
+func TestRankableCandidatesWiresZoneThrough(t *testing.T) {
+	providers := []agentmanager.SchedulableProvider{
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "zoned", AgentEndpoint: "https://a:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuTotal: 4, CpuAvailable: 4, RamTotalMb: 4096, RamAvailableMb: 4096, Zone: "us-east"}},
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "unzoned", AgentEndpoint: "https://b:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuTotal: 4, CpuAvailable: 4, RamTotalMb: 4096, RamAvailableMb: 4096}},
+	}
+	worker := NewWorker(nil, nil, nil, nil, testRanker())
+	candidates, _ := worker.rankableCandidates(context.Background(), providers)
+
+	zones := map[string]string{}
+	for _, c := range candidates {
+		zones[c.ProviderID] = c.Zone
+	}
+	if zones["zoned"] != "us-east" {
+		t.Fatalf("expected zoned candidate's Zone to be %q, got %q", "us-east", zones["zoned"])
+	}
+	if zones["unzoned"] != "" {
+		t.Fatalf("expected unzoned candidate's Zone to be empty, got %q", zones["unzoned"])
 	}
 }
 
@@ -244,6 +270,117 @@ func TestDeployingCarriesReservedEgressMbpsIntoTheDeployRequest(t *testing.T) {
 				t.Fatalf("EgressMbps = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+// TestNoEligibleProviderErrorSurfacesDistinctReasons covers ADR-026 §3's
+// error-messaging mitigation: the NO_CAPACITY error must surface the
+// distinct exclusion reasons actually seen, not just a count -- a general
+// fix, not zone-specific.
+func TestNoEligibleProviderErrorSurfacesDistinctReasons(t *testing.T) {
+	excluded := []scheduler.Exclusion{
+		{ProviderID: "a", Reason: "insufficient CPU"},
+		{ProviderID: "b", Reason: "insufficient CPU"},
+		{ProviderID: "c", Reason: "below workload's minimum reputation constraint"},
+	}
+	err := noEligibleProviderError(excluded, nil, "")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "3 candidates excluded") {
+		t.Fatalf("expected the exclusion count in the message, got %q", msg)
+	}
+	if !strings.Contains(msg, "insufficient CPU") || !strings.Contains(msg, "below workload's minimum reputation constraint") {
+		t.Fatalf("expected both distinct reasons in the message, got %q", msg)
+	}
+	// "insufficient CPU" must appear exactly once despite two candidates
+	// sharing it -- reasons are deduplicated, not merely concatenated.
+	if strings.Count(msg, "insufficient CPU") != 1 {
+		t.Fatalf("expected the reason deduplicated, got %q", msg)
+	}
+}
+
+// TestNoEligibleProviderErrorBoundsDistinctReasons pins that an
+// unreasonably large number of distinct reasons is capped, not printed in
+// full, per maxDistinctExclusionReasons.
+func TestNoEligibleProviderErrorBoundsDistinctReasons(t *testing.T) {
+	var excluded []scheduler.Exclusion
+	for i := 0; i < maxDistinctExclusionReasons+3; i++ {
+		excluded = append(excluded, scheduler.Exclusion{ProviderID: fmt.Sprintf("p%d", i), Reason: fmt.Sprintf("reason-%d", i)})
+	}
+	msg := noEligibleProviderError(excluded, nil, "").Error()
+	if !strings.Contains(msg, "and 3 more") {
+		t.Fatalf("expected the overflow to be summarized as \"and 3 more\", got %q", msg)
+	}
+}
+
+// TestNoEligibleProviderErrorBoundsZonesPresent is the zones-present
+// list's own version of the test above: a large, zone-diverse candidate
+// pool (the exact permissionless, free-form-zone scenario ADR-026
+// targets) must not produce an unbounded "zones present: ..." list --
+// found in review as a gap the reasons list above didn't have.
+func TestNoEligibleProviderErrorBoundsZonesPresent(t *testing.T) {
+	var excluded []scheduler.Exclusion
+	var candidates []scheduler.Candidate
+	for i := 0; i < maxDistinctExclusionReasons+3; i++ {
+		providerID := fmt.Sprintf("p%d", i)
+		excluded = append(excluded, scheduler.Exclusion{ProviderID: providerID, Reason: scheduler.ReasonZoneMismatch})
+		candidates = append(candidates, scheduler.Candidate{ProviderID: providerID, Zone: fmt.Sprintf("zone-%d", i)})
+	}
+	msg := noEligibleProviderError(excluded, candidates, "nowhere").Error()
+	if !strings.Contains(msg, "zones present:") {
+		t.Fatalf("expected the zone-specific message, got %q", msg)
+	}
+	if !strings.Contains(msg, "and 3 more") {
+		t.Fatalf("expected the zone overflow to be summarized as \"and 3 more\" (8 distinct zones, capped at %d), got %q", maxDistinctExclusionReasons, msg)
+	}
+}
+
+// TestNoEligibleProviderErrorSurfacesZonesPresentOnAllZoneMismatch covers
+// ADR-026 §3's named example directly: when every exclusion is a zone
+// mismatch, the message names the requested zone and the set of zones
+// actually declared among the excluded candidates, deduplicated and
+// sorted -- not just "zone mismatch" repeated with no further signal.
+func TestNoEligibleProviderErrorSurfacesZonesPresentOnAllZoneMismatch(t *testing.T) {
+	excluded := []scheduler.Exclusion{
+		{ProviderID: "a", Reason: scheduler.ReasonZoneMismatch},
+		{ProviderID: "b", Reason: scheduler.ReasonZoneMismatch},
+		{ProviderID: "c", Reason: scheduler.ReasonZoneMismatch},
+	}
+	candidates := []scheduler.Candidate{
+		{ProviderID: "a", Zone: "us-east"},
+		{ProviderID: "b", Zone: "us-west"},
+		{ProviderID: "c", Zone: "us-east"},
+	}
+	msg := noEligibleProviderError(excluded, candidates, "us-eas").Error()
+	if !strings.Contains(msg, `requested zone "us-eas" matched none`) {
+		t.Fatalf("expected the requested zone quoted in the message, got %q", msg)
+	}
+	if !strings.Contains(msg, "zones present: us-east, us-west") {
+		t.Fatalf("expected the deduplicated, sorted set of declared zones, got %q", msg)
+	}
+}
+
+// TestNoEligibleProviderErrorFallsBackWhenExclusionReasonsAreMixed pins
+// that the zone-specific message only triggers when *every* exclusion is
+// a zone mismatch -- a mixed set of reasons (some zone, some not) falls
+// back to the general distinct-reasons summary instead.
+func TestNoEligibleProviderErrorFallsBackWhenExclusionReasonsAreMixed(t *testing.T) {
+	excluded := []scheduler.Exclusion{
+		{ProviderID: "a", Reason: scheduler.ReasonZoneMismatch},
+		{ProviderID: "b", Reason: "insufficient CPU"},
+	}
+	candidates := []scheduler.Candidate{
+		{ProviderID: "a", Zone: "us-west"},
+		{ProviderID: "b", Zone: "us-east"},
+	}
+	msg := noEligibleProviderError(excluded, candidates, "us-east").Error()
+	if strings.Contains(msg, "zones present") {
+		t.Fatalf("expected the general summary, not the zone-specific one, got %q", msg)
+	}
+	if !strings.Contains(msg, scheduler.ReasonZoneMismatch) || !strings.Contains(msg, "insufficient CPU") {
+		t.Fatalf("expected both distinct reasons in the general summary, got %q", msg)
 	}
 }
 
