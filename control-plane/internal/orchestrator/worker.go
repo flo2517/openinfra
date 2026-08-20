@@ -372,49 +372,75 @@ func noEligibleProviderError(excluded []scheduler.Exclusion, candidates []schedu
 		return fmt.Errorf("no eligible provider (0 candidates excluded)")
 	}
 
-	reasons := make([]string, 0, len(excluded))
-	seenReasons := make(map[string]bool, len(excluded))
+	rawReasons := make([]string, 0, len(excluded))
 	allZoneMismatch := true
 	for _, e := range excluded {
-		if e.Reason != "zone mismatch" {
+		if e.Reason != scheduler.ReasonZoneMismatch {
 			allZoneMismatch = false
 		}
-		if !seenReasons[e.Reason] {
-			seenReasons[e.Reason] = true
-			reasons = append(reasons, e.Reason)
-		}
+		rawReasons = append(rawReasons, e.Reason)
 	}
+	reasons, truncatedReasons := dedupeOrderedBounded(rawReasons, maxDistinctExclusionReasons)
 
 	if allZoneMismatch && requiredZone != "" {
 		zonesByProvider := make(map[string]string, len(candidates))
 		for _, c := range candidates {
 			zonesByProvider[c.ProviderID] = c.Zone
 		}
-		seenZones := make(map[string]bool, len(excluded))
-		var zones []string
+		rawZones := make([]string, 0, len(excluded))
 		for _, e := range excluded {
-			zone := zonesByProvider[e.ProviderID]
-			if zone == "" || seenZones[zone] {
-				continue
+			if zone := zonesByProvider[e.ProviderID]; zone != "" {
+				rawZones = append(rawZones, zone)
 			}
-			seenZones[zone] = true
-			zones = append(zones, zone)
 		}
+		// Bounded the same way reasons is just above -- a large,
+		// zone-diverse candidate pool (the exact permissionless,
+		// free-form-zone scenario ADR-026 targets) must not produce an
+		// unbounded error message.
+		zones, truncatedZones := dedupeOrderedBounded(rawZones, maxDistinctExclusionReasons)
 		sort.Strings(zones)
 		if len(zones) == 0 {
 			return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; no excluded candidate declared a zone",
 				len(excluded), requiredZone)
 		}
+		if truncatedZones > 0 {
+			return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; zones present: %s, and %d more",
+				len(excluded), requiredZone, strings.Join(zones, ", "), truncatedZones)
+		}
 		return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; zones present: %s",
 			len(excluded), requiredZone, strings.Join(zones, ", "))
 	}
 
-	if len(reasons) > maxDistinctExclusionReasons {
+	if truncatedReasons > 0 {
 		return fmt.Errorf("no eligible provider: %d candidates excluded — reasons: %s, and %d more",
-			len(excluded), strings.Join(reasons[:maxDistinctExclusionReasons], ", "), len(reasons)-maxDistinctExclusionReasons)
+			len(excluded), strings.Join(reasons, ", "), truncatedReasons)
 	}
 	return fmt.Errorf("no eligible provider: %d candidates excluded — reasons: %s",
 		len(excluded), strings.Join(reasons, ", "))
+}
+
+// dedupeOrderedBounded deduplicates items in first-seen order, then caps
+// the result at max distinct values, returning how many *additional*
+// distinct values existed beyond the cap (0 if none -- a caller building
+// an "and N more" suffix needs that count, not just the truncated slice's
+// length). Shared by noEligibleProviderError's two dedup passes (exclusion
+// reasons, and -- separately -- zones present among zone-mismatch
+// exclusions) so both get identical bounding/ordering behavior from one
+// place instead of two hand-rolled seen-map loops that could silently
+// drift apart (e.g. a future change to how "seen" is normalized, applied
+// to only one of the two).
+func dedupeOrderedBounded(items []string, max int) (values []string, truncatedBy int) {
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		if !seen[item] {
+			seen[item] = true
+			values = append(values, item)
+		}
+	}
+	if len(values) <= max {
+		return values, 0
+	}
+	return values[:max], len(values) - max
 }
 
 // workloadEgressMbps is the workload's *reserved* egress rate (ADR-025

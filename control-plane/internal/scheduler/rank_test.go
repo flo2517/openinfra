@@ -146,15 +146,15 @@ func TestRankEnforcesRequiredZoneConstraint(t *testing.T) {
 	for _, e := range decision.Excluded {
 		reasons[e.ProviderID] = e.Reason
 	}
-	if reasons["wrong-zone"] != "zone mismatch" {
-		t.Fatalf("expected 'wrong-zone' excluded with reason %q, got %q", "zone mismatch", reasons["wrong-zone"])
+	if reasons["wrong-zone"] != ReasonZoneMismatch {
+		t.Fatalf("expected 'wrong-zone' excluded with reason %q, got %q", ReasonZoneMismatch, reasons["wrong-zone"])
 	}
 	// A candidate with no declared zone is excluded too, not treated as a
 	// neutral default the way HasReputation is -- ADR-026 §4 is explicit
 	// that this differs from the reputation convention because zone is
 	// provider-declared at zero cost, unlike chain-assigned reputation.
-	if reasons["no-zone"] != "zone mismatch" {
-		t.Fatalf("expected 'no-zone' excluded with reason %q, got %q", "zone mismatch", reasons["no-zone"])
+	if reasons["no-zone"] != ReasonZoneMismatch {
+		t.Fatalf("expected 'no-zone' excluded with reason %q, got %q", ReasonZoneMismatch, reasons["no-zone"])
 	}
 }
 

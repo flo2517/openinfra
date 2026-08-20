@@ -315,6 +315,28 @@ func TestNoEligibleProviderErrorBoundsDistinctReasons(t *testing.T) {
 	}
 }
 
+// TestNoEligibleProviderErrorBoundsZonesPresent is the zones-present
+// list's own version of the test above: a large, zone-diverse candidate
+// pool (the exact permissionless, free-form-zone scenario ADR-026
+// targets) must not produce an unbounded "zones present: ..." list --
+// found in review as a gap the reasons list above didn't have.
+func TestNoEligibleProviderErrorBoundsZonesPresent(t *testing.T) {
+	var excluded []scheduler.Exclusion
+	var candidates []scheduler.Candidate
+	for i := 0; i < maxDistinctExclusionReasons+3; i++ {
+		providerID := fmt.Sprintf("p%d", i)
+		excluded = append(excluded, scheduler.Exclusion{ProviderID: providerID, Reason: scheduler.ReasonZoneMismatch})
+		candidates = append(candidates, scheduler.Candidate{ProviderID: providerID, Zone: fmt.Sprintf("zone-%d", i)})
+	}
+	msg := noEligibleProviderError(excluded, candidates, "nowhere").Error()
+	if !strings.Contains(msg, "zones present:") {
+		t.Fatalf("expected the zone-specific message, got %q", msg)
+	}
+	if !strings.Contains(msg, "and 3 more") {
+		t.Fatalf("expected the zone overflow to be summarized as \"and 3 more\" (8 distinct zones, capped at %d), got %q", maxDistinctExclusionReasons, msg)
+	}
+}
+
 // TestNoEligibleProviderErrorSurfacesZonesPresentOnAllZoneMismatch covers
 // ADR-026 §3's named example directly: when every exclusion is a zone
 // mismatch, the message names the requested zone and the set of zones
@@ -322,9 +344,9 @@ func TestNoEligibleProviderErrorBoundsDistinctReasons(t *testing.T) {
 // sorted -- not just "zone mismatch" repeated with no further signal.
 func TestNoEligibleProviderErrorSurfacesZonesPresentOnAllZoneMismatch(t *testing.T) {
 	excluded := []scheduler.Exclusion{
-		{ProviderID: "a", Reason: "zone mismatch"},
-		{ProviderID: "b", Reason: "zone mismatch"},
-		{ProviderID: "c", Reason: "zone mismatch"},
+		{ProviderID: "a", Reason: scheduler.ReasonZoneMismatch},
+		{ProviderID: "b", Reason: scheduler.ReasonZoneMismatch},
+		{ProviderID: "c", Reason: scheduler.ReasonZoneMismatch},
 	}
 	candidates := []scheduler.Candidate{
 		{ProviderID: "a", Zone: "us-east"},
@@ -346,7 +368,7 @@ func TestNoEligibleProviderErrorSurfacesZonesPresentOnAllZoneMismatch(t *testing
 // back to the general distinct-reasons summary instead.
 func TestNoEligibleProviderErrorFallsBackWhenExclusionReasonsAreMixed(t *testing.T) {
 	excluded := []scheduler.Exclusion{
-		{ProviderID: "a", Reason: "zone mismatch"},
+		{ProviderID: "a", Reason: scheduler.ReasonZoneMismatch},
 		{ProviderID: "b", Reason: "insufficient CPU"},
 	}
 	candidates := []scheduler.Candidate{
@@ -357,7 +379,7 @@ func TestNoEligibleProviderErrorFallsBackWhenExclusionReasonsAreMixed(t *testing
 	if strings.Contains(msg, "zones present") {
 		t.Fatalf("expected the general summary, not the zone-specific one, got %q", msg)
 	}
-	if !strings.Contains(msg, "zone mismatch") || !strings.Contains(msg, "insufficient CPU") {
+	if !strings.Contains(msg, scheduler.ReasonZoneMismatch) || !strings.Contains(msg, "insufficient CPU") {
 		t.Fatalf("expected both distinct reasons in the general summary, got %q", msg)
 	}
 }

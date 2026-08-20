@@ -243,6 +243,18 @@ func (r *Ranker) Rank(
 	return decision
 }
 
+// ReasonZoneMismatch is scoreOne's exclusion reason for ADR-026 §4's zone
+// hard-exclusion (below). Exported, not a bare string literal repeated at
+// its only other use site, orchestrator.Worker.noEligibleProviderError
+// (internal/orchestrator/worker.go): that function pattern-matches on this
+// exact reason to build its zone-specific "zones present: ..." error
+// message (ADR-026 §3's typo-diagnosis mitigation). A hand-duplicated
+// string in each file would compile and pass both packages' own tests
+// even if one side's wording drifted from the other -- silently breaking
+// the zone-specific messaging with no compiler or test signal, since
+// nothing would tie the two literals together.
+const ReasonZoneMismatch = "zone mismatch"
+
 func (r *Ranker) scoreOne(
 	weights ProfileWeights,
 	requirements *sharedv1.ResourceRequirements,
@@ -320,7 +332,7 @@ func (r *Ranker) scoreOne(
 	// explicit "run this in zone X" request and is excluded, not treated
 	// as "matches anything".
 	if constraints != nil && constraints.RequiredZone != "" && candidate.Zone != constraints.RequiredZone {
-		return Score{}, true, "zone mismatch"
+		return Score{}, true, ReasonZoneMismatch
 	}
 	if constraints != nil && constraints.MinReputation > 0 {
 		// Documented convention: min_reputation is on the same
