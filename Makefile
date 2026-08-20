@@ -52,6 +52,8 @@ dev-up:
 	deployments/scripts/generate-dev-certs.sh
 	docker compose --env-file .env -f deployments/docker-compose.yml config --quiet
 	docker compose --env-file .env -f deployments/docker-compose.yml up -d --build --wait
+	test -x deployments/scripts/bootstrap-network-validators.sh
+	GO=$(GO) deployments/scripts/bootstrap-network-validators.sh
 
 dev-down:
 	docker compose --env-file .env -f deployments/docker-compose.yml down
