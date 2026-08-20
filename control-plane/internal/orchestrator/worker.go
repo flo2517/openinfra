@@ -393,30 +393,48 @@ func noEligibleProviderError(excluded []scheduler.Exclusion, candidates []schedu
 				rawZones = append(rawZones, zone)
 			}
 		}
-		// Bounded the same way reasons is just above -- a large,
-		// zone-diverse candidate pool (the exact permissionless,
-		// free-form-zone scenario ADR-026 targets) must not produce an
-		// unbounded error message.
-		zones, truncatedZones := dedupeOrderedBounded(rawZones, maxDistinctExclusionReasons)
-		sort.Strings(zones)
+		// Deduplicated and sorted *before* bounding, deliberately in that
+		// order: bounding first-seen order (as reasons does just above)
+		// would let an arbitrary subset of zones survive truncation --
+		// found in review as a real bug, since the whole point of this
+		// message is letting a tenant spot their own typo by checking
+		// whether the zone they expect appears in the list, and
+		// provider-iteration order has no relationship to which zone
+		// that is. Sorting first, then truncating, guarantees the
+		// truncated list is always the alphabetically-first N distinct
+		// zones -- deterministic and complete for any zone whose name
+		// sorts within the bound, not an arbitrary sample.
+		allZones := dedupeOrdered(rawZones)
+		sort.Strings(allZones)
+		zones, truncatedZones := allZones, 0
+		if len(allZones) > maxDistinctExclusionReasons {
+			zones, truncatedZones = allZones[:maxDistinctExclusionReasons], len(allZones)-maxDistinctExclusionReasons
+		}
 		if len(zones) == 0 {
 			return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; no excluded candidate declared a zone",
 				len(excluded), requiredZone)
 		}
-		if truncatedZones > 0 {
-			return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; zones present: %s, and %d more",
-				len(excluded), requiredZone, strings.Join(zones, ", "), truncatedZones)
-		}
 		return fmt.Errorf("no eligible provider: %d candidates excluded — requested zone %q matched none; zones present: %s",
-			len(excluded), requiredZone, strings.Join(zones, ", "))
+			len(excluded), requiredZone, joinWithOverflow(zones, truncatedZones))
 	}
 
-	if truncatedReasons > 0 {
-		return fmt.Errorf("no eligible provider: %d candidates excluded — reasons: %s, and %d more",
-			len(excluded), strings.Join(reasons, ", "), truncatedReasons)
-	}
 	return fmt.Errorf("no eligible provider: %d candidates excluded — reasons: %s",
-		len(excluded), strings.Join(reasons, ", "))
+		len(excluded), joinWithOverflow(reasons, truncatedReasons))
+}
+
+// joinWithOverflow renders a bounded, deduplicated list for an error
+// message, appending ", and N more" when the caller's dedupeOrderedBounded
+// call truncated it. Shared by noEligibleProviderError's two list-shaped
+// branches (reasons, zones present) so the "and N more" phrasing can only
+// ever say one thing, not drift between near-identical hand-written
+// fmt.Errorf branches -- found in review as exactly that risk (up to 5
+// near-duplicate format strings differing only in this suffix).
+func joinWithOverflow(items []string, truncatedBy int) string {
+	joined := strings.Join(items, ", ")
+	if truncatedBy > 0 {
+		return fmt.Sprintf("%s, and %d more", joined, truncatedBy)
+	}
+	return joined
 }
 
 // dedupeOrderedBounded deduplicates items in first-seen order, then caps
@@ -430,17 +448,29 @@ func noEligibleProviderError(excluded []scheduler.Exclusion, candidates []schedu
 // drift apart (e.g. a future change to how "seen" is normalized, applied
 // to only one of the two).
 func dedupeOrderedBounded(items []string, max int) (values []string, truncatedBy int) {
+	values = dedupeOrdered(items)
+	if len(values) <= max {
+		return values, 0
+	}
+	return values[:max], len(values) - max
+}
+
+// dedupeOrdered deduplicates items in first-seen order, unbounded. The
+// building block dedupeOrderedBounded truncates after; callers that need
+// a different order applied before truncation (e.g. sorted, not
+// first-seen -- see the zones-present list in noEligibleProviderError)
+// call this directly instead, so the property they actually want
+// truncated by is decided before any values are thrown away, not after.
+func dedupeOrdered(items []string) []string {
 	seen := make(map[string]bool, len(items))
+	var values []string
 	for _, item := range items {
 		if !seen[item] {
 			seen[item] = true
 			values = append(values, item)
 		}
 	}
-	if len(values) <= max {
-		return values, 0
-	}
-	return values[:max], len(values) - max
+	return values
 }
 
 // workloadEgressMbps is the workload's *reserved* egress rate (ADR-025
