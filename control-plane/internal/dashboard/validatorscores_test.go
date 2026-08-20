@@ -16,6 +16,7 @@ import (
 	"github.com/openinfra/network/internal/testsupport"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/walletlogin"
+	"github.com/openinfra/network/internal/workloadapi"
 	"github.com/openinfra/network/migrations"
 )
 
@@ -65,7 +66,8 @@ func newValidatorScoresTestServer(t *testing.T) (context.Context, *Server, *pgxp
 
 	users := userauth.NewPostgresRepository(pool)
 	wallet := walletlogin.NewService(walletlogin.NewPostgresRepository(pool), users)
-	server := New(pool, nil, chain, wallet, users, nil) // nil redis/limiter: unused by this endpoint under test
+	workloads := workloadapi.NewService(workloadapi.NewPostgresRepository(pool))
+	server := New(pool, nil, chain, wallet, users, nil, workloads) // nil redis/limiter: unused by this endpoint under test
 	return ctx, server, pool
 }
 

@@ -7,6 +7,10 @@
 // declaration here would collide with app.js's.
 (() => {
 const $ = id => document.getElementById(id);
+// row()/warn(): shared with tenant.js via auth.js's window.openinfraDashboard
+// (see that file for why they live there) -- no longer declared here, so
+// a future edit to either can't drift between the two panels silently.
+const { row, warn } = window.openinfraDashboard;
 
 // Roles that may see this panel, mirroring userauth.roleRank's ordering
 // (internal/userauth/userauth.go). This is a *rendering* decision only:
@@ -16,22 +20,6 @@ const OPERATOR_ROLES = ['operator_readonly', 'operator_admin'];
 
 const AUDIT_PAGE_SIZE = 25;
 let auditOffset = 0;
-
-function row(values) {
-  const tr = document.createElement('tr');
-  for (const value of values) {
-    const td = document.createElement('td');
-    td.textContent = value;
-    tr.append(td);
-  }
-  return tr;
-}
-
-function warn(id, message) {
-  const element = $(id);
-  element.hidden = !message;
-  element.textContent = message || '';
-}
 
 function timestamp(value) {
   return value ? new Date(value).toLocaleString() : '—';

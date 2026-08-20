@@ -136,9 +136,17 @@ func run() error {
 	)
 	server := grpc.NewServer(options...)
 	workloadRepository := workloadapi.NewPostgresRepository(pool)
+	// Constructed once and shared: the gRPC ControlPlaneService server
+	// (via providerjoin.Service.SetWorkloadService below) and the
+	// dashboard's tenant-tier submitMyWorkload (internal/dashboard/
+	// tenantviews.go) both call into this exact instance, so a
+	// dashboard-submitted workload runs through the identical
+	// validation/hashing/persistence path a `workloadctl submit` gRPC
+	// call would.
+	workloadService := workloadapi.NewService(workloadRepository)
 	providerRepository := providerjoin.NewPostgresRepository(pool)
 	service := providerjoin.NewService(providerRepository, providerjoin.NewRedisHeartbeatStore(redisClient), registrar)
-	service.SetWorkloadService(workloadapi.NewService(workloadRepository))
+	service.SetWorkloadService(workloadService)
 	// ADR-013 §3: push the current active-validator allowlist to Agents on
 	// every heartbeat. chainClient already implements ValidatorSource via
 	// RPCClient.LatestActiveNetworkValidators; a read failure degrades to
@@ -205,7 +213,7 @@ func run() error {
 	authRateLimit := envIntOrDefault("DASHBOARD_AUTH_RATE_LIMIT_PER_MINUTE", 10)
 	authLimiter := ratelimit.NewRedisLimiter(redisClient, authRateLimit, 60)
 	httpServer := &http.Server{
-		Handler:           dashboard.New(pool, redisClient, chainClient, walletService, userRepository, authLimiter).Handler(),
+		Handler:           dashboard.New(pool, redisClient, chainClient, walletService, userRepository, authLimiter, workloadService).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

@@ -15,8 +15,9 @@ import (
 // enumerable in one place -- an operator reading the log should not have
 // to grep handlers to learn what actions exist.
 const (
-	auditActionWorkloadStop = "workload.stop"
-	auditActionAPIKeyIssue  = "api_key.issue"
+	auditActionWorkloadStop   = "workload.stop"
+	auditActionWorkloadSubmit = "workload.submit"
+	auditActionAPIKeyIssue    = "api_key.issue"
 
 	auditTargetWorkload = "workload"
 	auditTargetUser     = "user"

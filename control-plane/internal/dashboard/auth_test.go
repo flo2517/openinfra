@@ -21,6 +21,7 @@ import (
 	"github.com/openinfra/network/internal/testsupport"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/walletlogin"
+	"github.com/openinfra/network/internal/workloadapi"
 	"github.com/openinfra/network/migrations"
 	"github.com/redis/go-redis/v9"
 )
@@ -62,7 +63,8 @@ func newAuthTestServer(t *testing.T) (context.Context, *Server, *pgxpool.Pool) {
 
 	users := userauth.NewPostgresRepository(pool)
 	wallet := walletlogin.NewService(walletlogin.NewPostgresRepository(pool), users)
-	server := New(pool, nil, nil, wallet, users, nil) // nil redis/chain/limiter: unused by the auth endpoints under test
+	workloads := workloadapi.NewService(workloadapi.NewPostgresRepository(pool))
+	server := New(pool, nil, nil, wallet, users, nil, workloads) // nil redis/chain/limiter: unused by the auth endpoints under test
 	return ctx, server, pool
 }
 

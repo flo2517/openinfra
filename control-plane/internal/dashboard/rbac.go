@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/openinfra/network/internal/userauth"
@@ -43,6 +44,31 @@ func (s *Server) requireRole(minRole string, next http.HandlerFunc) http.Handler
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient role"})
 			return
 		}
-		next(w, r)
+		// The resolved user is threaded through context rather than
+		// re-derived: userauth.PostgresRepository.Authenticate is a write
+		// (it bumps api_keys.last_used_at), not a read, so a handler that
+		// called s.authenticatedUser(ctx, r) again -- every tenant
+		// handler in tenantviews.go did, found in review -- was paying a
+		// second Postgres round trip and a second identical write per
+		// request for data this function already resolved. See
+		// userFromContext below.
+		next(w, r.WithContext(context.WithValue(ctx, userContextKey{}, user)))
 	}
+}
+
+// userContextKey is unexported so only this package can set or read the
+// value requireRole stores -- a handler outside this package cannot
+// forge an authenticated identity by setting the same context key from
+// elsewhere, since the key type itself is not exported.
+type userContextKey struct{}
+
+// userFromContext reads the user requireRole already resolved for this
+// request. Only ever call this from a handler wrapped in requireRole
+// (every route that reaches it is, by construction -- see dashboard.go's
+// route table); the ok=false path exists for defensiveness (a handler
+// mistakenly registered without requireRole, or moved during a future
+// refactor) rather than an expected runtime case.
+func userFromContext(ctx context.Context) (userauth.User, bool) {
+	user, ok := ctx.Value(userContextKey{}).(userauth.User)
+	return user, ok
 }
