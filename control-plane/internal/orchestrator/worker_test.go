@@ -337,6 +337,30 @@ func TestNoEligibleProviderErrorBoundsZonesPresent(t *testing.T) {
 	}
 }
 
+// TestNoEligibleProviderErrorTruncatesZonesAlphabeticallyNotByIterationOrder
+// pins a real bug found in review: truncating in first-seen (candidate-
+// iteration) order and only then sorting the survivors can silently drop
+// the one zone name a tenant actually needs to see, e.g. their own typo's
+// intended target -- the sorted-looking output would hide it instead of
+// revealing it. Deliberately iterates the excluded candidates in *reverse*
+// alphabetical zone order, so a first-seen-then-sort implementation would
+// keep "zone-h".."zone-d" and drop "zone-c".."zone-a" -- the opposite of
+// what a correct dedupe-then-sort-then-truncate implementation keeps.
+func TestNoEligibleProviderErrorTruncatesZonesAlphabeticallyNotByIterationOrder(t *testing.T) {
+	var excluded []scheduler.Exclusion
+	var candidates []scheduler.Candidate
+	zonesInReverseIterationOrder := []string{"zone-h", "zone-g", "zone-f", "zone-e", "zone-d", "zone-c", "zone-b", "zone-a"}
+	for i, zone := range zonesInReverseIterationOrder {
+		providerID := fmt.Sprintf("p%d", i)
+		excluded = append(excluded, scheduler.Exclusion{ProviderID: providerID, Reason: scheduler.ReasonZoneMismatch})
+		candidates = append(candidates, scheduler.Candidate{ProviderID: providerID, Zone: zone})
+	}
+	msg := noEligibleProviderError(excluded, candidates, "nowhere").Error()
+	if !strings.Contains(msg, "zones present: zone-a, zone-b, zone-c, zone-d, zone-e, and 3 more") {
+		t.Fatalf("expected the alphabetically-first 5 zones regardless of candidate iteration order, got %q", msg)
+	}
+}
+
 // TestNoEligibleProviderErrorSurfacesZonesPresentOnAllZoneMismatch covers
 // ADR-026 §3's named example directly: when every exclusion is a zone
 // mismatch, the message names the requested zone and the set of zones
