@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
 
 ## Context
 
