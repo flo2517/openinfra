@@ -25,3 +25,11 @@ make dev-clean      # removes named volumes; deployments/local remains explicit 
 ```
 
 To deliberately reset only the development Agent identity, stop the stack and remove `deployments/local/agent/`. This is destructive and registers a new on-chain provider on the next start. Never commit that directory or the generated certificates.
+
+## Multiple instances (`multi-node` profile)
+
+`COMPOSE_PROFILES=multi-node make dev-up` starts two more Provider Agents, `provider-agent-2` and `provider-agent-3`, alongside the default `provider-agent` -- see the README's "Multi-provider, multi-validator local network" section for why (mainly: giving `networkvalidator`'s committee more than one provider to actually challenge, and the scheduler more than one candidate to rank). Each replica is an exact copy of this service's shape -- same security posture, same `docker-socket-proxy` dependency, same digest-pinned image -- differing only in its advertised endpoint (`https://provider-agent-2:50052`/`https://provider-agent-3:50052`), host port (`PROVIDER_AGENT_2_PORT`/`PROVIDER_AGENT_3_PORT`, defaulting to `50053`/`50054`), and state directory (`deployments/local/agent-2`/`deployments/local/agent-3`).
+
+All instances share the one `docker-socket-proxy` from this document's "Docker boundary" section above: they all ultimately reach the same underlying host Docker daemon, distinguished only by container name/labels, not by any per-provider isolation. This is a deliberate simplification for local dev's actual purpose (observable multi-provider scheduling and multi-validator behavior), not a claim of real inter-provider isolation -- do not read multiple provider-agent instances as a security boundary between them. They also share the one agent-server certificate (`deployments/scripts/generate-dev-certs.sh` puts every instance's hostname in its SAN list), since the Control Plane's outbound TLS verification checks the dialed hostname against whichever certificate the Agent presents, not a per-instance identity.
+
+To add a fourth instance, copy one of `provider-agent-2`/`provider-agent-3`'s blocks in `deployments/docker-compose.yml`, give it a new hostname/port/state directory, and add that hostname to the SAN list `generate-dev-certs.sh` builds for `agent-server.crt`.
