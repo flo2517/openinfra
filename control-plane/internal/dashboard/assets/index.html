@@ -33,6 +33,25 @@
       <div><dt>Workloads</dt><dd><strong id="workload-count">—</strong><small>persistés dans PostgreSQL</small></dd></div>
       <div><dt>Network Validators</dt><dd><strong id="validator-count">—</strong><small>actifs on-chain</small></dd></div>
     </dl>
+    <section class="panel" id="tenant-panel" hidden>
+      <div class="panel-head"><div><span class="eyebrow">MES WORKLOADS</span><h2>Soumettre et suivre mes charges</h2></div><button id="tenant-refresh" type="button">Actualiser</button></div>
+      <p class="muted">Réservé à votre propre compte (ADR-016) : ce formulaire et cette liste n'agissent que sur les workloads que vous possédez, quel que soit votre rôle.</p>
+      <form id="tenant-submit-form">
+        <div class="tenant-form-grid">
+          <div><label for="tenant-image">Image (référence OCI avec digest sha256)</label><input id="tenant-image" type="text" placeholder="repo/image@sha256:…" required></div>
+          <div><label for="tenant-cpu">CPU (cœurs)</label><input id="tenant-cpu" type="number" min="0.01" step="0.01" value="1" required></div>
+          <div><label for="tenant-ram">RAM (Mo)</label><input id="tenant-ram" type="number" min="1" step="1" value="512" required></div>
+          <div><label for="tenant-storage">Stockage (Go)</label><input id="tenant-storage" type="number" min="0" step="1" value="5" required></div>
+          <div><label for="tenant-duration">Durée (secondes)</label><input id="tenant-duration" type="number" min="1" step="1" value="3600" required></div>
+        </div>
+        <button id="tenant-submit" type="submit">Soumettre le workload</button>
+      </form>
+      <div id="tenant-submit-warning" class="warning" role="alert" hidden></div>
+      <p id="tenant-submit-status" class="muted" role="status" aria-live="polite" hidden></p>
+
+      <div id="tenant-workloads-warning" class="warning" role="alert" hidden></div>
+      <div class="table-wrap" role="region" tabindex="0" aria-label="Mes workloads (zone défilable)"><table><caption class="sr-only">Mes workloads, les plus récents en premier</caption><thead><tr><th scope="col">Workload</th><th scope="col">État</th><th scope="col">Image</th><th scope="col">CPU</th><th scope="col">RAM</th><th scope="col">Stockage</th><th scope="col">Erreur</th><th scope="col">Action</th></tr></thead><tbody id="tenant-workloads"></tbody></table></div>
+    </section>
     <section class="panel"><div class="panel-head"><div><span class="eyebrow">WORKLOADS</span><h2>Orchestration durable</h2></div></div>
       <div class="table-wrap" role="region" tabindex="0" aria-label="Nombre de workloads par état (zone défilable)"><table><caption class="sr-only">Nombre de workloads par état</caption><thead><tr><th scope="col">État</th><th scope="col">Nombre</th></tr></thead><tbody id="workloads"></tbody></table></div>
       <p class="muted">Vue publique : uniquement des totaux par état. Le détail par workload est réservé à son propriétaire, après authentification.</p>
@@ -108,6 +127,7 @@
   </main>
   <script src="auth.js" defer></script>
   <script src="app.js" defer></script>
+  <script src="tenant.js" defer></script>
   <script src="operator.js" defer></script>
 </body>
 </html>

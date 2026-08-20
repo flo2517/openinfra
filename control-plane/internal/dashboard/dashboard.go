@@ -18,6 +18,7 @@ import (
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/walletlogin"
+	"github.com/openinfra/network/internal/workloadapi"
 	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"github.com/redis/go-redis/v9"
@@ -41,7 +42,17 @@ type Server struct {
 	wallet  *walletlogin.Service
 	users   userauth.Repository
 	limiter RateLimiter
-	now     func() time.Time
+	// workloads is the exact *workloadapi.Service instance
+	// cmd/controlplane/main.go also wires into the gRPC
+	// ControlPlaneService server -- submitMyWorkload (tenantviews.go)
+	// calls its SubmitWorkload directly rather than duplicating
+	// validateSubmission's checks or CreateOrGet's persistence here. Not
+	// used to reach GetWorkload/StopWorkload: myWorkload/stopMyWorkload
+	// already have their own, older, repository-level wiring
+	// (workloadapi.NewPostgresRepository(s.pool)) and there is no reason
+	// to disturb it for this change.
+	workloads *workloadapi.Service
+	now       func() time.Time
 }
 
 type Provider struct {
@@ -191,8 +202,8 @@ func boundedQueryInt(query url.Values, key string, fallback, min, max int) int {
 	return parsed
 }
 
-func New(pool *pgxpool.Pool, redisClient redis.UniversalClient, chain *blockchainbridge.RPCClient, wallet *walletlogin.Service, users userauth.Repository, limiter RateLimiter) *Server {
-	return &Server{pool: pool, redis: redisClient, chain: chain, wallet: wallet, users: users, limiter: limiter, now: time.Now}
+func New(pool *pgxpool.Pool, redisClient redis.UniversalClient, chain *blockchainbridge.RPCClient, wallet *walletlogin.Service, users userauth.Repository, limiter RateLimiter, workloads *workloadapi.Service) *Server {
+	return &Server{pool: pool, redis: redisClient, chain: chain, wallet: wallet, users: users, limiter: limiter, workloads: workloads, now: time.Now}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -214,6 +225,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/validator/rounds/{provider_id}", s.validatorRounds)
 	mux.HandleFunc("GET /api/v1/provider/{provider_id}/onchain", s.providerOnChain)
 	mux.HandleFunc("GET /api/v1/my/workloads", s.requireRole(userauth.RoleTenant, s.myWorkloads))
+	mux.HandleFunc("POST /api/v1/my/workloads", s.requireRole(userauth.RoleTenant, s.submitMyWorkload))
 	mux.HandleFunc("GET /api/v1/my/workloads/{workload_id}", s.requireRole(userauth.RoleTenant, s.myWorkload))
 	mux.HandleFunc("POST /api/v1/my/workloads/{workload_id}/stop", s.requireRole(userauth.RoleTenant, s.stopMyWorkload))
 	mux.HandleFunc("GET /api/v1/operator/queue", s.requireRole(userauth.RoleOperatorReadOnly, s.operatorQueue))

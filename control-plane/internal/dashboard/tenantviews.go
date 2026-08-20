@@ -2,15 +2,21 @@ package dashboard
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/workloadapi"
+	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -287,4 +293,129 @@ func (s *Server) stopMyWorkload(w http.ResponseWriter, r *http.Request) {
 		"workload_id": stored.WorkloadID,
 		"state":       stored.State,
 	})
+}
+
+// maxWorkloadSubmitBodyBytes bounds POST /api/v1/my/workloads' JSON body.
+// An OCI image reference pinned by a sha256 digest plus four small
+// numbers never legitimately needs more than this -- the same
+// generous-but-bounded ceiling maxAuthBodyBytes (auth.go) applies to the
+// unauthenticated auth endpoints.
+const maxWorkloadSubmitBodyBytes = 4096
+
+// submitWorkloadRequestBody is POST /api/v1/my/workloads' request body:
+// the same five values `workloadctl submit` takes positionally on the
+// command line (cmd/workloadctl/main.go's usage string), as JSON instead.
+// There is deliberately no profile field yet -- see submitMyWorkload's
+// doc comment on the placeholder it uses instead.
+type submitWorkloadRequestBody struct {
+	Image           string  `json:"image"`
+	CPUCores        float32 `json:"cpu_cores"`
+	RAMMB           int64   `json:"ram_mb"`
+	StorageGB       int64   `json:"storage_gb"`
+	DurationSeconds int32   `json:"duration_seconds"`
+}
+
+// submitMyWorkload is ADR-016 §2's tenant-tier submit action, the mirror
+// image of stopMyWorkload above: a thin HTTP wrapper over the exact
+// SubmitWorkload path internal/workloadapi already exposes over gRPC
+// (ControlPlaneService/SubmitWorkload) -- reached here through
+// s.workloads, the very *workloadapi.Service instance
+// cmd/controlplane/main.go also wires into the gRPC server. No
+// validation, request-hashing, or persistence logic is duplicated in
+// this package: validateSubmission's checks, the idempotency/ownership
+// handling in CreateOrGet, and the capacity/state machine all run
+// unmodified, exactly as they would for a `workloadctl submit` call or
+// any other direct gRPC caller.
+//
+// workload_id and request_id are minted server-side rather than taken
+// from the caller, for the same reason stopMyWorkload's stop-request
+// idempotency key is: a browser has no way to keep a stable value across
+// a page reload, and (unlike a stop, which must not be repeated) a
+// duplicate POST here should simply mint a second, independent workload
+// rather than needing an idempotency key from the caller at all.
+//
+// The authenticated user_id is attached to ctx with userauth.WithUserID
+// -- the exact context key/value shape the gRPC unary interceptor
+// (internal/userauth/interceptor.go) sets for an authenticated
+// mTLS+API-key caller -- so workloadapi.Service.SubmitWorkload's own
+// requireOwner check runs completely unmodified; this handler never
+// passes ownership as an explicit parameter that could drift from it.
+func (s *Server) submitMyWorkload(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	user, ok := s.authenticatedUser(ctx, r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		return
+	}
+
+	var body submitWorkloadRequestBody
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxWorkloadSubmitBodyBytes)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	request := &controlplanev1.SubmitWorkloadRequest{
+		RequestId: uuid.NewString(),
+		Image:     body.Image,
+		Definition: &sharedv1.WorkloadDefinition{
+			WorkloadId: uuid.NewString(),
+			// COMPUTE_INTENSIVE: the same arbitrary-but-valid placeholder
+			// cmd/workloadctl/main.go's submit already uses -- this form
+			// doesn't ask the tenant to choose a profile yet, and
+			// WORKLOAD_PROFILE_UNSPECIFIED is rejected by
+			// validateSubmission.
+			Profile: sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE,
+			Requirements: &sharedv1.ResourceRequirements{
+				Cpu:       body.CPUCores,
+				RamMb:     body.RAMMB,
+				StorageGb: body.StorageGB,
+			},
+			DurationSeconds: body.DurationSeconds,
+		},
+	}
+
+	response, err := s.workloads.SubmitWorkload(userauth.WithUserID(ctx, user.UserID), request)
+	if err != nil {
+		httpStatus, message := submitWorkloadError(err)
+		outcome := auditOutcomeDenied
+		if httpStatus == http.StatusServiceUnavailable {
+			outcome = auditOutcomeError
+		}
+		s.recordAudit(ctx, user, auditActionWorkloadSubmit, auditTargetWorkload, request.Definition.WorkloadId, outcome)
+		writeJSON(w, httpStatus, map[string]string{"error": message})
+		return
+	}
+
+	s.recordAudit(ctx, user, auditActionWorkloadSubmit, auditTargetWorkload, response.WorkloadId, auditOutcomeSuccess)
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"workload_id": response.WorkloadId,
+		"state":       strings.TrimPrefix(response.State.String(), "WORKLOAD_STATE_"),
+	})
+}
+
+// submitWorkloadError translates a workloadapi.Service.SubmitWorkload gRPC
+// status error into the (HTTP status, message) pair this HTTP wrapper
+// returns -- InvalidArgument is the caller's own validation failure (400,
+// message passed through: validateSubmission's messages name exactly
+// which field is wrong and contain nothing tenant-secret), AlreadyExists
+// is CreateOrGet's idempotency-conflict case surfaced with a fixed,
+// generic message (a colliding request_id can only happen here from a
+// UUID collision, not a legitimate retry, since this handler always
+// mints a fresh one), and everything else -- including a bare non-status
+// error -- is treated as unavailable rather than guessed at.
+func submitWorkloadError(err error) (int, string) {
+	s, ok := status.FromError(err)
+	if !ok {
+		return http.StatusServiceUnavailable, "workload submission unavailable"
+	}
+	switch s.Code() {
+	case codes.InvalidArgument:
+		return http.StatusBadRequest, s.Message()
+	case codes.AlreadyExists:
+		return http.StatusConflict, "workload submission conflict"
+	default:
+		return http.StatusServiceUnavailable, "workload submission unavailable"
+	}
 }
