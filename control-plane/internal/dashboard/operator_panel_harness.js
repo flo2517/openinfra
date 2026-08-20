@@ -89,6 +89,26 @@ const context = vm.createContext({
       key: () => config.session,
       onChange: () => {},
     },
+    // operator.js now reads row()/warn() from here instead of declaring
+    // its own copies (see auth.js's window.openinfraDashboard) -- this
+    // harness never loads auth.js (only operator.js, in isolation, like
+    // the rest of this mock window), so it stubs the same shape by hand,
+    // matching openinfraSession's own mock just above.
+    openinfraDashboard: {
+      row(values) {
+        const tr = { children: [], textContent: '', classList: { names: [], add(name) { this.names.push(name); } }, append(...nodes) { this.children.push(...nodes); } };
+        for (const value of values) {
+          const td = { textContent: value };
+          tr.append(td);
+        }
+        return tr;
+      },
+      warn(id, message) {
+        const el = element(id);
+        el.hidden = !message;
+        el.textContent = message || '';
+      },
+    },
   },
   fetch: (url, options) => {
     requests.push({ url, authorization: (options && options.headers && options.headers.authorization) || null });

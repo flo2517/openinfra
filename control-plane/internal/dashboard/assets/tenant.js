@@ -11,26 +11,14 @@
 // declaration here would collide with app.js's/operator.js's.
 (() => {
 const $ = id => document.getElementById(id);
+// row()/warn(): shared with operator.js via auth.js's window.openinfraDashboard
+// (see that file for why they live there) -- no longer declared here, so
+// a future edit to either can't drift between the two panels silently.
+const { row, warn } = window.openinfraDashboard;
 
 // Terminal or already-in-flight states: the stop button is disabled, not
 // removed, so the row's layout doesn't jump as a workload progresses.
 const NON_STOPPABLE_STATES = new Set(['STOPPING', 'STOPPED', 'COMPLETED', 'FAILED']);
-
-function row(values) {
-  const tr = document.createElement('tr');
-  for (const value of values) {
-    const td = document.createElement('td');
-    td.textContent = value;
-    tr.append(td);
-  }
-  return tr;
-}
-
-function warn(id, message) {
-  const element = $(id);
-  element.hidden = !message;
-  element.textContent = message || '';
-}
 
 function authedFetch(path, options = {}) {
   const key = window.openinfraSession.key();

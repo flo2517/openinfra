@@ -109,7 +109,11 @@ func (s *Server) myWorkloads(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
-	user, ok := s.authenticatedUser(ctx, r)
+	// The identity requireRole already resolved for this request (see
+	// userFromContext's doc comment) -- not a second call to
+	// s.authenticatedUser, which would re-run Authenticate's Postgres
+	// write (last_used_at) a second time for no reason.
+	user, ok := userFromContext(ctx)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 		return
@@ -164,7 +168,11 @@ func (s *Server) myWorkload(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
-	user, ok := s.authenticatedUser(ctx, r)
+	// The identity requireRole already resolved for this request (see
+	// userFromContext's doc comment) -- not a second call to
+	// s.authenticatedUser, which would re-run Authenticate's Postgres
+	// write (last_used_at) a second time for no reason.
+	user, ok := userFromContext(ctx)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 		return
@@ -253,7 +261,11 @@ func (s *Server) stopMyWorkload(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
-	user, ok := s.authenticatedUser(ctx, r)
+	// The identity requireRole already resolved for this request (see
+	// userFromContext's doc comment) -- not a second call to
+	// s.authenticatedUser, which would re-run Authenticate's Postgres
+	// write (last_used_at) a second time for no reason.
+	user, ok := userFromContext(ctx)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 		return
@@ -344,7 +356,11 @@ func (s *Server) submitMyWorkload(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
-	user, ok := s.authenticatedUser(ctx, r)
+	// The identity requireRole already resolved for this request (see
+	// userFromContext's doc comment) -- not a second call to
+	// s.authenticatedUser, which would re-run Authenticate's Postgres
+	// write (last_used_at) a second time for no reason.
+	user, ok := userFromContext(ctx)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 		return

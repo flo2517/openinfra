@@ -57,6 +57,38 @@ async function getOrCreateLocalKey() {
   return { privateKey: pair.privateKey, publicKeyHex: toHex(rawPublic) };
 }
 
+// Tiny render helpers every panel script needs (tenant.js, operator.js).
+// Shared here rather than each declaring its own copy (found in review:
+// tenant.js's and operator.js's row()/warn() were byte-for-byte
+// duplicates) -- auth.js is the one file guaranteed to load, and run,
+// before either (see index.html's <script> order), matching the same
+// "one explicit window-level surface" pattern window.openinfraSession
+// already establishes just below. Generic DOM utilities living in
+// auth.js reads a little odd by name; they're here because this is the
+// first-loaded shared file, not because they're auth-related.
+window.openinfraDashboard = {
+  // Builds one <tr> from an ordered list of cell values -- every panel's
+  // table rows are plain text cells, never markup, so textContent (not
+  // innerHTML) is the only assignment used.
+  row(values) {
+    const tr = document.createElement('tr');
+    for (const value of values) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.append(td);
+    }
+    return tr;
+  },
+  // Shows or clears a panel's inline warning/error element. Toggling
+  // `hidden` (not display/visibility) matches this dashboard's existing
+  // CSS convention for conditionally-rendered elements.
+  warn(id, message) {
+    const element = document.getElementById(id);
+    element.hidden = !message;
+    element.textContent = message || '';
+  },
+};
+
 // The session bridge other asset scripts read. Each script is now
 // function-scoped (see the IIFE note above), so this one explicit
 // window-level surface is how the operator panel learns there is a
