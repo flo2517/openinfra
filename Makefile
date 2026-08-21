@@ -53,7 +53,21 @@ dev-up:
 	docker compose --env-file .env -f deployments/docker-compose.yml config --quiet
 	docker compose --env-file .env -f deployments/docker-compose.yml up -d --build --wait
 	test -x deployments/scripts/bootstrap-network-validators.sh
-	GO=$(GO) deployments/scripts/bootstrap-network-validators.sh
+	# Runs after `up --wait` has already succeeded, so a failure here is
+	# not "nothing came up" -- postgres/redis/blockchain-node/
+	# control-plane/every provider-agent are already healthy and usable.
+	# It means a Network Validator didn't finish registering in time,
+	# which only matters for round-closing/quorum, not for the rest of
+	# the stack. Said explicitly on failure (found in review: a bare
+	# `make: *** Error 1` here reads as total failure, prompting an
+	# unnecessary `make dev-clean`) -- bootstrap-network-validators.sh is
+	# itself idempotent (is_registered short-circuits already-registered
+	# validators), so `make dev-up` again retries only what's left.
+	GO=$(GO) deployments/scripts/bootstrap-network-validators.sh || { \
+		echo "dev-up: the core stack is up and healthy -- this failure is only in Network Validator bootstrap (see the errors above)." >&2; \
+		echo "dev-up: rerun \`make dev-up\` to retry just the unregistered validator(s); no need to \`make dev-clean\` first." >&2; \
+		exit 1; \
+	}
 
 dev-down:
 	docker compose --env-file .env -f deployments/docker-compose.yml down
