@@ -22,10 +22,19 @@
 //     why it lives here and not in cmd/networkvalidator, which
 //     deliberately only ever signs with an ordinary validator's own
 //     account.
+//   - fund-account (local dev bootstrap only): the Control Plane's own
+//     bridge/sudo account is the sole account endowed at genesis
+//     (blockchain/node/src/chain_spec.rs); a freshly generated Network
+//     Validator signing key starts at zero balance and cannot satisfy
+//     register_validator's stake reservation without first receiving a
+//     transfer from that endowed account. Used by
+//     deployments/scripts/bootstrap-network-validators.sh, never by
+//     cmd/networkvalidator itself, which deliberately only ever signs
+//     with an ordinary validator's own account.
 //
 // Each subcommand only connects to the credential store it actually
 // needs -- user/API-key/role commands never touch the chain,
-// resolve-dispute never touches Postgres.
+// resolve-dispute and fund-account never touch Postgres.
 package main
 
 import (
@@ -61,6 +70,8 @@ func run(args []string) error {
 		return runUserCommand(ctx, args)
 	case "resolve-dispute":
 		return runResolveDispute(ctx, args)
+	case "fund-account":
+		return runFundAccount(ctx, args)
 	default:
 		return usageError()
 	}
@@ -198,6 +209,48 @@ func runResolveDispute(ctx context.Context, args []string) error {
 	return nil
 }
 
+// runFundAccount submits a plain balances transfer from the Control
+// Plane's own bridge/sudo account -- the only account endowed at
+// genesis -- to dest. Local dev bootstrap only (see the package doc
+// comment): gives a freshly generated Network Validator signing key
+// enough free balance for it to later call register_validator itself
+// with its own key, never sudo-wrapped or run on the validator's behalf.
+func runFundAccount(ctx context.Context, args []string) error {
+	if len(args) != 3 {
+		return errors.New("usage: controlplane-admin fund-account <account-hex> <amount>")
+	}
+	rpcURL := os.Getenv("SUBSTRATE_RPC_URL")
+	if rpcURL == "" {
+		return errors.New("SUBSTRATE_RPC_URL is required")
+	}
+	signerKeyFile := os.Getenv("SUBSTRATE_SIGNER_KEY_FILE")
+	if signerKeyFile == "" {
+		return errors.New("SUBSTRATE_SIGNER_KEY_FILE is required (the Control Plane's own bridge/sudo key -- the only account endowed at genesis)")
+	}
+	dest, err := parseAccountHex(args[1])
+	if err != nil {
+		return fmt.Errorf("parse account: %w", err)
+	}
+	amount, err := strconv.ParseUint(args[2], 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse amount: %w", err)
+	}
+
+	chain, err := blockchainbridge.NewRPCClient(rpcURL, &http.Client{})
+	if err != nil {
+		return fmt.Errorf("configure Substrate RPC client: %w", err)
+	}
+	registrar, err := blockchainbridge.NewRegistrarFromPKCS8File(chain, signerKeyFile)
+	if err != nil {
+		return fmt.Errorf("configure bridge signer: %w", err)
+	}
+	if err := registrar.FundAccount(ctx, dest, amount); err != nil {
+		return fmt.Errorf("transfer_allow_death: %w", err)
+	}
+	fmt.Printf("transfer_allow_death submitted: %d to %s\n", amount, args[1])
+	return nil
+}
+
 func parseAccountHex(value string) ([32]byte, error) {
 	var account [32]byte
 	decoded, err := hex.DecodeString(value)
@@ -223,5 +276,5 @@ func parseUpholdOrReject(value string) (bool, error) {
 }
 
 func usageError() error {
-	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator_readonly|operator_admin> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject>>")
+	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator_readonly|operator_admin> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject> | fund-account <account-hex> <amount>>")
 }

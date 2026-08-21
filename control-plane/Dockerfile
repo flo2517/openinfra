@@ -21,11 +21,20 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/control-plane ./cmd/controlplane
 # database out-of-band -- i.e. the shipped artifact would not support
 # its own documented operational procedures.
 RUN go build -trimpath -ldflags="-s -w" -o /out/controlplane-admin ./cmd/controlplane-admin
+# networkvalidator ships alongside the server so the local dev stack's
+# networkvalidator/networkvalidator-2/networkvalidator-3 Compose services
+# (deployments/docker-compose.yml) can run it via an entrypoint override
+# on this same image, the same pattern controlplane-admin already
+# establishes for a second binary from this module -- without a separate
+# Dockerfile duplicating this build stage's dependency and Go-module
+# setup.
+RUN go build -trimpath -ldflags="-s -w" -o /out/networkvalidator ./cmd/networkvalidator
 RUN GOBIN=/out go install github.com/grpc-ecosystem/grpc-health-probe@${GRPC_HEALTH_PROBE_VERSION}
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
 COPY --from=build /out/control-plane /usr/local/bin/control-plane
 COPY --from=build /out/controlplane-admin /usr/local/bin/controlplane-admin
+COPY --from=build /out/networkvalidator /usr/local/bin/networkvalidator
 COPY --from=build /out/grpc-health-probe /usr/local/bin/grpc-health-probe
 USER nonroot:nonroot
 EXPOSE 50051

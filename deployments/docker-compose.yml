@@ -239,6 +239,283 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # provider-agent-2 and provider-agent-3 (below) are the opt-in
+  # "multi-node" profile: two extra Provider Agent instances so the
+  # local dev stack actually has more than one provider to schedule
+  # across and for the Network Validators below to challenge, without
+  # slowing down or complicating `make dev-up`'s default single-provider
+  # case. Enable with `COMPOSE_PROFILES=multi-node make dev-up` (Compose
+  # reads COMPOSE_PROFILES from the environment on its own -- no Makefile
+  # change needed to activate this). All three provider-agent instances
+  # share the one docker-socket-proxy and the one agent-server
+  # certificate above: local dev's actual purpose here is observing
+  # multi-provider scheduling/challenge behavior, not achieving real
+  # resource or trust isolation between simulated providers -- a second
+  # or third docker-socket-proxy would still front the same underlying
+  # host Docker daemon (see this file's provider-agent comment and
+  # deployments/provider-agent.md), and the agent-server certificate's
+  # SAN already covers every instance's hostname (see
+  # generate-dev-certs.sh). Each instance otherwise matches
+  # provider-agent's exact shape: same security posture, same
+  # dependencies, its own advertised endpoint/host port/state volume.
+  provider-agent-2:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: provider-agent/Dockerfile
+    environment:
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      OPENINFRA_AGENT_ADVERTISED_ENDPOINT: https://provider-agent-2:50052
+      OPENINFRA_CONTROL_PLANE_ENDPOINT: https://control-plane:50051
+      OPENINFRA_AGENT_MAX_WORKLOADS: ${PROVIDER_AGENT_MAX_WORKLOADS:-8}
+      OPENINFRA_AGENT_MAX_CPU_CORES: ${PROVIDER_AGENT_MAX_CPU_CORES:-8.0}
+      OPENINFRA_AGENT_MAX_MEMORY_MB: ${PROVIDER_AGENT_MAX_MEMORY_MB:-16384}
+      OPENINFRA_AGENT_PIDS_LIMIT: ${PROVIDER_AGENT_PIDS_LIMIT:-128}
+      OPENINFRA_AGENT_MAX_EGRESS_MBPS: ${PROVIDER_AGENT_MAX_EGRESS_MBPS:-10000}
+      TLS_CERT_FILE: /run/openinfra-tls/client.crt
+      TLS_KEY_FILE: /run/openinfra-tls/client.key
+      TLS_CA_FILE: /run/openinfra-tls/ca.crt
+      TLS_SERVER_NAME: control-plane
+      AGENT_TLS_CERT_FILE: /run/openinfra-tls/agent-server.crt
+      AGENT_TLS_KEY_FILE: /run/openinfra-tls/agent-server.key
+      AGENT_TLS_CLIENT_CA_FILE: /run/openinfra-tls/ca.crt
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "127.0.0.1:${PROVIDER_AGENT_2_PORT:-50053}:50052"
+    volumes:
+      - ./local/agent-2:/var/lib/openinfra-agent
+      - ./local/certs:/run/openinfra-tls:ro
+    networks:
+      - default
+      - docker-executor
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/openinfra-agent-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+
+  provider-agent-3:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: provider-agent/Dockerfile
+    environment:
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      OPENINFRA_AGENT_ADVERTISED_ENDPOINT: https://provider-agent-3:50052
+      OPENINFRA_CONTROL_PLANE_ENDPOINT: https://control-plane:50051
+      OPENINFRA_AGENT_MAX_WORKLOADS: ${PROVIDER_AGENT_MAX_WORKLOADS:-8}
+      OPENINFRA_AGENT_MAX_CPU_CORES: ${PROVIDER_AGENT_MAX_CPU_CORES:-8.0}
+      OPENINFRA_AGENT_MAX_MEMORY_MB: ${PROVIDER_AGENT_MAX_MEMORY_MB:-16384}
+      OPENINFRA_AGENT_PIDS_LIMIT: ${PROVIDER_AGENT_PIDS_LIMIT:-128}
+      OPENINFRA_AGENT_MAX_EGRESS_MBPS: ${PROVIDER_AGENT_MAX_EGRESS_MBPS:-10000}
+      TLS_CERT_FILE: /run/openinfra-tls/client.crt
+      TLS_KEY_FILE: /run/openinfra-tls/client.key
+      TLS_CA_FILE: /run/openinfra-tls/ca.crt
+      TLS_SERVER_NAME: control-plane
+      AGENT_TLS_CERT_FILE: /run/openinfra-tls/agent-server.crt
+      AGENT_TLS_KEY_FILE: /run/openinfra-tls/agent-server.key
+      AGENT_TLS_CLIENT_CA_FILE: /run/openinfra-tls/ca.crt
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "127.0.0.1:${PROVIDER_AGENT_3_PORT:-50054}:50052"
+    volumes:
+      - ./local/agent-3:/var/lib/openinfra-agent
+      - ./local/certs:/run/openinfra-tls:ro
+    networks:
+      - default
+      - docker-executor
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/openinfra-agent-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+
+  # networkvalidator runs cmd/networkvalidator's continuous challenge
+  # loop (ADR-011/013): it is part of the *default* stack (no profile),
+  # unlike provider-agent-2/3 below, because a Network Validator daemon
+  # is what makes "OpenInfra Network" actually observable at all in local
+  # dev (previously: zero instances wired into Compose, confirmed by
+  # inspection). A single validator can register, go ACTIVE, and submit
+  # evidence, but pallet-network-validator's MinQuorum (3,
+  # blockchain/runtime/src/lib.rs) means a round can never actually
+  # *close* with only one validator -- see networkvalidator-2/3 below,
+  # and deployments/network-validator.md, for the full committee. This
+  # service builds from the same image as control-plane (its binary
+  # ships in that same Dockerfile) and only overrides the entrypoint/
+  # command to run networkvalidator instead. It never joins
+  # docker-executor: it never touches Docker, only the chain RPC and
+  # each Agent's mTLS gRPC endpoint over the default network.
+  #
+  # Healthcheck: this binary has no listening port to probe (a pure
+  # outbound challenge loop -- unlike provider-agent/control-plane, which
+  # each ship a dedicated probe binary/endpoint for exactly this reason).
+  # `networkvalidator status` is what's actually realistic to probe with
+  # instead: a real, already-shipped subcommand, valid as a distroless
+  # `CMD`-form healthcheck (no shell required), that fails loudly (a
+  # useful liveness signal) if VALIDATOR_SIGNER_KEY_FILE is missing or
+  # unreadable (e.g. a LOCAL_UID mismatch, or key generation interrupted
+  # mid-write) or if the chain RPC is unreachable, and succeeds whether
+  # or not this validator has been registered yet (bootstrap-network-
+  # validators.sh runs after the stack is already up, so "not registered
+  # yet" must not read as unhealthy). Without this, `docker compose up
+  # --wait` cannot distinguish a validator that's actually running from
+  # one crash-looping on a bad key file -- `make dev-up` would report
+  # success either way.
+  networkvalidator:
+    build:
+      context: ..
+      dockerfile: control-plane/Dockerfile
+    entrypoint: ["/usr/local/bin/networkvalidator"]
+    command: ["run"]
+    environment:
+      SUBSTRATE_RPC_URL: http://blockchain-node:9944
+      VALIDATOR_SIGNER_KEY_FILE: /run/openinfra-validator/validator-key.pem
+      DASHBOARD_BASE_URL: http://control-plane:8080
+      AGENT_SERVER_CA_FILE: /run/openinfra-tls/ca.crt
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ./local/validators:/run/openinfra-validator:ro
+      - ./local/certs:/run/openinfra-tls:ro
+    networks:
+      - default
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      blockchain-node:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/networkvalidator", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # networkvalidator-2 and networkvalidator-3: the rest of the "multi-
+  # node" profile's committee. Together with networkvalidator above they
+  # reach MinQuorum=3 (blockchain/runtime/src/lib.rs), the minimum for a
+  # round to actually close and push an aggregate into pallet-reputation
+  # -- TargetCommitteeSize is 5, but a round only needs quorum among
+  # whichever committee members are active, not the full target size.
+  # Same shape as networkvalidator above, just a different
+  # VALIDATOR_SIGNER_KEY_FILE (deployments/scripts/generate-dev-certs.sh
+  # generates all three keys unconditionally, so they exist whether or
+  # not this profile is enabled).
+  networkvalidator-2:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: control-plane/Dockerfile
+    entrypoint: ["/usr/local/bin/networkvalidator"]
+    command: ["run"]
+    environment:
+      SUBSTRATE_RPC_URL: http://blockchain-node:9944
+      VALIDATOR_SIGNER_KEY_FILE: /run/openinfra-validator/validator-2-key.pem
+      DASHBOARD_BASE_URL: http://control-plane:8080
+      AGENT_SERVER_CA_FILE: /run/openinfra-tls/ca.crt
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ./local/validators:/run/openinfra-validator:ro
+      - ./local/certs:/run/openinfra-tls:ro
+    networks:
+      - default
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      blockchain-node:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/networkvalidator", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  networkvalidator-3:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: control-plane/Dockerfile
+    entrypoint: ["/usr/local/bin/networkvalidator"]
+    command: ["run"]
+    environment:
+      SUBSTRATE_RPC_URL: http://blockchain-node:9944
+      VALIDATOR_SIGNER_KEY_FILE: /run/openinfra-validator/validator-3-key.pem
+      DASHBOARD_BASE_URL: http://control-plane:8080
+      AGENT_SERVER_CA_FILE: /run/openinfra-tls/ca.crt
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ./local/validators:/run/openinfra-validator:ro
+      - ./local/certs:/run/openinfra-tls:ro
+    networks:
+      - default
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      blockchain-node:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/networkvalidator", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   docker-executor:
     internal: true
