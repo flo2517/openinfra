@@ -377,6 +377,22 @@ services:
   # command to run networkvalidator instead. It never joins
   # docker-executor: it never touches Docker, only the chain RPC and
   # each Agent's mTLS gRPC endpoint over the default network.
+  #
+  # Healthcheck: this binary has no listening port to probe (a pure
+  # outbound challenge loop -- unlike provider-agent/control-plane, which
+  # each ship a dedicated probe binary/endpoint for exactly this reason).
+  # `networkvalidator status` is what's actually realistic to probe with
+  # instead: a real, already-shipped subcommand, valid as a distroless
+  # `CMD`-form healthcheck (no shell required), that fails loudly (a
+  # useful liveness signal) if VALIDATOR_SIGNER_KEY_FILE is missing or
+  # unreadable (e.g. a LOCAL_UID mismatch, or key generation interrupted
+  # mid-write) or if the chain RPC is unreachable, and succeeds whether
+  # or not this validator has been registered yet (bootstrap-network-
+  # validators.sh runs after the stack is already up, so "not registered
+  # yet" must not read as unhealthy). Without this, `docker compose up
+  # --wait` cannot distinguish a validator that's actually running from
+  # one crash-looping on a bad key file -- `make dev-up` would report
+  # success either way.
   networkvalidator:
     build:
       context: ..
@@ -399,6 +415,12 @@ services:
         condition: service_healthy
       blockchain-node:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/networkvalidator", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -441,6 +463,12 @@ services:
         condition: service_healthy
       blockchain-node:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/networkvalidator", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -473,6 +501,12 @@ services:
         condition: service_healthy
       blockchain-node:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/networkvalidator", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
     read_only: true
     tmpfs:
