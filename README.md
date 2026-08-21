@@ -33,7 +33,7 @@ Rust/Cargo, Go, Docker with Compose, GNU Make, `protoc`, Clang/LLVM, CMake, and 
 
 ## Development
 
-Run `make help` for commands. `make test-agent`, `make test-control-plane`, and `make test-blockchain` validate each native toolchain. `make dev-up` builds and waits for all local service healthchecks.
+Run `make help` for commands. `make test-agent`, `make test-control-plane`, and `make test-blockchain` validate each native toolchain. `make dev-up` builds and waits for all local service healthchecks. `make e2e` runs the full E2E suite matrix (happy path, multi-provider concurrency, chaos injection, migration rollback) against that running stack -- see `tests/e2e/AGENTS.md`; `make e2e-happy-path`, `make e2e-multi-provider`, `make e2e-chaos`, and `make e2e-migrations` run one suite at a time.
 
 ### Provider Join development flow
 
