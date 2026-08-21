@@ -1,3 +1,13 @@
+// clippy::result_large_err fires against tonic::include_proto!'s generated
+// trait method signatures below (every RPC handler returns
+// Result<Response<T>, tonic::Status>) -- tonic::Status is a dependency
+// type this crate has no control over, not something in this codebase to
+// shrink or box; the lint newly started firing here on a clippy 1.98
+// toolchain bump (CI floats `stable`, see .github/workflows/ci.yml) with
+// no code change on our side. Crate-level, not per-function, since every
+// RPC handler trips it identically for the same external-type reason.
+#![allow(clippy::result_large_err)]
+
 pub mod openinfra {
     pub mod shared {
         pub mod v1 {
