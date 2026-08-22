@@ -33,10 +33,19 @@ type Market interface {
 
 type ReconcilerConfig struct {
 	Interval time.Duration
+	// MaxWithdrawAttempts bounds how many consecutive remove_offer_for
+	// failures ReconcileOnce will submit for the same provider_id before
+	// it stops resubmitting and logs loudly instead (issue #138): unbounded
+	// retries here are exactly what produced a real, confirmed-live
+	// "1014: Priority is too low" transaction-pool collision against the
+	// shared bridge/sudo signing account. See the offering-loop's own
+	// comment in ReconcileOnce for the self-healing path back out of that
+	// stopped state.
+	MaxWithdrawAttempts int
 }
 
 func DefaultReconcilerConfig() ReconcilerConfig {
-	return ReconcilerConfig{Interval: 30 * time.Second}
+	return ReconcilerConfig{Interval: 30 * time.Second, MaxWithdrawAttempts: 5}
 }
 
 // Reconciler publishes/updates each currently-schedulable provider's offer
@@ -64,13 +73,22 @@ type Reconciler struct {
 	// one -- needed for withdrawal, since a provider that drops out of
 	// ListSchedulableProviders can no longer be looked up there.
 	offering map[string][32]byte
+	// withdrawAttempts counts consecutive remove_offer_for failures per
+	// provider_id, reset to 0 (by deletion) on success or once the
+	// provider is either seen again in ListSchedulableProviders or found
+	// already gone via a fresh FinalizedOffer read. Bounded by
+	// cfg.MaxWithdrawAttempts -- see that field's doc comment.
+	withdrawAttempts map[string]int
 }
 
 func NewReconciler(directory Directory, market Market, cfg ReconcilerConfig) *Reconciler {
 	if cfg.Interval <= 0 {
 		cfg.Interval = DefaultReconcilerConfig().Interval
 	}
-	return &Reconciler{directory: directory, market: market, cfg: cfg, offering: make(map[string][32]byte)}
+	if cfg.MaxWithdrawAttempts <= 0 {
+		cfg.MaxWithdrawAttempts = DefaultReconcilerConfig().MaxWithdrawAttempts
+	}
+	return &Reconciler{directory: directory, market: market, cfg: cfg, offering: make(map[string][32]byte), withdrawAttempts: make(map[string]int)}
 }
 
 func (r *Reconciler) Run(ctx context.Context) {
@@ -132,13 +150,45 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) {
 
 	for providerID, key := range r.offering {
 		if _, stillSchedulable := seen[providerID]; stillSchedulable {
+			delete(r.withdrawAttempts, providerID)
 			continue
 		}
+
+		// A fresh on-chain read before resubmitting: if the offer is
+		// already gone (a previous remove_offer_for's response was lost,
+		// or an operator cleared it directly), that "fresh state read"
+		// is itself enough to stop tracking this provider -- no extrinsic
+		// needed, and this is also what lets a provider stuck past
+		// MaxWithdrawAttempts (below) self-heal without operator action.
+		_, found, err := r.market.FinalizedOffer(ctx, key, head)
+		if err != nil {
+			slog.Warn("resourcemarket: finalized offer read failed for a withdrawal candidate; will retry next pass", "provider_id", providerID, "error", err)
+			continue
+		}
+		if !found {
+			delete(r.offering, providerID)
+			delete(r.withdrawAttempts, providerID)
+			continue
+		}
+
+		if r.withdrawAttempts[providerID] >= r.cfg.MaxWithdrawAttempts {
+			// Stopped, not forgotten: still logged every pass (loudly, so
+			// it can't quietly scroll out of an operator's recent logs)
+			// and still checked against chain state above, but no further
+			// remove_offer_for submissions until that check clears it or
+			// an operator intervenes directly on-chain.
+			slog.Error("resourcemarket: giving up retrying remove_offer_for after repeated failures; provider still holds a stale on-chain offer, not resubmitting until finalized state changes or an operator clears it",
+				"provider_id", providerID, "attempts", r.withdrawAttempts[providerID])
+			continue
+		}
+
 		if err := r.market.RemoveOfferFor(ctx, key); err != nil {
-			slog.Error("resourcemarket: remove_offer_for failed; will retry next pass", "provider_id", providerID, "error", err)
+			r.withdrawAttempts[providerID]++
+			slog.Error("resourcemarket: remove_offer_for failed; will retry next pass", "provider_id", providerID, "attempt", r.withdrawAttempts[providerID], "max_attempts", r.cfg.MaxWithdrawAttempts, "error", err)
 			continue
 		}
 		delete(r.offering, providerID)
+		delete(r.withdrawAttempts, providerID)
 	}
 }
 

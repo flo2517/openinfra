@@ -274,6 +274,31 @@ func (r *PostgresRepository) RetryLater(ctx context.Context, item Workload, code
 	return nil
 }
 
+// MarkFailed is RetryLater's terminal counterpart: it moves a workload out
+// of every non-terminal state into FAILED, for orchestrator.Worker.retry
+// once its retry cap is reached (issue #138) instead of re-queuing it
+// against a dead provider forever. Like RetryLater it accepts any of the
+// states that can hit that retry path, including STOPPING -- a stop that
+// can never get authoritative confirmation is exactly as stuck as a
+// deploy that never proceeds, and FAILED is the same "give up, make it
+// observable, let an operator act" terminal outcome for both. Uses the
+// same optimistic-concurrency WHERE clause (version/worker_id/lease) as
+// every other Mark* method so a worker that lost its claim never
+// terminates a workload another worker has since picked back up.
+func (r *PostgresRepository) MarkFailed(ctx context.Context, item Workload, code, message string) error {
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='FAILED', attempt_count=attempt_count+1, next_attempt_at=NULL, error_code=$2, last_error=$3, updated_at=now(), version=version+1, worker_id=NULL, worker_lease_until=NULL WHERE workload_id=$1 AND state IN ('REQUESTED','SCHEDULING','LEASE_PENDING','LEASED','DEPLOYING','STOPPING') AND version=$4 AND worker_id=$5 AND worker_lease_until>now()`, item.WorkloadID, code, message, item.Version, item.WorkerID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
 const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps`
 const selectWorkload = `SELECT ` + workloadColumns + ` FROM workloads`
 const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps`
