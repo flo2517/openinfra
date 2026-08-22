@@ -2,12 +2,14 @@
 
 ## Status
 
-**Proposed.** Written by Claude Code, autonomously, in response to issue #13. Per the convention
-established by ADR-016/018/025/026, this is deliberately **not** self-accepted: it decides how the
-Provider Agent's cryptographic identity is issued, renewed, and revoked — a real security boundary,
-not a narrower technical decision. It becomes Accepted only after the repository owner has
-personally reviewed a summary of the decisions below and confirmed acceptance in an interactive
-session. Nothing here has been implemented; no code changes accompany this PR.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #13, and held as Proposed per
+the convention established by ADR-016/018/025/026/029: it decides how the Provider Agent's
+cryptographic identity is issued, renewed, and revoked — a real security boundary, not a narrower
+technical decision. Nothing here is implemented yet by this ADR itself; issue #13 is unblocked by
+this acceptance and now carries the implementation work.
 
 ## Context
 

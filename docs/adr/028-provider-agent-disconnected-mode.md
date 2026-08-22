@@ -2,13 +2,14 @@
 
 ## Status
 
-**Proposed.** Written by Claude Code, autonomously, in response to issue #16. Per the convention
-established by ADR-016/018/025/026, this is deliberately **not** self-accepted: it decides what an
-autonomous Provider Agent is and is not allowed to do when it cannot reach the Control Plane — a
-real security/liveness boundary, not a narrower technical decision. It becomes Accepted only after
-the repository owner has personally reviewed a summary of the decisions below and confirmed
-acceptance in an interactive session. Nothing here has been implemented; no code changes accompany
-this PR.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #16, and held as Proposed per
+the convention established by ADR-016/018/025/026/029: it decides what an autonomous Provider Agent
+is and is not allowed to do when it cannot reach the Control Plane — a real security/liveness
+boundary, not a narrower technical decision. Nothing here is implemented yet by this ADR itself;
+issue #16 is unblocked by this acceptance and now carries the implementation work.
 
 **No prior spec exists.** `docs/` was searched for an existing "disconnected mode" design before
 writing this — none exists, despite issue #16's phrasing ("the specified... mode"). This ADR *is*
