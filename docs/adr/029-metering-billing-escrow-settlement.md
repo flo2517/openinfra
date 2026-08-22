@@ -2,14 +2,15 @@
 
 ## Status
 
-**Proposed.** Written by Claude Code, autonomously, in response to issue #19. Per the convention
-established by ADR-016/018/025/026/027/028, this is deliberately **not** self-accepted: it is the
-first design in this repository to move real, spendable monetary value on-chain, not just
-reputation numbers, state records, or bonded stake used purely as a slashing deterrent. It becomes
-Accepted only after the repository owner has personally reviewed a summary of the decisions below
-and confirmed acceptance in an interactive session. Nothing here has been implemented; no code
-changes accompany this PR. Issues #20 and #21 are both explicitly blocked on this ADR being
-accepted, per their own text and per this issue's acceptance criteria.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #19, and held as Proposed
+per the convention established by ADR-016/018/025/026/027/028: this is the first design in this
+repository to move real, spendable monetary value on-chain, not just reputation numbers, state
+records, or bonded stake used purely as a slashing deterrent. Nothing here is implemented yet by
+this ADR itself; issues #20 and #21 are unblocked by this acceptance and now carry the
+implementation work.
 
 ## Context
 
