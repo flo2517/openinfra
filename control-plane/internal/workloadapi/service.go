@@ -99,6 +99,23 @@ type Repository interface {
 	// workload simply not existing. See postgres.go.
 	Get(ctx context.Context, workloadID, ownerID string) (Workload, error)
 	RequestStop(ctx context.Context, workloadID, requestID, ownerID string, now time.Time) (Workload, error)
+	// ReconcileFromAgent applies an ADR-028 §4 Agent-reported state
+	// transition, but only if the row still matches every one of
+	// providerID (an Agent may only ever reconcile its own workloads) and
+	// fromStates (the transition's own precondition -- see
+	// reconciliationTransition). A row that no longer matches (already
+	// advanced past this transition by the worker, or reconciled by an
+	// earlier entry in the same heartbeat) is a silent no-op, not an
+	// error: reconciliation must be safe to apply against state that has
+	// already moved on. Deliberately does not gate on worker_id/version
+	// the way the worker's own Mark* methods do -- a heartbeat is not a
+	// claimed-row operation, and must be able to apply even while a
+	// worker currently holds an unrelated claim on the same row (the
+	// state-match precondition alone is what keeps this safe: whichever
+	// writer's precondition still holds when it commits, wins; the loser
+	// simply no-ops and is retried, from fresh state, on the next
+	// heartbeat or worker tick).
+	ReconcileFromAgent(ctx context.Context, workloadID, providerID string, fromStates []string, toState, containerID, errorCode string) (applied bool, err error)
 }
 
 type Service struct {
@@ -164,6 +181,72 @@ func (s *Service) GetWorkload(ctx context.Context, request *controlplanev1.GetWo
 		return nil, repositoryError(err)
 	}
 	return &controlplanev1.GetWorkloadResponse{WorkloadId: stored.WorkloadID, State: stateToProto(stored.State), ProviderId: stored.ProviderID, LeaseId: stored.LeaseID, ContainerId: stored.ContainerID, ErrorCode: stored.ErrorCode, CreatedAt: timestamppb.New(stored.CreatedAt), UpdatedAt: timestamppb.New(stored.UpdatedAt)}, nil
+}
+
+// ReconcileWorkloadStatus implements providerjoin.WorkloadReconciler
+// (ADR-028 §4): for each workload the Agent reported this heartbeat,
+// applies the transition reconciliationTransition selects for its
+// phase -- a no-op for a phase not in that table (Provisioning/Starting/
+// Unspecified: nothing for the Control Plane to act on yet). One entry
+// failing does not abort the rest of the batch, matching this ADR's "one
+// bad workload must not block reconciling every other one" pattern seen
+// elsewhere (collect_workload_bandwidth, activeValidators); the first
+// error encountered is still returned so the caller can log it.
+func (s *Service) ReconcileWorkloadStatus(ctx context.Context, providerID string, statuses []*controlplanev1.WorkloadStatusSummary) error {
+	var firstErr error
+	for _, entry := range statuses {
+		if entry == nil {
+			continue
+		}
+		fromStates, toState, errorCode, ok := reconciliationTransition(entry.Phase)
+		if !ok {
+			continue
+		}
+		if _, err := s.repository.ReconcileFromAgent(ctx, entry.WorkloadId, providerID, fromStates, toState, entry.ContainerId, errorCode); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// reconciliationTransition is ADR-028 §4's conflict-resolution table: what
+// the Control Plane's own WorkloadState should become when the Agent's
+// heartbeat reports a given AgentWorkloadPhase, and from which of the
+// Control Plane's own states that transition is accepted. Deliberately
+// narrow -- only the transitions the ADR actually calls for, not a general
+// mapping of every phase combination:
+//
+//   - DEPLOYING -> RUNNING: the Control Plane's own dispatch believed the
+//     workload was still being deployed; the Agent's own heartbeat is now
+//     the authoritative confirmation it is actually running (the same
+//     meaning DeployAndConfirm's synchronous confirmation already carries,
+//     just arriving asynchronously via heartbeat instead).
+//   - DEPLOYING or RUNNING -> FAILED: the Agent lost or failed the
+//     container. An explicit, honest terminal state -- never silently
+//     dropped -- mirroring agent-core's own WorkloadPhase::Lost handling.
+//   - RUNNING, DEPLOYING, or STOPPING -> STOPPED: the Agent already
+//     stopped the workload on its own (most commonly ADR-028 §3's local
+//     lease-expiry enforcement while disconnected) before the Control
+//     Plane's own STOPPING/StopAndConfirm flow got there -- this is the
+//     "expired lease" conflict case: the Agent's local action is
+//     authoritative, since it already actually happened.
+//
+// Every other phase (Provisioning, Starting, Unspecified) reports
+// something the Control Plane's own coarser state machine has no matching
+// action for yet -- reconciliation intentionally does nothing for those.
+func reconciliationTransition(phase controlplanev1.AgentWorkloadPhase) (fromStates []string, toState, errorCode string, ok bool) {
+	switch phase {
+	case controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_RUNNING:
+		return []string{"DEPLOYING"}, "RUNNING", "", true
+	case controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_FAILED:
+		return []string{"DEPLOYING", "RUNNING"}, "FAILED", "AGENT_REPORTED_FAILED", true
+	case controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_LOST:
+		return []string{"DEPLOYING", "RUNNING"}, "FAILED", "AGENT_REPORTED_LOST", true
+	case controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_STOPPED:
+		return []string{"RUNNING", "DEPLOYING", "STOPPING"}, "STOPPED", "", true
+	default:
+		return nil, "", "", false
+	}
 }
 
 func (s *Service) StopWorkload(ctx context.Context, request *controlplanev1.StopWorkloadRequest) (*controlplanev1.StopWorkloadResponse, error) {

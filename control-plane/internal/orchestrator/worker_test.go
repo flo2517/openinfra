@@ -273,6 +273,44 @@ func TestDeployingCarriesReservedEgressMbpsIntoTheDeployRequest(t *testing.T) {
 	}
 }
 
+// TestDeployingCarriesLeaseEndIntoTheDeployRequest is ADR-028 §3's
+// control-plane-side wiring: DEPLOYING must populate DeployRequest.LeaseEnd
+// from the workload's own duration_seconds, computed from "now" at dispatch
+// time -- the same value driving the WireGuard overlay's own expiry
+// (worker.go's definitionExpiry), so the Agent has a real basis to enforce
+// its own local lease-expiry policy (ADR-028 §3) even though this ADR adds
+// no persisted wall-clock lease_end column of its own.
+func TestDeployingCarriesLeaseEndIntoTheDeployRequest(t *testing.T) {
+	const durationSeconds = 3600
+	definition, err := proto.Marshal(&sharedv1.WorkloadDefinition{
+		Requirements:    &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256},
+		DurationSeconds: durationSeconds,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := workloadapi.Workload{WorkloadID: "workload", State: "DEPLOYING", Definition: definition, ProviderID: "provider", LeaseID: "42", Version: 1}
+	store := &recordingStore{item: item}
+	provider := agentmanager.SchedulableProvider{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "provider", AgentEndpoint: "https://agent:50052"}}
+	dispatcher := &capturingDispatcher{}
+	worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, dispatcher, testRanker())
+	before := time.Now().UTC()
+	if err := worker.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().UTC()
+	if dispatcher.request == nil {
+		t.Fatal("no DeployRequest captured")
+	}
+	if dispatcher.request.LeaseEnd == nil {
+		t.Fatal("LeaseEnd is nil, want a populated timestamp")
+	}
+	leaseEnd := dispatcher.request.LeaseEnd.AsTime()
+	if leaseEnd.Before(before.Add(durationSeconds*time.Second)) || leaseEnd.After(after.Add(durationSeconds*time.Second)) {
+		t.Fatalf("LeaseEnd = %s, want within [%s, %s]", leaseEnd, before.Add(durationSeconds*time.Second), after.Add(durationSeconds*time.Second))
+	}
+}
+
 // TestNoEligibleProviderErrorSurfacesDistinctReasons covers ADR-026 §3's
 // error-messaging mitigation: the NO_CAPACITY error must surface the
 // distinct exclusion reasons actually seen, not just a count -- a general

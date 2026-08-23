@@ -159,6 +159,14 @@ func run() error {
 	// SetValidatorSource above already uses -- this is telemetry, not a
 	// liveness-critical path.
 	service.SetBandwidthUsageStore(providerjoin.NewPostgresBandwidthUsageStore(pool))
+	// ADR-028 §4: status-first reconciliation on every heartbeat, against
+	// the exact same workloadService instance SetWorkloadService above
+	// already shares with the dashboard's tenant-tier submitMyWorkload --
+	// one Repository, one source of truth for the workloads table. A
+	// reconciliation failure degrades to a warning log inside Service
+	// (see SetWorkloadReconciler's doc comment), never fails the
+	// heartbeat itself.
+	service.SetWorkloadReconciler(workloadService)
 	// Independently drives provider_chain_registrations rows left in
 	// READY/RETRY (e.g. after a Control Plane or chain restart) to
 	// FINALIZED, without depending on the Agent retrying CompleteJoin.

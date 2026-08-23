@@ -25,3 +25,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 
 [dev-dependencies]
 tempfile = "3"
+# ADR-028 §3: only tests build DeployRequest.lease_end literals directly;
+# production code reads the field through the value the caller already
+# supplied on the generated agent_api::proto::DeployRequest type.
+prost-types = "0.12"

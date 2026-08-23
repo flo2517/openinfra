@@ -23,6 +23,77 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// AgentWorkloadPhase mirrors agent-core::local_state::WorkloadPhase
+// one-to-one -- deliberately not WorkloadState (this message's cousin
+// below): the two vocabularies answer different questions ("what does the
+// Agent locally observe about this container" vs. "what does the Control
+// Plane's own workload lifecycle believe"), and conflating them would let
+// an Agent-local phase silently masquerade as Control-Plane-confirmed
+// state, which ADR-028 §2 explicitly prohibits.
+type AgentWorkloadPhase int32
+
+const (
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_UNSPECIFIED  AgentWorkloadPhase = 0
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_PROVISIONING AgentWorkloadPhase = 1
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_STARTING     AgentWorkloadPhase = 2
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_RUNNING      AgentWorkloadPhase = 3
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_STOPPING     AgentWorkloadPhase = 4
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_STOPPED      AgentWorkloadPhase = 5
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_FAILED       AgentWorkloadPhase = 6
+	AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_LOST         AgentWorkloadPhase = 7
+)
+
+// Enum value maps for AgentWorkloadPhase.
+var (
+	AgentWorkloadPhase_name = map[int32]string{
+		0: "AGENT_WORKLOAD_PHASE_UNSPECIFIED",
+		1: "AGENT_WORKLOAD_PHASE_PROVISIONING",
+		2: "AGENT_WORKLOAD_PHASE_STARTING",
+		3: "AGENT_WORKLOAD_PHASE_RUNNING",
+		4: "AGENT_WORKLOAD_PHASE_STOPPING",
+		5: "AGENT_WORKLOAD_PHASE_STOPPED",
+		6: "AGENT_WORKLOAD_PHASE_FAILED",
+		7: "AGENT_WORKLOAD_PHASE_LOST",
+	}
+	AgentWorkloadPhase_value = map[string]int32{
+		"AGENT_WORKLOAD_PHASE_UNSPECIFIED":  0,
+		"AGENT_WORKLOAD_PHASE_PROVISIONING": 1,
+		"AGENT_WORKLOAD_PHASE_STARTING":     2,
+		"AGENT_WORKLOAD_PHASE_RUNNING":      3,
+		"AGENT_WORKLOAD_PHASE_STOPPING":     4,
+		"AGENT_WORKLOAD_PHASE_STOPPED":      5,
+		"AGENT_WORKLOAD_PHASE_FAILED":       6,
+		"AGENT_WORKLOAD_PHASE_LOST":         7,
+	}
+)
+
+func (x AgentWorkloadPhase) Enum() *AgentWorkloadPhase {
+	p := new(AgentWorkloadPhase)
+	*p = x
+	return p
+}
+
+func (x AgentWorkloadPhase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (AgentWorkloadPhase) Descriptor() protoreflect.EnumDescriptor {
+	return file_openinfra_controlplane_v1_control_plane_proto_enumTypes[0].Descriptor()
+}
+
+func (AgentWorkloadPhase) Type() protoreflect.EnumType {
+	return &file_openinfra_controlplane_v1_control_plane_proto_enumTypes[0]
+}
+
+func (x AgentWorkloadPhase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use AgentWorkloadPhase.Descriptor instead.
+func (AgentWorkloadPhase) EnumDescriptor() ([]byte, []int) {
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{0}
+}
+
 type WorkloadState int32
 
 const (
@@ -80,11 +151,11 @@ func (x WorkloadState) String() string {
 }
 
 func (WorkloadState) Descriptor() protoreflect.EnumDescriptor {
-	return file_openinfra_controlplane_v1_control_plane_proto_enumTypes[0].Descriptor()
+	return file_openinfra_controlplane_v1_control_plane_proto_enumTypes[1].Descriptor()
 }
 
 func (WorkloadState) Type() protoreflect.EnumType {
-	return &file_openinfra_controlplane_v1_control_plane_proto_enumTypes[0]
+	return &file_openinfra_controlplane_v1_control_plane_proto_enumTypes[1]
 }
 
 func (x WorkloadState) Number() protoreflect.EnumNumber {
@@ -93,7 +164,7 @@ func (x WorkloadState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use WorkloadState.Descriptor instead.
 func (WorkloadState) EnumDescriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{0}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{1}
 }
 
 type BeginJoinRequest struct {
@@ -450,8 +521,20 @@ type HeartbeatSigningPayload struct {
 	// same key signing the same data on the same transport, and two
 	// verifications that can disagree are worse than one that cannot.
 	WorkloadBandwidth []*WorkloadBandwidthUsage `protobuf:"bytes,6,rep,name=workload_bandwidth,json=workloadBandwidth,proto3" json:"workload_bandwidth,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// ADR-028 §4: one entry per workload the Agent currently knows about
+	// locally (agent-core::local_state::LocalState), on *every* heartbeat --
+	// not a special "resuming after disconnect" message. Bounded by the same
+	// max_workloads cap LocalState itself already enforces (default 8); the
+	// Control Plane additionally enforces its own ceiling regardless (see
+	// maxWorkloadStatusEntriesPerHeartbeat), the same defense-in-depth
+	// WorkloadBandwidthUsage above already gets. This is what makes
+	// reconciliation on reconnect "status-first by construction": the first
+	// heartbeat that succeeds after some failed ones carries exactly this
+	// same payload shape as any other heartbeat, so the Agent's actual
+	// observed state rides on the very call that re-establishes contact.
+	WorkloadStatus []*WorkloadStatusSummary `protobuf:"bytes,7,rep,name=workload_status,json=workloadStatus,proto3" json:"workload_status,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *HeartbeatSigningPayload) Reset() {
@@ -526,6 +609,94 @@ func (x *HeartbeatSigningPayload) GetWorkloadBandwidth() []*WorkloadBandwidthUsa
 	return nil
 }
 
+func (x *HeartbeatSigningPayload) GetWorkloadStatus() []*WorkloadStatusSummary {
+	if x != nil {
+		return x.WorkloadStatus
+	}
+	return nil
+}
+
+// ADR-028 §4: one workload's Agent-local status, as
+// agent-core::local_state::WorkloadRecord itself understands it -- never a
+// claim of Control-Plane-confirmed state (see WorkloadPhase's own doc
+// comment: it is entirely a vocabulary of locally observed truth).
+// providerjoin.Service.ReportHeartbeat reconciles this against its own
+// authoritative WorkloadState using the existing state machine; it does not
+// invent a new one.
+type WorkloadStatusSummary struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	WorkloadId string                 `protobuf:"bytes,1,opt,name=workload_id,json=workloadId,proto3" json:"workload_id,omitempty"`
+	Phase      AgentWorkloadPhase     `protobuf:"varint,2,opt,name=phase,proto3,enum=openinfra.controlplane.v1.AgentWorkloadPhase" json:"phase,omitempty"`
+	// Empty when the Agent has not yet created a container for this
+	// workload (AGENT_WORKLOAD_PHASE_PROVISIONING).
+	ContainerId string `protobuf:"bytes,3,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	// The exact spec_hash agent-core::local_state::WorkloadRecord persisted
+	// for this workload -- lets the Control Plane detect (though this ADR
+	// does not yet act on) a workload whose locally-persisted spec disagrees
+	// with what the Control Plane most recently asked for.
+	SpecHash      []byte `protobuf:"bytes,4,opt,name=spec_hash,json=specHash,proto3" json:"spec_hash,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorkloadStatusSummary) Reset() {
+	*x = WorkloadStatusSummary{}
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkloadStatusSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkloadStatusSummary) ProtoMessage() {}
+
+func (x *WorkloadStatusSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkloadStatusSummary.ProtoReflect.Descriptor instead.
+func (*WorkloadStatusSummary) Descriptor() ([]byte, []int) {
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *WorkloadStatusSummary) GetWorkloadId() string {
+	if x != nil {
+		return x.WorkloadId
+	}
+	return ""
+}
+
+func (x *WorkloadStatusSummary) GetPhase() AgentWorkloadPhase {
+	if x != nil {
+		return x.Phase
+	}
+	return AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_UNSPECIFIED
+}
+
+func (x *WorkloadStatusSummary) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
+func (x *WorkloadStatusSummary) GetSpecHash() []byte {
+	if x != nil {
+		return x.SpecHash
+	}
+	return nil
+}
+
 // WorkloadBandwidthUsage is one workload's cumulative byte counters, as
 // read by the Agent from the Linux interface counters of that workload's
 // own network namespace.
@@ -557,7 +728,7 @@ type WorkloadBandwidthUsage struct {
 
 func (x *WorkloadBandwidthUsage) Reset() {
 	*x = WorkloadBandwidthUsage{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[6]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -569,7 +740,7 @@ func (x *WorkloadBandwidthUsage) String() string {
 func (*WorkloadBandwidthUsage) ProtoMessage() {}
 
 func (x *WorkloadBandwidthUsage) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[6]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -582,7 +753,7 @@ func (x *WorkloadBandwidthUsage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkloadBandwidthUsage.ProtoReflect.Descriptor instead.
 func (*WorkloadBandwidthUsage) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{6}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *WorkloadBandwidthUsage) GetWorkloadId() string {
@@ -629,7 +800,7 @@ type ReportHeartbeatResponse struct {
 
 func (x *ReportHeartbeatResponse) Reset() {
 	*x = ReportHeartbeatResponse{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[7]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -641,7 +812,7 @@ func (x *ReportHeartbeatResponse) String() string {
 func (*ReportHeartbeatResponse) ProtoMessage() {}
 
 func (x *ReportHeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[7]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -654,7 +825,7 @@ func (x *ReportHeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportHeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*ReportHeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{7}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ReportHeartbeatResponse) GetStatus() v1.NodeStatus {
@@ -698,7 +869,7 @@ type SubmitWorkloadRequest struct {
 
 func (x *SubmitWorkloadRequest) Reset() {
 	*x = SubmitWorkloadRequest{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[8]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -710,7 +881,7 @@ func (x *SubmitWorkloadRequest) String() string {
 func (*SubmitWorkloadRequest) ProtoMessage() {}
 
 func (x *SubmitWorkloadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[8]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -723,7 +894,7 @@ func (x *SubmitWorkloadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitWorkloadRequest.ProtoReflect.Descriptor instead.
 func (*SubmitWorkloadRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{8}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SubmitWorkloadRequest) GetRequestId() string {
@@ -758,7 +929,7 @@ type SubmitWorkloadResponse struct {
 
 func (x *SubmitWorkloadResponse) Reset() {
 	*x = SubmitWorkloadResponse{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[9]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -770,7 +941,7 @@ func (x *SubmitWorkloadResponse) String() string {
 func (*SubmitWorkloadResponse) ProtoMessage() {}
 
 func (x *SubmitWorkloadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[9]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -783,7 +954,7 @@ func (x *SubmitWorkloadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitWorkloadResponse.ProtoReflect.Descriptor instead.
 func (*SubmitWorkloadResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{9}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SubmitWorkloadResponse) GetWorkloadId() string {
@@ -816,7 +987,7 @@ type GetWorkloadRequest struct {
 
 func (x *GetWorkloadRequest) Reset() {
 	*x = GetWorkloadRequest{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[10]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -828,7 +999,7 @@ func (x *GetWorkloadRequest) String() string {
 func (*GetWorkloadRequest) ProtoMessage() {}
 
 func (x *GetWorkloadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[10]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -841,7 +1012,7 @@ func (x *GetWorkloadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetWorkloadRequest.ProtoReflect.Descriptor instead.
 func (*GetWorkloadRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{10}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetWorkloadRequest) GetWorkloadId() string {
@@ -867,7 +1038,7 @@ type GetWorkloadResponse struct {
 
 func (x *GetWorkloadResponse) Reset() {
 	*x = GetWorkloadResponse{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[11]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -879,7 +1050,7 @@ func (x *GetWorkloadResponse) String() string {
 func (*GetWorkloadResponse) ProtoMessage() {}
 
 func (x *GetWorkloadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[11]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -892,7 +1063,7 @@ func (x *GetWorkloadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetWorkloadResponse.ProtoReflect.Descriptor instead.
 func (*GetWorkloadResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{11}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *GetWorkloadResponse) GetWorkloadId() string {
@@ -961,7 +1132,7 @@ type StopWorkloadRequest struct {
 
 func (x *StopWorkloadRequest) Reset() {
 	*x = StopWorkloadRequest{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[12]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -973,7 +1144,7 @@ func (x *StopWorkloadRequest) String() string {
 func (*StopWorkloadRequest) ProtoMessage() {}
 
 func (x *StopWorkloadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[12]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -986,7 +1157,7 @@ func (x *StopWorkloadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopWorkloadRequest.ProtoReflect.Descriptor instead.
 func (*StopWorkloadRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{12}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *StopWorkloadRequest) GetRequestId() string {
@@ -1014,7 +1185,7 @@ type StopWorkloadResponse struct {
 
 func (x *StopWorkloadResponse) Reset() {
 	*x = StopWorkloadResponse{}
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[13]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1026,7 +1197,7 @@ func (x *StopWorkloadResponse) String() string {
 func (*StopWorkloadResponse) ProtoMessage() {}
 
 func (x *StopWorkloadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[13]
+	mi := &file_openinfra_controlplane_v1_control_plane_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1039,7 +1210,7 @@ func (x *StopWorkloadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopWorkloadResponse.ProtoReflect.Descriptor instead.
 func (*StopWorkloadResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{13}
+	return file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *StopWorkloadResponse) GetWorkloadId() string {
@@ -1095,7 +1266,7 @@ const file_openinfra_controlplane_v1_control_plane_proto_rawDesc = "" +
 	"\x1aheartbeat_interval_seconds\x18\x04 \x01(\rR\x18heartbeatIntervalSeconds\"\x84\x01\n" +
 	"\x16ReportHeartbeatRequest\x12L\n" +
 	"\apayload\x18\x01 \x01(\v22.openinfra.controlplane.v1.HeartbeatSigningPayloadR\apayload\x12\x1c\n" +
-	"\tsignature\x18\x02 \x01(\fR\tsignature\"\xe1\x02\n" +
+	"\tsignature\x18\x02 \x01(\fR\tsignature\"\xbc\x03\n" +
 	"\x17HeartbeatSigningPayload\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1f\n" +
@@ -1105,7 +1276,14 @@ const file_openinfra_controlplane_v1_control_plane_proto_rawDesc = "" +
 	"\vobserved_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"observedAt\x12K\n" +
 	"\fcapabilities\x18\x05 \x01(\v2'.openinfra.shared.v1.ResourceCapabilityR\fcapabilities\x12`\n" +
-	"\x12workload_bandwidth\x18\x06 \x03(\v21.openinfra.controlplane.v1.WorkloadBandwidthUsageR\x11workloadBandwidth\"\xdf\x01\n" +
+	"\x12workload_bandwidth\x18\x06 \x03(\v21.openinfra.controlplane.v1.WorkloadBandwidthUsageR\x11workloadBandwidth\x12Y\n" +
+	"\x0fworkload_status\x18\a \x03(\v20.openinfra.controlplane.v1.WorkloadStatusSummaryR\x0eworkloadStatus\"\xbd\x01\n" +
+	"\x15WorkloadStatusSummary\x12\x1f\n" +
+	"\vworkload_id\x18\x01 \x01(\tR\n" +
+	"workloadId\x12C\n" +
+	"\x05phase\x18\x02 \x01(\x0e2-.openinfra.controlplane.v1.AgentWorkloadPhaseR\x05phase\x12!\n" +
+	"\fcontainer_id\x18\x03 \x01(\tR\vcontainerId\x12\x1b\n" +
+	"\tspec_hash\x18\x04 \x01(\fR\bspecHash\"\xdf\x01\n" +
 	"\x16WorkloadBandwidthUsage\x12\x1f\n" +
 	"\vworkload_id\x18\x01 \x01(\tR\n" +
 	"workloadId\x12.\n" +
@@ -1158,7 +1336,16 @@ const file_openinfra_controlplane_v1_control_plane_proto_rawDesc = "" +
 	"workloadId\x12>\n" +
 	"\x05state\x18\x02 \x01(\x0e2(.openinfra.controlplane.v1.WorkloadStateR\x05state\x129\n" +
 	"\n" +
-	"updated_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt*\xd5\x02\n" +
+	"updated_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt*\xab\x02\n" +
+	"\x12AgentWorkloadPhase\x12$\n" +
+	" AGENT_WORKLOAD_PHASE_UNSPECIFIED\x10\x00\x12%\n" +
+	"!AGENT_WORKLOAD_PHASE_PROVISIONING\x10\x01\x12!\n" +
+	"\x1dAGENT_WORKLOAD_PHASE_STARTING\x10\x02\x12 \n" +
+	"\x1cAGENT_WORKLOAD_PHASE_RUNNING\x10\x03\x12!\n" +
+	"\x1dAGENT_WORKLOAD_PHASE_STOPPING\x10\x04\x12 \n" +
+	"\x1cAGENT_WORKLOAD_PHASE_STOPPED\x10\x05\x12\x1f\n" +
+	"\x1bAGENT_WORKLOAD_PHASE_FAILED\x10\x06\x12\x1d\n" +
+	"\x19AGENT_WORKLOAD_PHASE_LOST\x10\a*\xd5\x02\n" +
 	"\rWorkloadState\x12\x1e\n" +
 	"\x1aWORKLOAD_STATE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18WORKLOAD_STATE_REQUESTED\x10\x01\x12\x1d\n" +
@@ -1192,66 +1379,70 @@ func file_openinfra_controlplane_v1_control_plane_proto_rawDescGZIP() []byte {
 	return file_openinfra_controlplane_v1_control_plane_proto_rawDescData
 }
 
-var file_openinfra_controlplane_v1_control_plane_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_openinfra_controlplane_v1_control_plane_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_openinfra_controlplane_v1_control_plane_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_openinfra_controlplane_v1_control_plane_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_openinfra_controlplane_v1_control_plane_proto_goTypes = []any{
-	(WorkloadState)(0),              // 0: openinfra.controlplane.v1.WorkloadState
-	(*BeginJoinRequest)(nil),        // 1: openinfra.controlplane.v1.BeginJoinRequest
-	(*BeginJoinResponse)(nil),       // 2: openinfra.controlplane.v1.BeginJoinResponse
-	(*CompleteJoinRequest)(nil),     // 3: openinfra.controlplane.v1.CompleteJoinRequest
-	(*CompleteJoinResponse)(nil),    // 4: openinfra.controlplane.v1.CompleteJoinResponse
-	(*ReportHeartbeatRequest)(nil),  // 5: openinfra.controlplane.v1.ReportHeartbeatRequest
-	(*HeartbeatSigningPayload)(nil), // 6: openinfra.controlplane.v1.HeartbeatSigningPayload
-	(*WorkloadBandwidthUsage)(nil),  // 7: openinfra.controlplane.v1.WorkloadBandwidthUsage
-	(*ReportHeartbeatResponse)(nil), // 8: openinfra.controlplane.v1.ReportHeartbeatResponse
-	(*SubmitWorkloadRequest)(nil),   // 9: openinfra.controlplane.v1.SubmitWorkloadRequest
-	(*SubmitWorkloadResponse)(nil),  // 10: openinfra.controlplane.v1.SubmitWorkloadResponse
-	(*GetWorkloadRequest)(nil),      // 11: openinfra.controlplane.v1.GetWorkloadRequest
-	(*GetWorkloadResponse)(nil),     // 12: openinfra.controlplane.v1.GetWorkloadResponse
-	(*StopWorkloadRequest)(nil),     // 13: openinfra.controlplane.v1.StopWorkloadRequest
-	(*StopWorkloadResponse)(nil),    // 14: openinfra.controlplane.v1.StopWorkloadResponse
-	(*timestamppb.Timestamp)(nil),   // 15: google.protobuf.Timestamp
-	(*v1.ResourceCapability)(nil),   // 16: openinfra.shared.v1.ResourceCapability
-	(v1.NodeStatus)(0),              // 17: openinfra.shared.v1.NodeStatus
-	(*v1.WorkloadDefinition)(nil),   // 18: openinfra.shared.v1.WorkloadDefinition
+	(AgentWorkloadPhase)(0),         // 0: openinfra.controlplane.v1.AgentWorkloadPhase
+	(WorkloadState)(0),              // 1: openinfra.controlplane.v1.WorkloadState
+	(*BeginJoinRequest)(nil),        // 2: openinfra.controlplane.v1.BeginJoinRequest
+	(*BeginJoinResponse)(nil),       // 3: openinfra.controlplane.v1.BeginJoinResponse
+	(*CompleteJoinRequest)(nil),     // 4: openinfra.controlplane.v1.CompleteJoinRequest
+	(*CompleteJoinResponse)(nil),    // 5: openinfra.controlplane.v1.CompleteJoinResponse
+	(*ReportHeartbeatRequest)(nil),  // 6: openinfra.controlplane.v1.ReportHeartbeatRequest
+	(*HeartbeatSigningPayload)(nil), // 7: openinfra.controlplane.v1.HeartbeatSigningPayload
+	(*WorkloadStatusSummary)(nil),   // 8: openinfra.controlplane.v1.WorkloadStatusSummary
+	(*WorkloadBandwidthUsage)(nil),  // 9: openinfra.controlplane.v1.WorkloadBandwidthUsage
+	(*ReportHeartbeatResponse)(nil), // 10: openinfra.controlplane.v1.ReportHeartbeatResponse
+	(*SubmitWorkloadRequest)(nil),   // 11: openinfra.controlplane.v1.SubmitWorkloadRequest
+	(*SubmitWorkloadResponse)(nil),  // 12: openinfra.controlplane.v1.SubmitWorkloadResponse
+	(*GetWorkloadRequest)(nil),      // 13: openinfra.controlplane.v1.GetWorkloadRequest
+	(*GetWorkloadResponse)(nil),     // 14: openinfra.controlplane.v1.GetWorkloadResponse
+	(*StopWorkloadRequest)(nil),     // 15: openinfra.controlplane.v1.StopWorkloadRequest
+	(*StopWorkloadResponse)(nil),    // 16: openinfra.controlplane.v1.StopWorkloadResponse
+	(*timestamppb.Timestamp)(nil),   // 17: google.protobuf.Timestamp
+	(*v1.ResourceCapability)(nil),   // 18: openinfra.shared.v1.ResourceCapability
+	(v1.NodeStatus)(0),              // 19: openinfra.shared.v1.NodeStatus
+	(*v1.WorkloadDefinition)(nil),   // 20: openinfra.shared.v1.WorkloadDefinition
 }
 var file_openinfra_controlplane_v1_control_plane_proto_depIdxs = []int32{
-	15, // 0: openinfra.controlplane.v1.BeginJoinResponse.expires_at:type_name -> google.protobuf.Timestamp
-	16, // 1: openinfra.controlplane.v1.CompleteJoinRequest.capabilities:type_name -> openinfra.shared.v1.ResourceCapability
-	17, // 2: openinfra.controlplane.v1.CompleteJoinResponse.status:type_name -> openinfra.shared.v1.NodeStatus
-	15, // 3: openinfra.controlplane.v1.CompleteJoinResponse.registered_at:type_name -> google.protobuf.Timestamp
-	6,  // 4: openinfra.controlplane.v1.ReportHeartbeatRequest.payload:type_name -> openinfra.controlplane.v1.HeartbeatSigningPayload
-	15, // 5: openinfra.controlplane.v1.HeartbeatSigningPayload.observed_at:type_name -> google.protobuf.Timestamp
-	16, // 6: openinfra.controlplane.v1.HeartbeatSigningPayload.capabilities:type_name -> openinfra.shared.v1.ResourceCapability
-	7,  // 7: openinfra.controlplane.v1.HeartbeatSigningPayload.workload_bandwidth:type_name -> openinfra.controlplane.v1.WorkloadBandwidthUsage
-	15, // 8: openinfra.controlplane.v1.WorkloadBandwidthUsage.window_started_at:type_name -> google.protobuf.Timestamp
-	17, // 9: openinfra.controlplane.v1.ReportHeartbeatResponse.status:type_name -> openinfra.shared.v1.NodeStatus
-	15, // 10: openinfra.controlplane.v1.ReportHeartbeatResponse.accepted_at:type_name -> google.protobuf.Timestamp
-	18, // 11: openinfra.controlplane.v1.SubmitWorkloadRequest.definition:type_name -> openinfra.shared.v1.WorkloadDefinition
-	0,  // 12: openinfra.controlplane.v1.SubmitWorkloadResponse.state:type_name -> openinfra.controlplane.v1.WorkloadState
-	15, // 13: openinfra.controlplane.v1.SubmitWorkloadResponse.created_at:type_name -> google.protobuf.Timestamp
-	0,  // 14: openinfra.controlplane.v1.GetWorkloadResponse.state:type_name -> openinfra.controlplane.v1.WorkloadState
-	15, // 15: openinfra.controlplane.v1.GetWorkloadResponse.created_at:type_name -> google.protobuf.Timestamp
-	15, // 16: openinfra.controlplane.v1.GetWorkloadResponse.updated_at:type_name -> google.protobuf.Timestamp
-	0,  // 17: openinfra.controlplane.v1.StopWorkloadResponse.state:type_name -> openinfra.controlplane.v1.WorkloadState
-	15, // 18: openinfra.controlplane.v1.StopWorkloadResponse.updated_at:type_name -> google.protobuf.Timestamp
-	1,  // 19: openinfra.controlplane.v1.ControlPlaneService.BeginJoin:input_type -> openinfra.controlplane.v1.BeginJoinRequest
-	3,  // 20: openinfra.controlplane.v1.ControlPlaneService.CompleteJoin:input_type -> openinfra.controlplane.v1.CompleteJoinRequest
-	5,  // 21: openinfra.controlplane.v1.ControlPlaneService.ReportHeartbeat:input_type -> openinfra.controlplane.v1.ReportHeartbeatRequest
-	9,  // 22: openinfra.controlplane.v1.ControlPlaneService.SubmitWorkload:input_type -> openinfra.controlplane.v1.SubmitWorkloadRequest
-	11, // 23: openinfra.controlplane.v1.ControlPlaneService.GetWorkload:input_type -> openinfra.controlplane.v1.GetWorkloadRequest
-	13, // 24: openinfra.controlplane.v1.ControlPlaneService.StopWorkload:input_type -> openinfra.controlplane.v1.StopWorkloadRequest
-	2,  // 25: openinfra.controlplane.v1.ControlPlaneService.BeginJoin:output_type -> openinfra.controlplane.v1.BeginJoinResponse
-	4,  // 26: openinfra.controlplane.v1.ControlPlaneService.CompleteJoin:output_type -> openinfra.controlplane.v1.CompleteJoinResponse
-	8,  // 27: openinfra.controlplane.v1.ControlPlaneService.ReportHeartbeat:output_type -> openinfra.controlplane.v1.ReportHeartbeatResponse
-	10, // 28: openinfra.controlplane.v1.ControlPlaneService.SubmitWorkload:output_type -> openinfra.controlplane.v1.SubmitWorkloadResponse
-	12, // 29: openinfra.controlplane.v1.ControlPlaneService.GetWorkload:output_type -> openinfra.controlplane.v1.GetWorkloadResponse
-	14, // 30: openinfra.controlplane.v1.ControlPlaneService.StopWorkload:output_type -> openinfra.controlplane.v1.StopWorkloadResponse
-	25, // [25:31] is the sub-list for method output_type
-	19, // [19:25] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	17, // 0: openinfra.controlplane.v1.BeginJoinResponse.expires_at:type_name -> google.protobuf.Timestamp
+	18, // 1: openinfra.controlplane.v1.CompleteJoinRequest.capabilities:type_name -> openinfra.shared.v1.ResourceCapability
+	19, // 2: openinfra.controlplane.v1.CompleteJoinResponse.status:type_name -> openinfra.shared.v1.NodeStatus
+	17, // 3: openinfra.controlplane.v1.CompleteJoinResponse.registered_at:type_name -> google.protobuf.Timestamp
+	7,  // 4: openinfra.controlplane.v1.ReportHeartbeatRequest.payload:type_name -> openinfra.controlplane.v1.HeartbeatSigningPayload
+	17, // 5: openinfra.controlplane.v1.HeartbeatSigningPayload.observed_at:type_name -> google.protobuf.Timestamp
+	18, // 6: openinfra.controlplane.v1.HeartbeatSigningPayload.capabilities:type_name -> openinfra.shared.v1.ResourceCapability
+	9,  // 7: openinfra.controlplane.v1.HeartbeatSigningPayload.workload_bandwidth:type_name -> openinfra.controlplane.v1.WorkloadBandwidthUsage
+	8,  // 8: openinfra.controlplane.v1.HeartbeatSigningPayload.workload_status:type_name -> openinfra.controlplane.v1.WorkloadStatusSummary
+	0,  // 9: openinfra.controlplane.v1.WorkloadStatusSummary.phase:type_name -> openinfra.controlplane.v1.AgentWorkloadPhase
+	17, // 10: openinfra.controlplane.v1.WorkloadBandwidthUsage.window_started_at:type_name -> google.protobuf.Timestamp
+	19, // 11: openinfra.controlplane.v1.ReportHeartbeatResponse.status:type_name -> openinfra.shared.v1.NodeStatus
+	17, // 12: openinfra.controlplane.v1.ReportHeartbeatResponse.accepted_at:type_name -> google.protobuf.Timestamp
+	20, // 13: openinfra.controlplane.v1.SubmitWorkloadRequest.definition:type_name -> openinfra.shared.v1.WorkloadDefinition
+	1,  // 14: openinfra.controlplane.v1.SubmitWorkloadResponse.state:type_name -> openinfra.controlplane.v1.WorkloadState
+	17, // 15: openinfra.controlplane.v1.SubmitWorkloadResponse.created_at:type_name -> google.protobuf.Timestamp
+	1,  // 16: openinfra.controlplane.v1.GetWorkloadResponse.state:type_name -> openinfra.controlplane.v1.WorkloadState
+	17, // 17: openinfra.controlplane.v1.GetWorkloadResponse.created_at:type_name -> google.protobuf.Timestamp
+	17, // 18: openinfra.controlplane.v1.GetWorkloadResponse.updated_at:type_name -> google.protobuf.Timestamp
+	1,  // 19: openinfra.controlplane.v1.StopWorkloadResponse.state:type_name -> openinfra.controlplane.v1.WorkloadState
+	17, // 20: openinfra.controlplane.v1.StopWorkloadResponse.updated_at:type_name -> google.protobuf.Timestamp
+	2,  // 21: openinfra.controlplane.v1.ControlPlaneService.BeginJoin:input_type -> openinfra.controlplane.v1.BeginJoinRequest
+	4,  // 22: openinfra.controlplane.v1.ControlPlaneService.CompleteJoin:input_type -> openinfra.controlplane.v1.CompleteJoinRequest
+	6,  // 23: openinfra.controlplane.v1.ControlPlaneService.ReportHeartbeat:input_type -> openinfra.controlplane.v1.ReportHeartbeatRequest
+	11, // 24: openinfra.controlplane.v1.ControlPlaneService.SubmitWorkload:input_type -> openinfra.controlplane.v1.SubmitWorkloadRequest
+	13, // 25: openinfra.controlplane.v1.ControlPlaneService.GetWorkload:input_type -> openinfra.controlplane.v1.GetWorkloadRequest
+	15, // 26: openinfra.controlplane.v1.ControlPlaneService.StopWorkload:input_type -> openinfra.controlplane.v1.StopWorkloadRequest
+	3,  // 27: openinfra.controlplane.v1.ControlPlaneService.BeginJoin:output_type -> openinfra.controlplane.v1.BeginJoinResponse
+	5,  // 28: openinfra.controlplane.v1.ControlPlaneService.CompleteJoin:output_type -> openinfra.controlplane.v1.CompleteJoinResponse
+	10, // 29: openinfra.controlplane.v1.ControlPlaneService.ReportHeartbeat:output_type -> openinfra.controlplane.v1.ReportHeartbeatResponse
+	12, // 30: openinfra.controlplane.v1.ControlPlaneService.SubmitWorkload:output_type -> openinfra.controlplane.v1.SubmitWorkloadResponse
+	14, // 31: openinfra.controlplane.v1.ControlPlaneService.GetWorkload:output_type -> openinfra.controlplane.v1.GetWorkloadResponse
+	16, // 32: openinfra.controlplane.v1.ControlPlaneService.StopWorkload:output_type -> openinfra.controlplane.v1.StopWorkloadResponse
+	27, // [27:33] is the sub-list for method output_type
+	21, // [21:27] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_openinfra_controlplane_v1_control_plane_proto_init() }
@@ -1264,8 +1455,8 @@ func file_openinfra_controlplane_v1_control_plane_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_openinfra_controlplane_v1_control_plane_proto_rawDesc), len(file_openinfra_controlplane_v1_control_plane_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   14,
+			NumEnums:      2,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

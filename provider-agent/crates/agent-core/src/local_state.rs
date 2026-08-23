@@ -73,6 +73,19 @@ pub struct WorkloadRecord {
     /// reason as `egress_mbps`.
     #[serde(default)]
     pub rate_limited: bool,
+    /// ADR-028 §3: when this workload's lease authorization ends, unix
+    /// seconds, sourced from `DeployRequest.lease_end`. `agent-executor`'s
+    /// `deployment()` requires every new `DeployRequest` to carry it (see
+    /// that function's validation), so this is only ever `None` for a
+    /// record persisted before this field existed --
+    /// `#[serde(default)]` for the same backward-compat reason as
+    /// `egress_mbps`/`rate_limited`. A `None` record is never auto-stopped
+    /// by `enforce_lease_expiry` (it has no known term to enforce) but
+    /// remains fully visible via `recover()`/heartbeats -- deliberately
+    /// not backfilled with a guessed value, matching this ADR's "never
+    /// fabricate" principle for locally-synthesized authority.
+    #[serde(default)]
+    pub lease_end: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +242,7 @@ mod tests {
             phase: WorkloadPhase::Running,
             egress_mbps: 0,
             rate_limited: false,
+            lease_end: Some(1_700_000_000),
         };
         {
             let state = LocalState::open(directory.path()).expect("open state");

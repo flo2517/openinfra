@@ -19,6 +19,7 @@ import (
 	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ReputationSource reads a provider's on-chain reputation vector by its
@@ -204,7 +205,16 @@ func (w *Worker) processOne(ctx context.Context) error {
 				return w.retry(ctx, item, "AGENT_STATUS_UNKNOWN", statusErr)
 			}
 		}
-		request := &agentv1.DeployRequest{WorkloadId: item.WorkloadID, LeaseId: item.LeaseID, Image: item.Image, Limits: &agentv1.ResourceLimits{CpuCores: definition.Requirements.Cpu, MemoryMb: definition.Requirements.RamMb, EgressMbps: workloadEgressMbps(definition)}}
+		// ADR-028 §3: the wall-clock lease term the Agent must locally
+		// enforce if it becomes disconnected from the Control Plane.
+		// Computed once, here, from the exact duration_seconds this
+		// workload's on-chain lease was created with (the same value
+		// LEASE_PENDING above already converted to a block count) --
+		// reused verbatim for the WireGuard overlay's own expiry below,
+		// so the two "when does this workload's authorization end"
+		// values can never independently drift.
+		definitionExpiry := time.Now().UTC().Add(time.Duration(definition.DurationSeconds) * time.Second)
+		request := &agentv1.DeployRequest{WorkloadId: item.WorkloadID, LeaseId: item.LeaseID, Image: item.Image, Limits: &agentv1.ResourceLimits{CpuCores: definition.Requirements.Cpu, MemoryMb: definition.Requirements.RamMb, EgressMbps: workloadEgressMbps(definition)}, LeaseEnd: timestamppb.New(definitionExpiry)}
 		deployCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
 		defer cancel()
 		containerID, err := w.dispatcher.DeployAndConfirm(deployCtx, provider.RegisteredProvider, request)
@@ -212,7 +222,6 @@ func (w *Worker) processOne(ctx context.Context) error {
 			return w.retry(ctx, item, "AGENT_DEPLOY_FAILED", err)
 		}
 		if w.overlay != nil {
-			definitionExpiry := time.Now().UTC().Add(time.Duration(definition.DurationSeconds) * time.Second)
 			if err := w.overlay.Attach(ctx, item.WorkloadID, item.LeaseID, containerID, definitionExpiry); err != nil {
 				// Do not expose a running workload with a partially attached
 				// network. Stop is best effort; the worker retries this state.

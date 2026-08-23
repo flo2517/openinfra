@@ -1,6 +1,8 @@
 syntax = "proto3";
 package openinfra.agent.v1;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/openinfra/network/protocol/generated/go/agent/v1;agentv1";
 
 service ProviderAgentService {
@@ -60,6 +62,17 @@ message DeployRequest {
   string lease_id = 2;
   string image = 3;
   ResourceLimits limits = 4;
+  // ADR-028 §3: when this workload's lease authorization ends. Sourced from
+  // the same lease term the orchestrator already computes before calling
+  // Deploy (control-plane/internal/orchestrator/worker.go). Required: the
+  // Agent refuses a DeployRequest with no lease_end (see agent-executor's
+  // deployment() validation) because it would otherwise have no way to
+  // locally bound how long it is authorized to keep the workload running if
+  // it becomes disconnected from the Control Plane (ADR-028 §2/§3) -- a
+  // stricter reading than the ADR's own text, which only says the field is
+  // added, not that it is mandatory; treated as mandatory here as the more
+  // conservative interpretation.
+  google.protobuf.Timestamp lease_end = 5;
 }
 
 message ResourceLimits {

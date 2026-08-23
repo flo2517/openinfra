@@ -84,6 +84,7 @@ dependencies = [
  "bollard",
  "chrono",
  "hex",
+ "prost-types",
  "sha2",
  "tempfile",
  "thiserror",

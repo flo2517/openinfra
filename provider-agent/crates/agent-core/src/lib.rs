@@ -1,3 +1,4 @@
+pub mod disconnect;
 pub mod errors;
 pub mod identity;
 pub mod local_state;
