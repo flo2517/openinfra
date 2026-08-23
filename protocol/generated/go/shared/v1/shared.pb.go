@@ -1055,6 +1055,180 @@ func (x *EventEnvelope) GetSignature() string {
 	return ""
 }
 
+// --- Metering Summary (ADR-029 / issue #20) ---
+//
+// One workload's bounded, signed usage evidence for a single billing
+// period. Mirrors, field for field, ADR-029 §6's on-chain
+// `MeteringSummary<BlockNumber>` struct that a future `pallet-escrow`
+// (issue #21, not yet implemented) verifies inside `complete_and_payout`
+// -- with two off-chain-only additions called out below, since #21 does
+// not exist yet to coordinate byte-for-byte wire compatibility. This
+// message's own field values (not this proto encoding) are what the
+// Agent signs: see agent-api's METERING_DOMAIN and its doc comment for
+// the exact canonical byte layout, and
+// control-plane/internal/metering/signing.go for the mirrored Go
+// verification. That hand-rolled encoding, not this proto's wire form,
+// is the actual signed/hashed content -- deliberately, so the signature
+// and evidence_hash never depend on proto's marshal behavior agreeing
+// byte-for-byte across prost and protobuf-go (the same reasoning
+// agent-api already applies to SolveChallenge/MeasureBandwidth).
+type MeteringSummary struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Off-chain-only (not on ADR-029 §6's on-chain struct): identifies
+	// *which* workload this summary covers. lease_id alone is ambiguous
+	// off-chain in the general case (though today's schema happens to be
+	// 1:1); workload_id is what the Agent's local state and Control
+	// Plane's `workloads` table both key on, so it is carried explicitly
+	// rather than requiring a join to resolve.
+	WorkloadId string `protobuf:"bytes,1,opt,name=workload_id,json=workloadId,proto3" json:"workload_id,omitempty"`
+	// Matches ADR-029's LeaseId correlation key -- the same lease_id
+	// pallet-lease and this repo's `workloads.lease_id` column already
+	// use.
+	LeaseId string `protobuf:"bytes,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	// Monotonic per (provider, workload). Replay resistance: the Control
+	// Plane rejects/quarantines any sequence <= the last accepted one for
+	// this pair, never silently treats it as billable (issue #20's own
+	// acceptance criterion).
+	Sequence uint64 `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	// Unix seconds (UTC), not a chain BlockNumber -- the Agent has no
+	// block-number concept (ADR: "the Provider Agent never talks to the
+	// chain directly"). A future #21 evidence-relay path converts these to
+	// BlockNumber when constructing pallet-escrow's own on-chain struct;
+	// that conversion is #21's job, not specified here.
+	PeriodStart uint64 `protobuf:"varint,4,opt,name=period_start,json=periodStart,proto3" json:"period_start,omitempty"`
+	PeriodEnd   uint64 `protobuf:"varint,5,opt,name=period_end,json=periodEnd,proto3" json:"period_end,omitempty"`
+	// Explicit schema version (ADR-029 §1/§7): a future dimension or unit
+	// change bumps this rather than silently reinterpreting old evidence.
+	MeteringSchemaVersion uint32 `protobuf:"varint,6,opt,name=metering_schema_version,json=meteringSchemaVersion,proto3" json:"metering_schema_version,omitempty"`
+	// All four priced dimensions plus the reserved, zero-priced fifth
+	// (ADR-029 §1) -- explicit integer units, never a float, matching this
+	// wire protocol's existing no-implicit-float convention for anything
+	// that touches billing/chain.
+	CpuCoreSeconds   uint64 `protobuf:"varint,7,opt,name=cpu_core_seconds,json=cpuCoreSeconds,proto3" json:"cpu_core_seconds,omitempty"`
+	RamMbSeconds     uint64 `protobuf:"varint,8,opt,name=ram_mb_seconds,json=ramMbSeconds,proto3" json:"ram_mb_seconds,omitempty"`
+	StorageGbSeconds uint64 `protobuf:"varint,9,opt,name=storage_gb_seconds,json=storageGbSeconds,proto3" json:"storage_gb_seconds,omitempty"`
+	NetworkEgressMb  uint64 `protobuf:"varint,10,opt,name=network_egress_mb,json=networkEgressMb,proto3" json:"network_egress_mb,omitempty"`
+	NetworkIngressMb uint64 `protobuf:"varint,11,opt,name=network_ingress_mb,json=networkIngressMb,proto3" json:"network_ingress_mb,omitempty"`
+	// Reserved: priced at 0 and not charged in v1 (ADR-029 §1/§11).
+	GpuSeconds    uint64 `protobuf:"varint,12,opt,name=gpu_seconds,json=gpuSeconds,proto3" json:"gpu_seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MeteringSummary) Reset() {
+	*x = MeteringSummary{}
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MeteringSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MeteringSummary) ProtoMessage() {}
+
+func (x *MeteringSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MeteringSummary.ProtoReflect.Descriptor instead.
+func (*MeteringSummary) Descriptor() ([]byte, []int) {
+	return file_openinfra_shared_v1_shared_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *MeteringSummary) GetWorkloadId() string {
+	if x != nil {
+		return x.WorkloadId
+	}
+	return ""
+}
+
+func (x *MeteringSummary) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+func (x *MeteringSummary) GetSequence() uint64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetPeriodStart() uint64 {
+	if x != nil {
+		return x.PeriodStart
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetPeriodEnd() uint64 {
+	if x != nil {
+		return x.PeriodEnd
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetMeteringSchemaVersion() uint32 {
+	if x != nil {
+		return x.MeteringSchemaVersion
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetCpuCoreSeconds() uint64 {
+	if x != nil {
+		return x.CpuCoreSeconds
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetRamMbSeconds() uint64 {
+	if x != nil {
+		return x.RamMbSeconds
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetStorageGbSeconds() uint64 {
+	if x != nil {
+		return x.StorageGbSeconds
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetNetworkEgressMb() uint64 {
+	if x != nil {
+		return x.NetworkEgressMb
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetNetworkIngressMb() uint64 {
+	if x != nil {
+		return x.NetworkIngressMb
+	}
+	return 0
+}
+
+func (x *MeteringSummary) GetGpuSeconds() uint64 {
+	if x != nil {
+		return x.GpuSeconds
+	}
+	return 0
+}
+
 var File_openinfra_shared_v1_shared_proto protoreflect.FileDescriptor
 
 const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
@@ -1139,7 +1313,24 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x16\n" +
 	"\x06source\x18\x04 \x01(\tR\x06source\x12\x18\n" +
 	"\apayload\x18\x05 \x01(\fR\apayload\x12\x1c\n" +
-	"\tsignature\x18\x06 \x01(\tR\tsignature*\xaa\x01\n" +
+	"\tsignature\x18\x06 \x01(\tR\tsignature\"\xdc\x03\n" +
+	"\x0fMeteringSummary\x12\x1f\n" +
+	"\vworkload_id\x18\x01 \x01(\tR\n" +
+	"workloadId\x12\x19\n" +
+	"\blease_id\x18\x02 \x01(\tR\aleaseId\x12\x1a\n" +
+	"\bsequence\x18\x03 \x01(\x04R\bsequence\x12!\n" +
+	"\fperiod_start\x18\x04 \x01(\x04R\vperiodStart\x12\x1d\n" +
+	"\n" +
+	"period_end\x18\x05 \x01(\x04R\tperiodEnd\x126\n" +
+	"\x17metering_schema_version\x18\x06 \x01(\rR\x15meteringSchemaVersion\x12(\n" +
+	"\x10cpu_core_seconds\x18\a \x01(\x04R\x0ecpuCoreSeconds\x12$\n" +
+	"\x0eram_mb_seconds\x18\b \x01(\x04R\framMbSeconds\x12,\n" +
+	"\x12storage_gb_seconds\x18\t \x01(\x04R\x10storageGbSeconds\x12*\n" +
+	"\x11network_egress_mb\x18\n" +
+	" \x01(\x04R\x0fnetworkEgressMb\x12,\n" +
+	"\x12network_ingress_mb\x18\v \x01(\x04R\x10networkIngressMb\x12\x1f\n" +
+	"\vgpu_seconds\x18\f \x01(\x04R\n" +
+	"gpuSeconds*\xaa\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x17\n" +
@@ -1176,7 +1367,7 @@ func file_openinfra_shared_v1_shared_proto_rawDescGZIP() []byte {
 }
 
 var file_openinfra_shared_v1_shared_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_openinfra_shared_v1_shared_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_openinfra_shared_v1_shared_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_openinfra_shared_v1_shared_proto_goTypes = []any{
 	(NodeStatus)(0),               // 0: openinfra.shared.v1.NodeStatus
 	(WorkloadProfile)(0),          // 1: openinfra.shared.v1.WorkloadProfile
@@ -1191,7 +1382,8 @@ var file_openinfra_shared_v1_shared_proto_goTypes = []any{
 	(*WorkloadConstraints)(nil),   // 10: openinfra.shared.v1.WorkloadConstraints
 	(*Lease)(nil),                 // 11: openinfra.shared.v1.Lease
 	(*EventEnvelope)(nil),         // 12: openinfra.shared.v1.EventEnvelope
-	(*timestamppb.Timestamp)(nil), // 13: google.protobuf.Timestamp
+	(*MeteringSummary)(nil),       // 13: openinfra.shared.v1.MeteringSummary
+	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
 }
 var file_openinfra_shared_v1_shared_proto_depIdxs = []int32{
 	4,  // 0: openinfra.shared.v1.NodeIdentity.capabilities:type_name -> openinfra.shared.v1.ResourceCapability
@@ -1202,10 +1394,10 @@ var file_openinfra_shared_v1_shared_proto_depIdxs = []int32{
 	9,  // 5: openinfra.shared.v1.WorkloadDefinition.requirements:type_name -> openinfra.shared.v1.ResourceRequirements
 	10, // 6: openinfra.shared.v1.WorkloadDefinition.constraints:type_name -> openinfra.shared.v1.WorkloadConstraints
 	6,  // 7: openinfra.shared.v1.ResourceRequirements.bandwidth:type_name -> openinfra.shared.v1.Bandwidth
-	13, // 8: openinfra.shared.v1.Lease.start:type_name -> google.protobuf.Timestamp
-	13, // 9: openinfra.shared.v1.Lease.end:type_name -> google.protobuf.Timestamp
+	14, // 8: openinfra.shared.v1.Lease.start:type_name -> google.protobuf.Timestamp
+	14, // 9: openinfra.shared.v1.Lease.end:type_name -> google.protobuf.Timestamp
 	2,  // 10: openinfra.shared.v1.Lease.state:type_name -> openinfra.shared.v1.LeaseState
-	13, // 11: openinfra.shared.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
+	14, // 11: openinfra.shared.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
 	12, // [12:12] is the sub-list for method output_type
 	12, // [12:12] is the sub-list for method input_type
 	12, // [12:12] is the sub-list for extension type_name
@@ -1224,7 +1416,7 @@ func file_openinfra_shared_v1_shared_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_openinfra_shared_v1_shared_proto_rawDesc), len(file_openinfra_shared_v1_shared_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   10,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

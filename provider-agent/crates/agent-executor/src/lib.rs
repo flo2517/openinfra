@@ -2,7 +2,7 @@ mod bandwidth;
 mod rate_limit;
 
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
-use agent_api::{Executor, WorkloadStatus};
+use agent_api::{Executor, UsageSample, WorkloadStatus};
 use agent_core::local_state::{
     LocalState, LocalStateError, Reservation, WorkloadPhase, WorkloadRecord,
 };
@@ -643,6 +643,46 @@ impl Executor for DockerExecutor {
         Ok(WorkloadStatus {
             state: Self::map_observation(&observation) as i32,
             details: format!("Docker state: {}", observation.status),
+        })
+    }
+
+    /// ADR-029 §6 / issue #20. `record.lease_id` and the
+    /// sequence/period bounds (`LocalState::next_metering_period`) are
+    /// real and durable; `WorkloadNotFound` propagates unchanged so
+    /// agent-api's `executor_status_error` maps it to `NotFound`, the
+    /// same way `get_status` already does for a missing workload.
+    ///
+    /// **The five usage counters below are honest zero stubs** -- see
+    /// `UsageSample`'s own doc comment. No per-container CPU/RAM/storage
+    /// metric source exists anywhere in this codebase yet (bollard's
+    /// container stats API -- `Docker::stats` -- is not called by
+    /// `ContainerEngine`/`BollardEngine` today), and this workload's
+    /// live network byte counters (`bandwidth::read_bandwidth`) need a
+    /// container PID this method has no cheap way to obtain without a
+    /// second Docker inspect call per invocation -- deliberately left
+    /// for the real-collection follow-up issue named in the implementing
+    /// PR's description, rather than half-wiring one dimension now.
+    async fn usage_summary(
+        &self,
+        workload_id: &str,
+        now: u64,
+        max_period_seconds: u64,
+    ) -> Result<UsageSample> {
+        let record = self.state.workload(workload_id)?;
+        let period = self
+            .state
+            .next_metering_period(workload_id, now, max_period_seconds)?;
+        Ok(UsageSample {
+            lease_id: record.lease_id,
+            sequence: period.sequence,
+            period_start: period.period_start,
+            period_end: period.period_end,
+            cpu_core_seconds: 0,
+            ram_mb_seconds: 0,
+            storage_gb_seconds: 0,
+            network_egress_mb: 0,
+            network_ingress_mb: 0,
+            gpu_seconds: 0,
         })
     }
 }

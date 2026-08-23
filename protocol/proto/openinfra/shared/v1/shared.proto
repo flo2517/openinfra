@@ -149,3 +149,60 @@ message EventEnvelope {
   bytes payload = 5; // Serialized specific event model
   string signature = 6;
 }
+
+// --- Metering Summary (ADR-029 / issue #20) ---
+//
+// One workload's bounded, signed usage evidence for a single billing
+// period. Mirrors, field for field, ADR-029 §6's on-chain
+// `MeteringSummary<BlockNumber>` struct that a future `pallet-escrow`
+// (issue #21, not yet implemented) verifies inside `complete_and_payout`
+// -- with two off-chain-only additions called out below, since #21 does
+// not exist yet to coordinate byte-for-byte wire compatibility. This
+// message's own field values (not this proto encoding) are what the
+// Agent signs: see agent-api's METERING_DOMAIN and its doc comment for
+// the exact canonical byte layout, and
+// control-plane/internal/metering/signing.go for the mirrored Go
+// verification. That hand-rolled encoding, not this proto's wire form,
+// is the actual signed/hashed content -- deliberately, so the signature
+// and evidence_hash never depend on proto's marshal behavior agreeing
+// byte-for-byte across prost and protobuf-go (the same reasoning
+// agent-api already applies to SolveChallenge/MeasureBandwidth).
+message MeteringSummary {
+  // Off-chain-only (not on ADR-029 §6's on-chain struct): identifies
+  // *which* workload this summary covers. lease_id alone is ambiguous
+  // off-chain in the general case (though today's schema happens to be
+  // 1:1); workload_id is what the Agent's local state and Control
+  // Plane's `workloads` table both key on, so it is carried explicitly
+  // rather than requiring a join to resolve.
+  string workload_id = 1;
+  // Matches ADR-029's LeaseId correlation key -- the same lease_id
+  // pallet-lease and this repo's `workloads.lease_id` column already
+  // use.
+  string lease_id = 2;
+  // Monotonic per (provider, workload). Replay resistance: the Control
+  // Plane rejects/quarantines any sequence <= the last accepted one for
+  // this pair, never silently treats it as billable (issue #20's own
+  // acceptance criterion).
+  uint64 sequence = 3;
+  // Unix seconds (UTC), not a chain BlockNumber -- the Agent has no
+  // block-number concept (ADR: "the Provider Agent never talks to the
+  // chain directly"). A future #21 evidence-relay path converts these to
+  // BlockNumber when constructing pallet-escrow's own on-chain struct;
+  // that conversion is #21's job, not specified here.
+  uint64 period_start = 4;
+  uint64 period_end = 5;
+  // Explicit schema version (ADR-029 §1/§7): a future dimension or unit
+  // change bumps this rather than silently reinterpreting old evidence.
+  uint32 metering_schema_version = 6;
+  // All four priced dimensions plus the reserved, zero-priced fifth
+  // (ADR-029 §1) -- explicit integer units, never a float, matching this
+  // wire protocol's existing no-implicit-float convention for anything
+  // that touches billing/chain.
+  uint64 cpu_core_seconds = 7;
+  uint64 ram_mb_seconds = 8;
+  uint64 storage_gb_seconds = 9;
+  uint64 network_egress_mb = 10;
+  uint64 network_ingress_mb = 11;
+  // Reserved: priced at 0 and not charged in v1 (ADR-029 §1/§11).
+  uint64 gpu_seconds = 12;
+}
