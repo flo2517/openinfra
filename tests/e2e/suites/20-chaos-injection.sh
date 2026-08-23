@@ -15,20 +15,28 @@
 #   - Agent timeout      -> scenario_agent_timeout
 #   - chain delay         -> scenario_chain_delay
 #
+# Plus, per issue #139's "deeper fault injection" item:
+#   - Postgres torn (mid-flight) connection -> scenario_postgres_torn_connection,
+#     using the opt-in "chaos"-profile toxiproxy proxy
+#     (deployments/docker-compose.yml) to inject a real TCP RST into an
+#     already-established Postgres connection -- a different, more
+#     realistic failure mode than scenario_postgres_recovery's clean
+#     `docker compose stop` above.
+#
 # What is deliberately NOT attempted here (see tests/e2e/AGENTS.md): a
 # real multi-node network split (this is a single-node dev chain --
 # ADR-009 -- there is nothing to partition on the consensus side, only the
-# CP<->Agent link, which scenario_network_partition covers), and killing
-# postgres/redis mid-write to force a torn transaction (Docker's stop
-# gives the process a clean SIGTERM; forcing a torn write deterministically
-# would need fault injection inside the DB engine itself, out of scope for
-# black-box Compose manipulation).
+# CP<->Agent link, which scenario_network_partition covers). Redis's own
+# torn-connection equivalent is scoped out of this first toxiproxy pass
+# (see scenario_postgres_torn_connection's own comment for why Postgres was
+# picked first) -- a real, tracked follow-up, not a silent gap.
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 export E2E_REPO_ROOT="$repo_root"
 # shellcheck source=tests/e2e/lib/common.sh
 . "$repo_root/tests/e2e/lib/common.sh"
 
+ensure_shared_binaries
 require_stack_up postgres redis blockchain-node control-plane docker-socket-proxy provider-agent
 
 deploy_image="registry.k8s.io/pause:3.9"
@@ -64,6 +72,42 @@ wait_workload_terminal() {
   done
   echo "$state"
   return 1
+}
+
+# stop_and_release_capacity <api_key> <wid> -- unlike every other cleanup
+# in this suite (a bare `docker rm -f $container_id`, which force-removes
+# the container out from under the Agent without ever telling it), this
+# issues a real `workloadctl stop` so internal/orchestrator/worker.go's
+# STOPPING-state handler calls the Agent's StopAndConfirm and its
+# agent-executor::recover()-tracked WorkloadRecord actually transitions
+# out of a capacity-consuming WorkloadPhase (agent-core::local_state.rs).
+# Found live while determinism-testing scenario_postgres_torn_connection
+# in this session: `docker rm -f`-only cleanup (used everywhere else in
+# this suite, and in suites 10/00's cleanup-safety-net registration) never
+# frees the Agent's own OPENINFRA_AGENT_MAX_WORKLOADS reservation for that
+# workload, so repeated runs against the same long-lived default
+# single-provider stack silently exhaust it (default max 8, 2 workloads
+# per run of this scenario alone) -- after which every subsequent Deploy
+# is rejected with "maximum active workload count reached" and the
+# orchestrator's uncapped retry loop (already a known gap, see this repo's
+# CLAUDE.md) spins on it forever. That's a real, pre-existing, suite-wide
+# gap (see follow-up issue #152) affecting
+# every scenario here, not something this fix claims to close everywhere
+# -- it only keeps this scenario's own two workloads from adding to it.
+# Best-effort and bounded (a stuck stop must not make this scenario itself
+# hang): logs and moves on rather than `fail`ing if the Agent doesn't
+# confirm STOPPED/FAILED promptly, since the scenario's actual pass/fail
+# assertions are already satisfied by the time this is called.
+stop_and_release_capacity() {
+  local api_key="$1" wid="$2" waited=0 state=""
+  OPENINFRA_API_KEY="$api_key" "$E2E_BIN_DIR/workloadctl" stop "$wid" >/dev/null 2>&1 || true
+  while (( waited < 30 )); do
+    state="$(workload_state "$wid")"
+    [[ "$state" == "STOPPED" || "$state" == "FAILED" ]] && { log "workload $wid released Agent capacity (state: $state)"; return 0; }
+    sleep 3
+    waited=$((waited + 3))
+  done
+  log "workload $wid did not confirm STOPPED/FAILED within 30s (last state: $state) -- Agent capacity for it may still be leaked; continuing anyway"
 }
 
 # --- A: restart -- control-plane restarts mid-flight ----------------------
@@ -312,11 +356,124 @@ scenario_chain_delay() {
   log "PASS: chain delay -- workload $wid retried through the pause and reached RUNNING with exactly one lease"
 }
 
+# --- G: Postgres torn connection -- a real TCP RST via toxiproxy, not a
+# clean `docker compose stop` -----------------------------------------------
+# scenario_postgres_recovery above proves the system survives Postgres
+# receiving a clean shutdown signal; this proves it survives a live
+# connection being severed out from under it mid-flight (issue #139's
+# "deeper fault injection" item). Picked Postgres over Redis for this
+# first toxiproxy pass: Postgres is the authoritative off-chain store
+# (AGENTS.md) that internal/orchestrator's claim loop writes to on every
+# poll tick (1s, worker.go), so a torn connection here is squarely in the
+# path that actually matters for correctness -- Redis is a reconstructible
+# cache (scenario_redis_loss already proves a *lost* Redis recovers; a
+# torn-vs-clean distinction matters far less for a cache that's allowed to
+# just be repopulated). A Redis torn-connection scenario is a real,
+# tracked follow-up, not silently dropped.
+#
+# Scoped deliberately to not touch the always-on Compose control-plane's
+# own Postgres connection at all (see deployments/docker-compose.yml's
+# toxiproxy comment for why): this scenario starts one extra, disposable
+# `controlplane` worker process (lib/common.sh's
+# start_extra_controlplane_worker, same mechanism suite 10 uses for
+# concurrency) whose DATABASE_URL is the only thing different -- routed
+# through the "chaos"-profile toxiproxy proxy instead of straight to
+# Postgres -- so only this one worker's traffic can have a toxic injected
+# into it. The always-on Compose control-plane and every other suite in
+# this matrix are completely unaffected by this scenario running.
+scenario_postgres_torn_connection() {
+  log "=== scenario: Postgres torn connection (toxiproxy reset_peer) ==="
+  local toxi_admin="http://127.0.0.1:${TOXIPROXY_ADMIN_PORT:-8474}"
+  local toxi_pg_port="${TOXIPROXY_POSTGRES_PORT:-15432}"
+  local proxy_name="postgres-e2e-chaos"
+
+  # Lazy expansion of the global `compose` array (not a locally-scoped
+  # copy) -- see lib/common.sh's register_cleanup comment on why: this
+  # function returns long before the EXIT trap that runs this cleanup
+  # fires, so anything registered here must reference state that is still
+  # valid at that later point, which a `local` array is not.
+  register_cleanup "\"\${compose[@]}\" --profile chaos stop toxiproxy >/dev/null 2>&1 || true"
+  log "starting toxiproxy (chaos profile)"
+  "${compose[@]}" --profile chaos up -d --wait toxiproxy \
+    || fail "toxiproxy did not become ready"
+  curl -fsS "$toxi_admin/proxies/$proxy_name" >/dev/null \
+    || fail "toxiproxy proxy $proxy_name not found at $toxi_admin -- check deployments/local/toxiproxy/config.json"
+
+  local work_dir grpc_port=50130 http_port=8130 worker_pid
+  work_dir="$(mktemp -d)"
+  local proxied_database_url="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${toxi_pg_port}/${POSTGRES_DB}?sslmode=disable"
+  worker_pid="$(start_extra_controlplane_worker "$work_dir" "$grpc_port" "$http_port" "$proxied_database_url")" \
+    || fail "toxiproxy-routed extra control-plane worker failed to start"
+  log "extra control-plane worker $worker_pid routing Postgres through toxiproxy"
+
+  # internal/orchestrator's claim-scan ticks every 1s (worker.go), so a
+  # few seconds is generous room for this worker to have already used its
+  # proxied connection at least once before the toxic below lands on it.
+  sleep 5
+  kill -0 "$worker_pid" 2>/dev/null || fail "toxiproxy-routed worker $worker_pid exited before the toxic was even injected"
+
+  log "injecting reset_peer toxics (real TCP RST, both directions) on $proxy_name"
+  curl -fsS -X POST "$toxi_admin/proxies/$proxy_name/toxics" -H 'Content-Type: application/json' \
+    -d '{"name":"e2e-reset-upstream","type":"reset_peer","stream":"upstream","attributes":{"timeout":0}}' >/dev/null \
+    || fail "failed to inject upstream reset_peer toxic"
+  curl -fsS -X POST "$toxi_admin/proxies/$proxy_name/toxics" -H 'Content-Type: application/json' \
+    -d '{"name":"e2e-reset-downstream","type":"reset_peer","stream":"downstream","attributes":{"timeout":0}}' >/dev/null \
+    || fail "failed to inject downstream reset_peer toxic"
+
+  # The torn connection must not crash the worker process -- a reset mid-
+  # query is a driver-level error to retry, never a reason to exit.
+  sleep 15
+  kill -0 "$worker_pid" 2>/dev/null || fail "toxiproxy-routed worker $worker_pid crashed after its Postgres connection was reset mid-flight -- a torn connection must be recoverable, not fatal"
+  log "toxiproxy-routed worker $worker_pid survived a torn (reset_peer) Postgres connection while it was live"
+
+  # Meanwhile the rest of the system -- the always-on Compose
+  # control-plane, talking to Postgres directly and completely unaffected
+  # by this proxy -- must keep working normally: one instance's torn
+  # connection must not corrupt shared state or degrade Postgres for
+  # anyone else.
+  local api_key wid state container_id
+  api_key="$(new_tenant "e2e-chaos-postgres-torn")"
+  wid="$(submit_workload "$api_key")"
+  state="$(wait_workload_terminal "$wid" 180)" || true
+  [[ "$state" == "RUNNING" ]] || fail "workload $wid did not reach RUNNING while a torn Postgres connection was live on the toxiproxy-routed worker (last state: $state)"
+  container_id="$(psql_exec "SELECT container_id FROM workloads WHERE workload_id='$wid';" | tr -d '[:space:]')"
+  register_cleanup "docker rm -f \"$container_id\" >/dev/null 2>&1 || true"
+  stop_and_release_capacity "$api_key" "$wid"
+
+  log "heal: removing the reset_peer toxics"
+  curl -fsS -X DELETE "$toxi_admin/proxies/$proxy_name/toxics/e2e-reset-upstream" >/dev/null || true
+  curl -fsS -X DELETE "$toxi_admin/proxies/$proxy_name/toxics/e2e-reset-downstream" >/dev/null || true
+
+  # Recovery: not just "still alive" above -- after healing, this same
+  # worker must still be genuinely usable, able to win a claim and drive a
+  # workload to completion with no duplicate lease/container.
+  local api_key2 wid2 state2 lease_count2 container_id2
+  api_key2="$(new_tenant "e2e-chaos-postgres-torn-recovery")"
+  wid2="$(submit_workload "$api_key2")"
+  state2="$(wait_workload_terminal "$wid2" 180)" || true
+  [[ "$state2" == "RUNNING" ]] || fail "workload $wid2 did not reach RUNNING after healing the torn Postgres connection (last state: $state2)"
+  lease_count2="$(psql_exec "SELECT count(DISTINCT lease_id) FROM workloads WHERE workload_id='$wid2';" | tr -d '[:space:]')"
+  [[ "$lease_count2" == "1" ]] || fail "workload $wid2 ended up with $lease_count2 distinct lease_ids after the torn-connection scenario"
+  container_id2="$(psql_exec "SELECT container_id FROM workloads WHERE workload_id='$wid2';" | tr -d '[:space:]')"
+  register_cleanup "docker rm -f \"$container_id2\" >/dev/null 2>&1 || true"
+  stop_and_release_capacity "$api_key2" "$wid2"
+
+  # Explicit teardown now (same reasoning as scenario_agent_timeout's own
+  # early teardown): the next scenario (or the suite's own exit) must see
+  # this worker and the chaos-profile proxy stopped, not still running.
+  kill "$worker_pid" >/dev/null 2>&1 || true
+  wait "$worker_pid" 2>/dev/null || true
+  "${compose[@]}" --profile chaos stop toxiproxy >/dev/null 2>&1 || true
+
+  log "PASS: Postgres torn connection -- worker survived a mid-flight reset_peer TCP RST, the shared system kept working throughout, and recovery after healing left no duplicate lease/container"
+}
+
 scenario_control_plane_restart
 scenario_network_partition
 scenario_redis_loss
 scenario_postgres_recovery
 scenario_agent_timeout
 scenario_chain_delay
+scenario_postgres_torn_connection
 
 echo "E2E chaos-injection suite PASSED"

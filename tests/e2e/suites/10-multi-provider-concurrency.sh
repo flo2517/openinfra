@@ -7,34 +7,90 @@
 # rewards, or reservations" -- the other half (behavior under an
 # injected restart) lives in suite 20.
 #
-# Three extra Provider Agents run as host processes (in addition to the
-# always-on Compose provider-agent container -- four real providers
-# total), and two extra `controlplane` processes run as host processes
-# sharing the same Postgres/Redis/Substrate as the Compose control-plane
-# (three real orchestrator.Worker instances total, each with its own
-# random workerID racing the others via the version+worker_lease_until
-# optimistic lock in internal/workloadapi/postgres.go). Six workloads are
-# submitted concurrently; the suite asserts every one reaches a terminal
-# state with no duplicate lease_id/container_id and no more than one
-# worker holding a live claim on the same workload at once.
+# Three extra Provider Agents (in addition to the always-on Compose
+# provider-agent container -- four real providers total) and two extra
+# `controlplane` processes run as host processes sharing the same
+# Postgres/Redis/Substrate as the Compose control-plane (three real
+# orchestrator.Worker instances total, each with its own random workerID
+# racing the others via the version+worker_lease_until optimistic lock in
+# internal/workloadapi/postgres.go). Six workloads are submitted
+# concurrently; the suite asserts every one reaches a terminal state with
+# no duplicate lease_id/container_id and no more than one worker holding a
+# live claim on the same workload at once.
+#
+# Issue #139: when `COMPOSE_PROFILES=multi-node` (PR #135) is active --
+# detected, not assumed -- two of the three extra Provider Agents are the
+# real containerized provider-agent-2/provider-agent-3 services instead of
+# another disposable host process, exercising their actual container
+# healthchecks/networking rather than only ever the host-process path.
+# The suite falls back to three host-process agents exactly as before when
+# that profile is not enabled, so it stays runnable either way. With the
+# profile's full Network Validator committee also up
+# (networkvalidator/-2/-3), this suite additionally exercises
+# pallet-network-validator's MinQuorum=3 actually closing a round -- a
+# genuine multi-node scenario nothing else in this matrix covers, since
+# the default stack's single validator can never reach quorum on its own
+# (tests/e2e/AGENTS.md).
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 export E2E_REPO_ROOT="$repo_root"
 # shellcheck source=tests/e2e/lib/common.sh
 . "$repo_root/tests/e2e/lib/common.sh"
 
+ensure_shared_binaries
 require_stack_up postgres redis blockchain-node control-plane docker-socket-proxy provider-agent
 
 # --- multiple Provider Agents --------------------------------------------
+# multi_node_active: detected, not assumed -- `docker compose ps` only
+# lists provider-agent-2/provider-agent-3 as running services when the
+# caller actually set `COMPOSE_PROFILES=multi-node` (deployments/
+# docker-compose.yml), so this suite behaves identically to before when
+# that profile is off and nobody has to opt into anything just to run it.
+multi_node_active=""
+if "${compose[@]}" ps --status running --services 2>/dev/null | grep -qx provider-agent-2 \
+  && "${compose[@]}" ps --status running --services 2>/dev/null | grep -qx provider-agent-3; then
+  multi_node_active=1
+fi
+
 declare -a provider_ids=()
-for i in 1 2 3; do
-  port=$((50100 + i))
+if [[ -n "$multi_node_active" ]]; then
+  log "COMPOSE_PROFILES=multi-node is active: using the real containerized provider-agent-2/provider-agent-3 (PR #135) for two of this suite's extra providers"
+  for svc in provider-agent-2 provider-agent-3; do
+    # These containers self-join at startup (provider-agent/docker/
+    # entrypoint.sh) and keep heartbeating on their own -- nothing here
+    # starts or stops them, and no cleanup deletes their provider row;
+    # they are persistent stack members, not this suite's disposable
+    # fixtures, unlike the host-process agents below.
+    endpoint="https://$svc:50052"
+    provider_id="$(psql_exec "SELECT provider_id FROM providers WHERE agent_endpoint='$endpoint' ORDER BY registered_at DESC LIMIT 1;" | tr -d '[:space:]')"
+    [[ "$provider_id" =~ ^[0-9a-f]{64}$ ]] || fail "no registered provider found for $svc (agent_endpoint=$endpoint) -- has it finished joining?"
+    wait_until 30 2 "heartbeat TTL for $svc's provider $provider_id" heartbeat_ttl_positive "$provider_id" \
+      || fail "$svc's provider $provider_id has no live heartbeat"
+    provider_ids+=("$provider_id")
+    log "containerized $svc is provider $provider_id"
+  done
+  # A third, disposable host-process provider on top of the two
+  # containerized ones -- keeps this suite's total extra-provider count
+  # (3, plus the always-on compose provider-agent = 4) the same whether or
+  # not the profile is enabled, rather than silently testing fewer
+  # providers just because it happened to be on.
+  port=50103
   work_dir="$(mktemp -d)"
   provider_id="$(start_provider_agent "$work_dir" "$port")" \
-    || fail "provider agent #$i failed to join/start"
+    || fail "provider agent #3 (host process) failed to join/start"
   provider_ids+=("$provider_id")
-  log "provider agent #$i joined as $provider_id (port $port)"
-done
+  log "provider agent #3 (host process) joined as $provider_id (port $port)"
+else
+  log "COMPOSE_PROFILES=multi-node is not active -- falling back to 3 disposable host-process Provider Agents (see README.md / tests/e2e/AGENTS.md to enable the multi-node profile)"
+  for i in 1 2 3; do
+    port=$((50100 + i))
+    work_dir="$(mktemp -d)"
+    provider_id="$(start_provider_agent "$work_dir" "$port")" \
+      || fail "provider agent #$i failed to join/start"
+    provider_ids+=("$provider_id")
+    log "provider agent #$i joined as $provider_id (port $port)"
+  done
+fi
 
 # --- concurrent Control Plane workers -------------------------------------
 declare -a worker_pids=()
@@ -142,6 +198,45 @@ while IFS= read -r container_id; do
   [[ "$(docker inspect --format='{{.State.Running}}' "$container_id" 2>/dev/null)" == "true" ]] \
     || fail "container $container_id for a RUNNING workload is not actually running"
 done <<<"$container_ids_output"
+
+# --- Network Validator quorum (issue #139) --------------------------------
+# pallet-network-validator's MinQuorum is 3 (blockchain/runtime/src/
+# lib.rs); the default stack runs exactly one Network Validator, which can
+# never close a round on its own. This only runs with the full multi-node
+# committee (networkvalidator + networkvalidator-2/-3, PR #135) up --
+# nothing here starts it, matching the providers section above: detect,
+# don't require.
+if [[ -n "$multi_node_active" ]] \
+  && "${compose[@]}" ps --status running --services 2>/dev/null | grep -qx networkvalidator-2 \
+  && "${compose[@]}" ps --status running --services 2>/dev/null | grep -qx networkvalidator-3; then
+  log "full Network Validator committee is up -- checking quorum"
+  dashboard_url="${E2E_DASHBOARD_URL:-http://127.0.0.1:8080}"
+
+  health_output="$(curl -fsS "$dashboard_url/api/v1/validator/health")" \
+    || fail "validator health endpoint unreachable at $dashboard_url"
+  active_count="$(grep -oE '"active_count":[0-9]+' <<<"$health_output" | grep -oE '[0-9]+')"
+  [[ -n "$active_count" && "$active_count" -ge 3 ]] \
+    || fail "expected at least 3 active Network Validators with the multi-node profile up, got '${active_count:-<none>}': $health_output"
+  log "validator health: $active_count active validators (MinQuorum=3): $health_output"
+
+  # Any of this suite's providers works; provider_ids[0] is always
+  # populated (the containerized-or-host-process agent started first
+  # above), and every provider gets challenged independently.
+  quorum_provider_id="${provider_ids[0]}"
+  rounds_url="$dashboard_url/api/v1/validator/rounds/$quorum_provider_id"
+  # 180s at 5s: confirmed live during development that 3 independent
+  # validator processes (networkvalidator's own 3s poll interval,
+  # internal/networkvalidator/run.go) reach quorum on at least one
+  # dimension well under a minute from a cold registration -- generous
+  # room on top of that without hanging forever on a genuine regression.
+  wait_until 180 5 "a round for provider $quorum_provider_id reaches quorum (3 independent validator submissions)" \
+    bash -c "curl -fsS '$rounds_url' | grep -q '\"quorum_reached\":true'" \
+    || fail "no dimension for provider $quorum_provider_id reached quorum within the timeout -- MinQuorum=3 with $active_count active validators should eventually close a round ($rounds_url)"
+
+  log "PASS: Network Validator quorum reached for provider $quorum_provider_id ($rounds_url)"
+else
+  log "COMPOSE_PROFILES=multi-node's full Network Validator committee is not up -- skipping quorum coverage (see tests/e2e/AGENTS.md / README.md to enable it)"
+fi
 
 log "multi-provider-concurrency suite PASSED: $workload_count workloads, $distinct_providers_used providers, no duplicate leases/containers"
 echo "E2E multi-provider-concurrency suite PASSED"

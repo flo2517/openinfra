@@ -12,10 +12,17 @@ dependency is unavailable the suite fails loudly (`require_stack_up` in
 - `lib/common.sh` -- sourced, never executed. Shared fixtures/cleanup/wait
   helpers every suite uses: the cleanup stack (`register_cleanup`,
   `run_cleanups`, trapped on `EXIT`), Postgres/Redis helpers (`psql_exec`,
-  `redis_exec`), `wait_until`/`wait_service_healthy` polling helpers, shared
-  binary builds (`agent-cli`, `workloadctl`, `controlplane-admin`,
-  `controlplane`), and fixture builders (`start_provider_agent`,
-  `start_extra_controlplane_worker`).
+  `redis_exec`), `wait_until`/`wait_service_healthy` polling helpers, lazy
+  shared binary builds (`ensure_shared_binaries` -- builds `agent-cli`,
+  `workloadctl`, `controlplane-admin`, `controlplane` into `$E2E_BIN_DIR`
+  the first time a suite actually calls it, not automatically at source
+  time; `30-migrations-rollback.sh` never calls it, which is exactly what
+  keeps that suite's CI job Postgres-only with zero Rust/Go build cost --
+  see `run.sh`'s own comment on how it decides whether to pre-build once
+  for the suites it's about to run), and fixture builders
+  (`start_provider_agent`, `start_extra_controlplane_worker` -- the latter
+  takes an optional 4th `database_url_override` argument,
+  `20-chaos-injection.sh`'s torn-connection scenario's only use of it).
 - `suites/NN-name.sh` -- one independent, self-contained suite per file,
   numbered for a stable run order (`run.sh` with no arguments runs them in
   filename order). Each suite:
@@ -42,9 +49,9 @@ dependency is unavailable the suite fails loudly (`require_stack_up` in
 | Suite | Covers |
 |---|---|
 | `00-happy-path.sh` | The full target lifecycle: Join -> ACTIVE -> offer -> lease -> deploy -> observe -> stop -> reward, dashboard RBAC/tenant isolation, and a stop-replay idempotence check. |
-| `10-multi-provider-concurrency.sh` | Three extra host-run Provider Agents (plus the always-on Compose one) and two extra `controlplane` worker processes sharing one Postgres/Redis/chain, driving six workloads submitted concurrently; asserts no duplicate lease_id/container_id and that real containers back every RUNNING row. |
-| `20-chaos-injection.sh` | Six chaos scenarios against the real stack: control-plane restart, a CP<->Agent network partition, Redis loss, PostgreSQL recovery, an Agent timeout (process killed mid-deploy), and a chain delay (blockchain-node paused). Each restores the stack before the next scenario runs. Verification status: the first three (restart, network partition, Redis loss) passed cleanly, back to back, in a live run against the real stack; the fourth (PostgreSQL recovery) stalled on a post-recovery workload in one such run after ~7 minutes of continuous chaos (mTLS handshake errors against the Agent, cause not yet root-caused -- possibly this sandbox's resource limits under sustained churn rather than the scenario logic itself), so scenarios five and six were not exercised back-to-back with the rest in the same run. Cleanup was confirmed complete even on that failure (zero leaked processes, zero leaked provider rows) -- see the follow-up issue filed alongside this suite matrix. |
-| `30-migrations-rollback.sh` | `control-plane/migrations/ROLLBACK.md` is complete (a section per migration file) and correct: forward-apply -> rollback -> forward-apply again reaches the same schema, against a disposable scratch database. |
+| `10-multi-provider-concurrency.sh` | Three extra Provider Agents (plus the always-on Compose one) and two extra `controlplane` worker processes sharing one Postgres/Redis/chain, driving six workloads submitted concurrently; asserts no duplicate lease_id/container_id and that real containers back every RUNNING row. When `COMPOSE_PROFILES=multi-node` (PR #135) is detected running, two of the three extra agents are the real containerized `provider-agent-2`/`provider-agent-3` services instead of another host process, and with the full three-validator committee also up it additionally proves `pallet-network-validator`'s `MinQuorum=3` closing a real round -- both fall back to the original all-host-process behavior, and skip the quorum check, when that profile isn't enabled (issue #139). |
+| `20-chaos-injection.sh` | Seven chaos scenarios against the real stack: control-plane restart, a CP<->Agent network partition, Redis loss, PostgreSQL recovery (clean `docker compose stop`/`start`), a Postgres *torn* connection (`reset_peer` TCP RST via the opt-in `chaos`-profile toxiproxy proxy -- issue #139, a genuinely different failure mode than the clean-stop recovery scenario), an Agent timeout (process killed mid-deploy), and a chain delay (blockchain-node paused). Each restores the stack before the next scenario runs. Verification status: the first three (restart, network partition, Redis loss) passed cleanly, back to back, in a live run against the real stack; the fourth (PostgreSQL recovery) stalled on a post-recovery workload in one such run after ~7 minutes of continuous chaos (mTLS handshake errors against the Agent, cause not yet root-caused -- possibly this sandbox's resource limits under sustained churn rather than the scenario logic itself), so scenarios five and six were not exercised back-to-back with the rest in the same run. Cleanup was confirmed complete even on that failure (zero leaked processes, zero leaked provider rows) -- see the follow-up issue filed alongside this suite matrix. The Postgres-torn-connection scenario (added for issue #139) was verified independently against the real stack -- see this suite's own header comment on `scenario_postgres_torn_connection` for what was actually run. |
+| `30-migrations-rollback.sh` | `control-plane/migrations/ROLLBACK.md` is complete (a section per migration file) and correct: forward-apply -> rollback -> forward-apply again reaches the same schema, against a disposable scratch database. Postgres-only (calls neither `ensure_shared_binaries` nor anything Substrate/Provider-Agent-shaped), so it's the one suite wired into CI (`.github/workflows/ci.yml`'s `e2e-migrations` job, issue #139) -- see "What is out of scope here, and why" below for the other three suites' CI status. |
 
 ## What is out of scope here, and why
 
@@ -53,20 +60,41 @@ dependency is unavailable the suite fails loudly (`require_stack_up` in
   partition away from. `20-chaos-injection.sh`'s network-partition scenario
   covers the Control-Plane<->Agent link instead, which is the partition this
   system actually has today.
-- **Torn/mid-write database or Redis failures.** `docker compose stop`
-  sends a clean shutdown signal; forcing a genuinely torn write would need
-  fault injection inside the DB/Redis engine itself (or a proxy like
-  toxiproxy in front of it), which is a real, larger addition -- see the
-  follow-up issue filed alongside this suite matrix.
-- **CI.** None of these suites run in `.github/workflows/ci.yml`. They need
-  the full Compose stack, including a from-source Substrate node build
+- **Torn/mid-write Redis failures.** Issue #139 added a genuinely torn
+  (not clean-stop) Postgres scenario via toxiproxy
+  (`scenario_postgres_torn_connection` in `20-chaos-injection.sh` --
+  Postgres was picked first because it's the authoritative off-chain store
+  every orchestrator write actually goes through, per AGENTS.md; Redis is
+  only a reconstructible cache, per `scenario_redis_loss` above). A
+  Redis-equivalent torn-connection scenario through the same toxiproxy
+  mechanism is a real, tracked follow-up, not silently dropped.
+- **Provider Agent capacity leaked by `docker rm -f`-only cleanup.** Found
+  while determinism-testing `scenario_postgres_torn_connection`: this
+  suite's (and `10-multi-provider-concurrency.sh`'s) `register_cleanup
+  "docker rm -f $container_id ..."` pattern force-removes the container
+  without ever telling the Agent, so `OPENINFRA_AGENT_MAX_WORKLOADS`
+  (default 8) never releases that workload's slot -- repeated runs against
+  the same long-lived provider silently exhaust it. Fixed only for
+  `scenario_postgres_torn_connection`'s own two workloads
+  (`stop_and_release_capacity` in `20-chaos-injection.sh`, which issues a
+  real `workloadctl stop` first); the pre-existing scenarios and suite 10
+  still have the leak. See issue #152.
+- **CI, beyond `30-migrations-rollback.sh`.** `.github/workflows/ci.yml`'s
+  `e2e-migrations` job (issue #139) runs that one suite for real on every
+  push/PR -- it is the only suite in this directory with no Substrate/
+  Provider-Agent dependency (Postgres only, brought up the same way this
+  suite itself does: `docker compose up` against the real `postgres`
+  service, not a bare connection string -- see that job's own comments for
+  why it can't reuse the `control-plane` CI job's native `services:`
+  postgres container the same way). The other three suites still need the
+  full Compose stack, including a from-source Substrate node build
   (`blockchain`'s own CI job budgets 60 minutes for that alone), multiple
   concurrent long-lived processes, and real container restarts/network
   manipulation -- none of which fits a shared, time-boxed CI runner without
   a meaningfully larger investment (a dedicated self-hosted runner or
-  pre-baked images). `make e2e` (this directory) is the intended entry
-  point for now, same as before this restructuring; wiring a subset into CI
-  is tracked as a follow-up.
+  pre-baked images) that issue #139 judged out of scope for now. `make e2e`
+  (this directory) remains the intended entry point for the full matrix;
+  wiring more of it into CI is tracked as a further follow-up.
 - **True idempotent-replay of `SubmitWorkload` at the E2E layer.**
   `workloadctl submit` always mints a fresh `request_id`/`workload_id`, so
   replaying the *exact same* request through the CLI isn't reachable from
@@ -185,6 +213,14 @@ withdrawal tracking before retrying.
 - Copy the shape of an existing suite, not a blank file: source
   `lib/common.sh` the same way, use `register_cleanup` for every resource,
   use `wait_until`/`wait_service_healthy` instead of a bare `sleep` loop.
+- Call `ensure_shared_binaries` right after sourcing `lib/common.sh` if (and
+  only if) the suite actually uses `$E2E_BIN_DIR` (`agent-cli`,
+  `workloadctl`, `controlplane-admin`, `controlplane`) -- it is lazy, not
+  automatic, specifically so a suite with no Rust/Go build dependency (like
+  `30-migrations-rollback.sh`) doesn't have to pay for one. `run.sh`
+  figures out on its own whether to pre-build once for the suites it's
+  about to run (it greps for the call), so there is nothing else to wire up
+  on that side.
 - Never pass a shell *function* into `wait_until` (or anything else) through
   `bash -c "..."` -- a `bash -c` subshell does not inherit this shell's
   functions (`agent-cli`, `curl`, `grep`, and other external commands are
