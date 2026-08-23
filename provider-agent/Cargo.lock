@@ -37,6 +37,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "num-bigint",
  "prost",
  "prost-types",
  "rcgen",

@@ -19,12 +19,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ControlPlaneService_BeginJoin_FullMethodName       = "/openinfra.controlplane.v1.ControlPlaneService/BeginJoin"
-	ControlPlaneService_CompleteJoin_FullMethodName    = "/openinfra.controlplane.v1.ControlPlaneService/CompleteJoin"
-	ControlPlaneService_ReportHeartbeat_FullMethodName = "/openinfra.controlplane.v1.ControlPlaneService/ReportHeartbeat"
-	ControlPlaneService_SubmitWorkload_FullMethodName  = "/openinfra.controlplane.v1.ControlPlaneService/SubmitWorkload"
-	ControlPlaneService_GetWorkload_FullMethodName     = "/openinfra.controlplane.v1.ControlPlaneService/GetWorkload"
-	ControlPlaneService_StopWorkload_FullMethodName    = "/openinfra.controlplane.v1.ControlPlaneService/StopWorkload"
+	ControlPlaneService_BeginJoin_FullMethodName        = "/openinfra.controlplane.v1.ControlPlaneService/BeginJoin"
+	ControlPlaneService_CompleteJoin_FullMethodName     = "/openinfra.controlplane.v1.ControlPlaneService/CompleteJoin"
+	ControlPlaneService_ReportHeartbeat_FullMethodName  = "/openinfra.controlplane.v1.ControlPlaneService/ReportHeartbeat"
+	ControlPlaneService_RenewCertificate_FullMethodName = "/openinfra.controlplane.v1.ControlPlaneService/RenewCertificate"
+	ControlPlaneService_SubmitWorkload_FullMethodName   = "/openinfra.controlplane.v1.ControlPlaneService/SubmitWorkload"
+	ControlPlaneService_GetWorkload_FullMethodName      = "/openinfra.controlplane.v1.ControlPlaneService/GetWorkload"
+	ControlPlaneService_StopWorkload_FullMethodName     = "/openinfra.controlplane.v1.ControlPlaneService/StopWorkload"
 )
 
 // ControlPlaneServiceClient is the client API for ControlPlaneService service.
@@ -43,6 +44,15 @@ type ControlPlaneServiceClient interface {
 	// ReportHeartbeat refreshes reconstructible liveness state. Sequence numbers
 	// must increase monotonically per provider identity.
 	ReportHeartbeat(ctx context.Context, in *ReportHeartbeatRequest, opts ...grpc.CallOption) (*ReportHeartbeatResponse, error)
+	// RenewCertificate (ADR-027 §3) issues a fresh short-lived leaf
+	// certificate for a provider that already holds one, callable only over
+	// a connection currently authenticated with a still-valid,
+	// previously-issued leaf certificate -- never over the bootstrap
+	// self-signed path CompleteJoin uses for first enrollment. The Agent
+	// triggers this once 50% of its current certificate's lifetime has
+	// elapsed, giving a 12h overlap window before the old certificate
+	// actually expires.
+	RenewCertificate(ctx context.Context, in *RenewCertificateRequest, opts ...grpc.CallOption) (*RenewCertificateResponse, error)
 	// SubmitWorkload durably accepts an idempotent workload request. Acceptance
 	// does not imply that scheduling, a lease, or deployment has succeeded.
 	SubmitWorkload(ctx context.Context, in *SubmitWorkloadRequest, opts ...grpc.CallOption) (*SubmitWorkloadResponse, error)
@@ -82,6 +92,16 @@ func (c *controlPlaneServiceClient) ReportHeartbeat(ctx context.Context, in *Rep
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReportHeartbeatResponse)
 	err := c.cc.Invoke(ctx, ControlPlaneService_ReportHeartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) RenewCertificate(ctx context.Context, in *RenewCertificateRequest, opts ...grpc.CallOption) (*RenewCertificateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewCertificateResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_RenewCertificate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +154,15 @@ type ControlPlaneServiceServer interface {
 	// ReportHeartbeat refreshes reconstructible liveness state. Sequence numbers
 	// must increase monotonically per provider identity.
 	ReportHeartbeat(context.Context, *ReportHeartbeatRequest) (*ReportHeartbeatResponse, error)
+	// RenewCertificate (ADR-027 §3) issues a fresh short-lived leaf
+	// certificate for a provider that already holds one, callable only over
+	// a connection currently authenticated with a still-valid,
+	// previously-issued leaf certificate -- never over the bootstrap
+	// self-signed path CompleteJoin uses for first enrollment. The Agent
+	// triggers this once 50% of its current certificate's lifetime has
+	// elapsed, giving a 12h overlap window before the old certificate
+	// actually expires.
+	RenewCertificate(context.Context, *RenewCertificateRequest) (*RenewCertificateResponse, error)
 	// SubmitWorkload durably accepts an idempotent workload request. Acceptance
 	// does not imply that scheduling, a lease, or deployment has succeeded.
 	SubmitWorkload(context.Context, *SubmitWorkloadRequest) (*SubmitWorkloadResponse, error)
@@ -157,6 +186,9 @@ func (UnimplementedControlPlaneServiceServer) CompleteJoin(context.Context, *Com
 }
 func (UnimplementedControlPlaneServiceServer) ReportHeartbeat(context.Context, *ReportHeartbeatRequest) (*ReportHeartbeatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportHeartbeat not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) RenewCertificate(context.Context, *RenewCertificateRequest) (*RenewCertificateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RenewCertificate not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) SubmitWorkload(context.Context, *SubmitWorkloadRequest) (*SubmitWorkloadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitWorkload not implemented")
@@ -242,6 +274,24 @@ func _ControlPlaneService_ReportHeartbeat_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlaneService_RenewCertificate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewCertificateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).RenewCertificate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_RenewCertificate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).RenewCertificate(ctx, req.(*RenewCertificateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ControlPlaneService_SubmitWorkload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SubmitWorkloadRequest)
 	if err := dec(in); err != nil {
@@ -314,6 +364,10 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportHeartbeat",
 			Handler:    _ControlPlaneService_ReportHeartbeat_Handler,
+		},
+		{
+			MethodName: "RenewCertificate",
+			Handler:    _ControlPlaneService_RenewCertificate_Handler,
 		},
 		{
 			MethodName: "SubmitWorkload",
