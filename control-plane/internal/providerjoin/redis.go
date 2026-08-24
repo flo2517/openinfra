@@ -55,3 +55,45 @@ func (s *RedisHeartbeatStore) Accept(ctx context.Context, providerID, requestID 
 		return errors.New("unexpected Redis heartbeat result")
 	}
 }
+
+// renewalNonceKeyPrefix backs RedisRenewalNonceStore -- ADR-027 §3's
+// replay protection for RenewCertificate. Deliberately no expiry: unlike
+// a heartbeat (every ~15s, cheap to let lapse and restart from a fresh
+// watermark), a renewal nonce watermark exists to prevent replaying an
+// old signed renewal request indefinitely, not just within one interval.
+// This is still reconstructible, not authoritative, per AGENTS.md -- if
+// Redis is flushed, the watermark resets to zero, which only widens the
+// (already Ed25519-signature-and-serial-bound) replay window back to "any
+// nonce a legitimate provider hasn't used since the flush," never grants
+// an attacker anything it didn't already need the provider's identity key
+// and a still-valid, non-revoked, correctly-serialed connection for.
+const renewalNonceKeyPrefix = "openinfra:renewal-nonce:"
+
+var acceptRenewalNonceScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if current and tonumber(ARGV[1]) <= tonumber(current) then
+  return -1
+end
+redis.call("SET", KEYS[1], ARGV[1])
+return 1
+`)
+
+// RedisRenewalNonceStore implements RenewalNonceStore.
+type RedisRenewalNonceStore struct {
+	client redis.UniversalClient
+}
+
+func NewRedisRenewalNonceStore(client redis.UniversalClient) *RedisRenewalNonceStore {
+	return &RedisRenewalNonceStore{client: client}
+}
+
+func (s *RedisRenewalNonceStore) Accept(ctx context.Context, providerID string, nonce uint64) error {
+	result, err := acceptRenewalNonceScript.Run(ctx, s.client, []string{renewalNonceKeyPrefix + providerID}, nonce).Int64()
+	if err != nil {
+		return err
+	}
+	if result == -1 {
+		return ErrRenewalReplay
+	}
+	return nil
+}

@@ -1,4 +1,5 @@
 mod mtls;
+mod pki;
 
 use agent_api::{
     openinfra::{controlplane::v1 as controlplanev1, shared::v1 as sharedv1},
@@ -7,7 +8,7 @@ use agent_api::{
 };
 use agent_core::{
     identity::{Ed25519IdentityManager, IdentityManager},
-    local_state::LocalState,
+    local_state::{LeafCertificate, LocalState},
     AgentConfig,
 };
 use agent_executor::DockerExecutor;
@@ -101,6 +102,19 @@ async fn handle_start(dev: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
+    // ADR-027 §3: renews the persisted mTLS leaf certificate once 50% of
+    // its lifetime has elapsed, with bounded backoff on failure -- the
+    // same long-running-process shape the heartbeat loop above already
+    // uses. A no-op poll loop (not spawned conditionally) when this Agent
+    // hasn't enrolled yet or the Control Plane isn't running in ADR-027
+    // mTLS PKI mode: run_renewal_loop's first check is always "is there a
+    // persisted leaf certificate at all."
+    let renewal_config = config.clone();
+    let renewal_state = Arc::clone(&local_state);
+    let renewal_identity = Arc::clone(&identity_manager);
+    tokio::spawn(async move {
+        run_renewal_loop(renewal_config, dev, renewal_state, renewal_identity).await;
+    });
     let executor =
         Arc::new(DockerExecutor::connect(Arc::clone(&local_state), config.executor.clone()).await?);
     let (event_bus, mut events) = tokio::sync::mpsc::channel(100);
@@ -186,7 +200,46 @@ async fn handle_join(dev: bool) -> Result<()> {
     let identity = Ed25519IdentityManager::new(config.security.key_path.clone())?;
     let public_key = hex::decode(identity.get_public_key().await?)?;
     let inventory = InventoryManager::new().get_inventory(&config.executor.state_path)?;
-    let channel = connect_control_plane(&config.control_plane.endpoint, dev).await?;
+
+    // ADR-027 §2/§6 migration: TLS_CERT_FILE configured means this Agent
+    // is deliberately still on the pre-ADR-027 static-cert deployment
+    // shape (retired as the *default* by this change, but kept working
+    // per the ADR §6 migration sequencing note, not removed) -- keep
+    // using that identity for BeginJoin/CompleteJoin exactly as before
+    // this PR, and never request mTLS enrollment.
+    //
+    // A fresh deployment that leaves TLS_CERT_FILE unset (the new
+    // default: deployments/docker-compose.yml no longer sets it for
+    // provider-agent) uses the real ADR-027 flow instead: a freshly
+    // generated mTLS leaf keypair, distinct from the long-term identity
+    // key above -- its self-signed certificate is the bootstrap identity
+    // this connection presents (the Control Plane's dual-trust-basis
+    // verifier accepts it for exactly BeginJoin/CompleteJoin, granting no
+    // authorization by itself; challenge_signature below is what actually
+    // authorizes anything). In --dev plaintext mode there is no TLS
+    // handshake at all, so neither the keypair nor tls_public_key serve
+    // any purpose; enrollment is skipped entirely rather than asking a
+    // plaintext-only Control Plane for a certificate it has nowhere to
+    // bind.
+    let use_bootstrap_enrollment = !dev && env::var("TLS_CERT_FILE").is_err();
+    let bootstrap = if use_bootstrap_enrollment {
+        Some(pki::generate_leaf_keypair()?)
+    } else {
+        None
+    };
+    let bootstrap_certificate_pem = match &bootstrap {
+        Some(keypair) => Some(pki::bootstrap_certificate_pem(keypair)?),
+        None => None,
+    };
+    let channel = connect_control_plane_with_identity(
+        &config.control_plane.endpoint,
+        dev,
+        bootstrap
+            .as_ref()
+            .zip(bootstrap_certificate_pem.as_ref())
+            .map(|(keypair, cert_pem)| (cert_pem.clone(), keypair.private_key_pem.clone())),
+    )
+    .await?;
     let mut client =
         controlplanev1::control_plane_service_client::ControlPlaneServiceClient::new(channel);
 
@@ -210,6 +263,10 @@ async fn handle_join(dev: bool) -> Result<()> {
         challenge_id: challenge.challenge_id,
         challenge_signature: signature,
         capabilities: Some(resource_capability(&config, &inventory)),
+        tls_public_key: bootstrap
+            .as_ref()
+            .map(|keypair| keypair.public_key_raw.to_vec())
+            .unwrap_or_default(),
     });
     // Registration may span multiple manually sealed blocks before finality.
     complete_request.set_timeout(Duration::from_secs(30));
@@ -219,6 +276,32 @@ async fn handle_join(dev: bool) -> Result<()> {
     }
     config.agent.id = Some(joined.provider_id.clone());
     persist_config(&config)?;
+
+    // ADR-027 §2/§5: persist the issued leaf identity so heartbeat/start
+    // use it instead of any static TLS_CERT_FILE from here on, and so the
+    // renewal loop (handle_start) knows there is something to renew. Only
+    // happens when the Control Plane actually issued one (non-empty
+    // certificate_pem) -- a Control Plane not running in ADR-027 mTLS PKI
+    // mode (CA_KEY_FILE unset) leaves this empty, and the Agent keeps
+    // using its static TLS_CERT_FILE identity exactly as before, per the
+    // ADR §6 migration sequencing note.
+    if let (Some(keypair), false) = (&bootstrap, joined.certificate_pem.is_empty()) {
+        let expires_at_unix = joined
+            .certificate_expires_at
+            .as_ref()
+            .map(|timestamp| timestamp.seconds)
+            .ok_or_else(|| anyhow::anyhow!("Control Plane issued a certificate with no expiry"))?;
+        let serial = pki::leaf_certificate_serial(&joined.certificate_pem)?;
+        let state = LocalState::open(&config.executor.state_path)?;
+        state.store_leaf_certificate(&LeafCertificate {
+            private_key_pem: keypair.private_key_pem.clone(),
+            certificate_pem: joined.certificate_pem.clone(),
+            serial,
+            expires_at_unix,
+        })?;
+        info!("mTLS leaf certificate issued and persisted (ADR-027 enrollment)");
+    }
+
     info!(provider_id = %joined.provider_id, "provider joined Control Plane");
     println!("Provider ACTIVE: {}", joined.provider_id);
     Ok(())
@@ -263,7 +346,15 @@ async fn report_heartbeat_with_state(
     signed.extend_from_slice(HEARTBEAT_DOMAIN);
     payload.encode(&mut signed)?;
     let signature = identity.sign(&signed).await?;
-    let channel = connect_control_plane(&config.control_plane.endpoint, dev).await?;
+    // ADR-027 §3: present the persisted Control-Plane-issued leaf
+    // certificate once enrolled, instead of the static TLS_CERT_FILE
+    // identity every earlier Agent still falls back to.
+    let channel = connect_control_plane_with_identity(
+        &config.control_plane.endpoint,
+        dev,
+        control_plane_client_identity(state)?,
+    )
+    .await?;
     let mut client =
         controlplanev1::control_plane_service_client::ControlPlaneServiceClient::new(channel);
     let mut request = tonic::Request::new(controlplanev1::ReportHeartbeatRequest {
@@ -299,6 +390,152 @@ async fn report_heartbeat_with_state(
     info!(%provider_id, sequence, "heartbeat accepted");
     println!("Provider ACTIVE: {provider_id} (heartbeat {sequence})");
     Ok(())
+}
+
+/// ADR-027 §3's renewal timer, run as its own long-running background
+/// task for the lifetime of `handle_start` (mirroring the heartbeat
+/// loop's shape, but on its own independent cadence -- renewal happens
+/// roughly once a day, heartbeats every ~15s, and the two must not block
+/// each other). Polls every `poll_interval` for whether the persisted
+/// leaf certificate (if any) has crossed its renewal threshold
+/// (`pki::RENEWAL_OVERLAP` before `expires_at_unix`, i.e. 50% of a 24h
+/// certificate's lifetime elapsed); on a failed attempt, backs off
+/// (`pki::RENEWAL_BACKOFF_BASE` doubling to `pki::RENEWAL_BACKOFF_CAP`)
+/// before checking again, resetting to `poll_interval` after any success.
+/// Never returns -- runs for the life of the process, the same contract
+/// the heartbeat loop above already has.
+async fn run_renewal_loop(
+    config: AgentConfig,
+    dev: bool,
+    state: Arc<LocalState>,
+    identity_manager: Arc<Ed25519IdentityManager>,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(60);
+    let mut backoff = pki::RENEWAL_BACKOFF_BASE;
+    loop {
+        let leaf = match state.leaf_certificate() {
+            Ok(Some(leaf)) => leaf,
+            Ok(None) => {
+                // Not yet enrolled (or talking to a Control Plane not
+                // running in ADR-027 mTLS PKI mode) -- nothing to renew.
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            Err(error) => {
+                error!(%error, "failed to read the persisted mTLS leaf certificate");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+        };
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs() as i64,
+            Err(_) => {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+        };
+        let renew_at = leaf.expires_at_unix - pki::RENEWAL_OVERLAP.as_secs() as i64;
+        if now < renew_at {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        if now >= leaf.expires_at_unix {
+            // ADR-027 §3: "no soft grace period past NotAfter" -- once
+            // expired, this Agent can no longer open a new mTLS
+            // connection to the Control Plane at all (a hard boundary,
+            // deliberately, per the ADR). Kept logging on every poll
+            // rather than giving up the task entirely: an operator fixing
+            // connectivity (or the Agent's clock) should see renewal
+            // resume without needing a process restart.
+            error!("mTLS leaf certificate has expired without a successful renewal; the Agent cannot open new connections to the Control Plane until the operator intervenes (see ADR-027 §3 / ADR-028 disconnected mode)");
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        match attempt_renewal(&config, dev, &state, &identity_manager, &leaf).await {
+            Ok(expires_at_unix) => {
+                info!(expires_at_unix, "mTLS leaf certificate renewed");
+                backoff = pki::RENEWAL_BACKOFF_BASE;
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Err(error) => {
+                warn!(%error, backoff_secs = backoff.as_secs(), "certificate renewal attempt failed; retrying with backoff");
+                tokio::time::sleep(backoff).await;
+                backoff = pki::next_backoff(backoff);
+            }
+        }
+    }
+}
+
+/// A single ADR-027 §3 renewal attempt: signs a fresh
+/// `RenewCertificateRequest` with the long-term identity key (never the
+/// TLS key itself), calls it over a connection authenticated with
+/// `current` (the still-valid, previously issued leaf certificate --
+/// never the bootstrap path, which is reserved for `handle_join`'s first
+/// enrollment), and on success persists the new leaf identity, replacing
+/// `current`. Returns the new certificate's expiry on success.
+async fn attempt_renewal(
+    config: &AgentConfig,
+    dev: bool,
+    state: &LocalState,
+    identity_manager: &Ed25519IdentityManager,
+    current: &LeafCertificate,
+) -> Result<i64> {
+    let provider_id = config
+        .agent
+        .id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("provider is not joined; run join first"))?;
+    let new_keypair = pki::generate_leaf_keypair()?;
+    let nonce = state.next_renewal_nonce()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let timestamp_seconds: i64 = now.as_secs().try_into()?;
+    let timestamp_nanos: i32 = now.subsec_nanos().try_into()?;
+    let signed = pki::renewal_signing_payload(
+        &new_keypair.public_key_raw,
+        &current.serial,
+        timestamp_seconds,
+        timestamp_nanos,
+        nonce,
+    );
+    let signature = identity_manager.sign(&signed).await?;
+
+    let channel = connect_control_plane_with_identity(
+        &config.control_plane.endpoint,
+        dev,
+        Some((
+            current.certificate_pem.clone(),
+            current.private_key_pem.clone(),
+        )),
+    )
+    .await?;
+    let mut client =
+        controlplanev1::control_plane_service_client::ControlPlaneServiceClient::new(channel);
+    let mut request = tonic::Request::new(controlplanev1::RenewCertificateRequest {
+        request_id: Uuid::new_v4().to_string(),
+        provider_id: provider_id.clone(),
+        new_tls_public_key: new_keypair.public_key_raw.to_vec(),
+        current_certificate_serial: current.serial.clone(),
+        timestamp: Some(prost_types::Timestamp {
+            seconds: timestamp_seconds,
+            nanos: timestamp_nanos,
+        }),
+        nonce,
+        signature,
+    });
+    request.set_timeout(Duration::from_secs(15));
+    let response = client.renew_certificate(request).await?.into_inner();
+    let expires_at_unix = response
+        .certificate_expires_at
+        .as_ref()
+        .map(|timestamp| timestamp.seconds)
+        .ok_or_else(|| anyhow::anyhow!("renewed certificate response has no expiry"))?;
+    state.store_leaf_certificate(&LeafCertificate {
+        private_key_pem: new_keypair.private_key_pem,
+        certificate_pem: response.certificate_pem,
+        serial: response.certificate_serial,
+        expires_at_unix,
+    })?;
+    Ok(expires_at_unix)
 }
 
 /// ADR-025 §2: this heartbeat's `workload_bandwidth` entries.
@@ -448,14 +685,34 @@ fn persist_config(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-async fn connect_control_plane(endpoint: &str, dev: bool) -> Result<Channel> {
+/// Connects to the Control Plane. `identity_override`, when set to
+/// `(certificate_pem, private_key_pem)`, is presented as the client's
+/// mTLS identity instead of reading `TLS_CERT_FILE`/`TLS_KEY_FILE` from
+/// disk. Used for two ADR-027 cases: `handle_join`'s bootstrap self-signed
+/// certificate (§2), and the persisted Control-Plane-issued leaf
+/// certificate once one has been enrolled/renewed (§3) -- see
+/// `control_plane_client_identity`. `TLS_CA_FILE`/`TLS_SERVER_NAME` are
+/// unaffected either way: both cases still need to verify the Control
+/// Plane's own long-lived server identity against the same CA.
+async fn connect_control_plane_with_identity(
+    endpoint: &str,
+    dev: bool,
+    identity_override: Option<(String, String)>,
+) -> Result<Channel> {
     let mut connection = Endpoint::from_shared(endpoint.to_string())?
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10));
 
     if endpoint.starts_with("https://") {
-        let certificate = fs::read(env::var("TLS_CERT_FILE")?)?;
-        let private_key = fs::read(env::var("TLS_KEY_FILE")?)?;
+        let (certificate, private_key) = match identity_override {
+            Some((certificate_pem, private_key_pem)) => {
+                (certificate_pem.into_bytes(), private_key_pem.into_bytes())
+            }
+            None => (
+                fs::read(env::var("TLS_CERT_FILE")?)?,
+                fs::read(env::var("TLS_KEY_FILE")?)?,
+            ),
+        };
         let ca = fs::read(env::var("TLS_CA_FILE")?)?;
         let domain = env::var("TLS_SERVER_NAME")?;
         connection = connection.tls_config(
@@ -471,6 +728,21 @@ async fn connect_control_plane(endpoint: &str, dev: bool) -> Result<Channel> {
     }
 
     Ok(connection.connect().await?)
+}
+
+/// Resolves the mTLS client identity `report_heartbeat_with_state` and the
+/// renewal loop should present: the persisted ADR-027 leaf certificate
+/// when one exists (regardless of how close to expiry it is -- an
+/// almost-expired certificate is still valid until the Control Plane says
+/// otherwise, and the renewal loop's own job, not this function's, is to
+/// replace it before that happens), or `None` to fall back to
+/// `TLS_CERT_FILE`/`TLS_KEY_FILE`, matching every Agent that hasn't
+/// enrolled (or is talking to a Control Plane not running in ADR-027 mTLS
+/// PKI mode) unaffected.
+fn control_plane_client_identity(state: &LocalState) -> Result<Option<(String, String)>> {
+    Ok(state
+        .leaf_certificate()?
+        .map(|leaf| (leaf.certificate_pem, leaf.private_key_pem)))
 }
 
 #[tokio::main]
@@ -496,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn plaintext_endpoint_requires_dev_mode() {
-        let error = connect_control_plane("http://127.0.0.1:50051", false)
+        let error = connect_control_plane_with_identity("http://127.0.0.1:50051", false, None)
             .await
             .expect_err("plaintext must be rejected");
         assert!(error.to_string().contains("require --dev"));
@@ -504,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn plaintext_endpoint_rejects_non_loopback() {
-        let error = connect_control_plane("http://192.0.2.1:50051", true)
+        let error = connect_control_plane_with_identity("http://192.0.2.1:50051", true, None)
             .await
             .expect_err("non-loopback plaintext must be rejected");
         assert!(error.to_string().contains("loopback"));
