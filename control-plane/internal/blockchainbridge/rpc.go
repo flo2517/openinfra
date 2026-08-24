@@ -29,6 +29,23 @@ func (e *RPCError) Error() string {
 	return fmt.Sprintf("Substrate RPC error %d: %s", e.Code, e.Message)
 }
 
+// IsTemporarilyBanned reports whether err is a Substrate transaction-pool
+// "1012: Transaction is temporarily banned" rejection -- the pool already
+// has this exact extrinsic (same account, same nonce, same call bytes) on a
+// cooldown from a prior submission. Confirmed live, repeatedly (issue
+// #141): a caller whose nonce is derived from *finalized* state (as
+// Registrar.EnsureActive's is) cannot escape this by simply retrying --
+// finalized state cannot advance past a transaction that is itself what's
+// blocking finalization, so an immediate retry reproduces the identical
+// extrinsic byte-for-byte and re-triggers the same ban. Callers should wait
+// longer than their normal retry schedule before resubmitting after this
+// specific error, not shorter -- see providerjoin.Reconciler.fail's use of
+// this.
+func IsTemporarilyBanned(err error) bool {
+	var rpcErr *RPCError
+	return errors.As(err, &rpcErr) && rpcErr.Code == 1012
+}
+
 type ChainHealth struct {
 	Peers           uint64 `json:"peers"`
 	IsSyncing       bool   `json:"isSyncing"`
