@@ -1,5 +1,6 @@
 mod bandwidth;
 mod rate_limit;
+pub mod vm;
 
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
 use agent_api::{Executor, UsageSample, WorkloadStatus};
@@ -320,6 +321,12 @@ pub enum ExecutorError {
     State(#[from] LocalStateError),
     #[error("container {0} did not reach the required state")]
     StateConfirmation(String),
+    /// ADR-033 §6/§7: `max_vm_workloads == 0` (the default) -- every VM
+    /// deploy attempt is rejected with this specific, identifiable
+    /// error, never silently ignored and never conflated with an
+    /// ordinary validation failure. See `vm::VmExecutor::deploy`.
+    #[error("VM workloads are disabled on this Agent (max_vm_workloads=0)")]
+    VmDisabled,
 }
 
 pub struct DockerExecutor {
@@ -527,6 +534,8 @@ impl DockerExecutor {
                 image: request.image.clone(),
                 spec_hash,
                 container_id: None,
+                vm_handle: None,
+                runtime: agent_core::local_state::WorkloadRuntime::Container,
                 phase: WorkloadPhase::Provisioning,
                 egress_mbps: limits.egress_mbps,
                 rate_limited: false,
@@ -1218,6 +1227,8 @@ mod tests {
             image: "registry.example/image:tag".to_string(),
             spec_hash: [0u8; 32],
             container_id: None,
+            vm_handle: None,
+            runtime: agent_core::local_state::WorkloadRuntime::Container,
             phase: agent_core::local_state::WorkloadPhase::Provisioning,
             egress_mbps: 0,
             rate_limited: false,

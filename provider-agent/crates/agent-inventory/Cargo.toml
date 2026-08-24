@@ -6,3 +6,8 @@ edition = "2021"
 [dependencies]
 sysinfo = "0.30"
 anyhow = "1.0"
+# ADR-033 §7: the real KVM_GET_API_VERSION ioctl probe behind
+# virtualization_capable -- raw libc open()/ioctl()/close(), no larger
+# VMM/hypervisor crate needed for a yes/no capability check.
+libc = "0.2"
+thiserror = "1.0"

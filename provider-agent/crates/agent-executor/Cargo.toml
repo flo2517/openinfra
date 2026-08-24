@@ -26,6 +26,19 @@ hex = "0.4"
 # drift silently breaking timestamp parsing would corrupt bandwidth
 # telemetry, not just fail loudly.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# ADR-033 §2: Cloud Hypervisor's own local API is plain HTTP over a Unix
+# domain socket -- hyper + hyperlocal (already a transitive dependency of
+# this crate via bollard, which uses the identical pattern for Docker's
+# own socket) give a real, spec-conformant HTTP/1.1 client/server pair
+# without hand-rolling wire parsing. Pinned to the same hyper version
+# bollard already resolves.
+hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
+hyperlocal = "0.8"
+serde_json = "1.0"
+# ADR-033 §4: HTTPS fetch for qcow2 boot images, digest-verified before
+# use (image.rs). rustls-tls (not the system OpenSSL/native-tls backend)
+# to avoid a new native TLS library dependency in the Agent's build.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
