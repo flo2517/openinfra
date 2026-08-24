@@ -22,6 +22,7 @@ config.yaml
 data/
 deployments/local/certs/
 deployments/local/chain/
+deployments/local/validators/
 **/postgres-data/
 **/redis-data/
 **/chains/

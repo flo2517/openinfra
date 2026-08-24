@@ -54,6 +54,20 @@ The Control Plane applies versioned PostgreSQL migrations at every startup. `mak
 
 Open `http://127.0.0.1:8080/dashboard/` after `make dev-up`. The dashboard polls a same-origin, read-only endpoint and reports registered providers, fresh heartbeats, available CPU/RAM, and finalized-chain progress. PostgreSQL status and Redis liveness are deliberately shown separately. The local Compose port is bound to loopback; non-local exposure requires a separate authenticated TLS deployment.
 
+### Multi-provider, multi-validator local network
+
+By default `make dev-up` runs one Provider Agent and one Network Validator (`cmd/networkvalidator`, ADR-011/013's continuous challenge loop). `deployments/scripts/generate-dev-certs.sh` always generates the certificates and Ed25519 signing keys for two more of each, and `deployments/scripts/bootstrap-network-validators.sh` (run automatically at the end of `make dev-up`) funds and registers whichever Network Validators are actually running from the Control Plane's own endowed bridge account -- so scaling up costs one environment variable, not a re-run of key generation:
+
+```bash
+COMPOSE_PROFILES=multi-node make dev-up
+```
+
+This starts `provider-agent-2`/`provider-agent-3` (host ports `50053`/`50054` by default, override with `PROVIDER_AGENT_2_PORT`/`PROVIDER_AGENT_3_PORT`) and `networkvalidator-2`/`networkvalidator-3` alongside the default instances -- three providers to schedule across, and three validators, which matters because `pallet-network-validator`'s `MinQuorum` is 3 (`blockchain/runtime/src/lib.rs`): a round cannot actually *close* into a reputation update with fewer than three active validators submitting evidence, no matter how many are registered. The default single-validator stack can register, go `ACTIVE`, and submit evidence, but will never see a round close on its own.
+
+All provider instances share the one `docker-socket-proxy` and the one agent-server certificate (its SAN already covers every instance's hostname) -- local dev's purpose here is observable multi-provider scheduling and multi-validator committee behavior, not real resource or trust isolation between simulated providers, which would need per-provider Docker isolation this MVP does not have regardless of instance count. See `deployments/provider-agent.md` and `deployments/network-validator.md` for the full trust-boundary notes, including how to add a fourth or later instance by extending the pattern in `deployments/docker-compose.yml` and the `for validator in ...` / SAN list in `generate-dev-certs.sh`.
+
+`COMPOSE_PROFILES` is read directly by the `docker compose` CLI, so no Makefile flag is needed; pass the same `COMPOSE_PROFILES=multi-node` prefix to `make dev-down`/`make dev-clean` too, so they tear down the profile's extra services instead of leaving them running. Re-running `make dev-up` (with or without the profile) is safe: certificate/key generation and validator registration are both idempotent.
+
 ## MVP Limits
 
 The blockchain node uses deterministic three-second manual sealing and a sudo bridge account for local development only; neither is production governance or consensus. Provider Join recovery currently occurs when the Agent retries `CompleteJoin`; an autonomous outbox reconciler remains future hardening. The MVP targets Docker workloads, CPU/RAM/storage inventory, Provider Join, heartbeats, leases, availability, reputation, and Reward Points. Kubernetes, direct Agent-to-chain calls, GPU scheduling, token economics, and production-grade decentralization are out of scope unless approved by ADR. WireGuard is scheduled after lease-gated workload execution.
