@@ -19,10 +19,25 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     spec_name: alloc::borrow::Cow::Borrowed("openinfra-runtime"),
     impl_name: alloc::borrow::Cow::Borrowed("openinfra-runtime"),
     authoring_version: 1,
-    spec_version: 3,
+    // ADR-032: bumped 3 -> 4 alongside transaction_version below, for
+    // ChargeTip's new TxExtension element -- matching this repo's
+    // established practice (#37's spec_version-only bump for the
+    // manual-sealing -> Aura/GRANDPA move) of bumping spec_version for a
+    // consensus/transaction-validity-affecting change, not for every
+    // pallet addition (six pallets landed since #37 without a further
+    // bump).
+    spec_version: 4,
     impl_version: 1,
     apis: RUNTIME_API_VERSIONS,
-    transaction_version: 1,
+    // ADR-032: bumped 1 -> 2. transaction_version signals a change to the
+    // SCALE-decoded shape of an extrinsic's `extra` field, independent of
+    // whether any pallet call/dispatch logic changed -- exactly what
+    // appending ChargeTip as TxExtension's tenth element does. This field
+    // has never changed since genesis before this: control-plane's
+    // TestSupportedTransactionVersionMatchesRuntime (added alongside this
+    // change) is this repo's first drift guard for it, closing the same
+    // gap issue #123 found for spec_version alone.
+    transaction_version: 2,
     system_version: 1,
 };
 
@@ -31,6 +46,84 @@ pub fn native_version() -> NativeVersion {
     NativeVersion {
         runtime_version: VERSION,
         can_author_with: Default::default(),
+    }
+}
+
+/// Carries an optional tip, used only to influence transaction-pool
+/// `priority` (ADR-032). Deducts nothing from any account -- this chain has
+/// no fee mechanism (`pallet-transaction-payment` is deliberately not a
+/// dependency: its `prepare` step unconditionally withdraws
+/// `inclusion_fee + tip` from every signed extrinsic, a real behavioral
+/// change this MVP chain has no reason to take on for a problem that
+/// doesn't require it), and this extension does not introduce one -- see
+/// `charge_tip_never_touches_any_balance` below.
+///
+/// Mechanism: nothing in this runtime's `TxExtension` tuple sets a nonzero
+/// `priority` on the `ValidTransaction` it returns today (every extension
+/// ahead of `ChargeTip` affects only `requires`/`provides`/weight), so a
+/// direct `priority = tip + 1` is the entire signal needed -- no
+/// `max_tx_per_block`-scaled formula (the shape
+/// `pallet-transaction-payment::get_priority` uses to stay meaningful
+/// alongside *other* weight-based-fee priority contributions) is solving a
+/// problem this chain has. The `+ 1` tie-breaks two zero-tip transactions
+/// ahead of the bare-default priority of 0, matching
+/// `pallet-transaction-payment`'s own convention for the same reason. The
+/// transaction pool's own displacement rule
+/// (`sc-transaction-pool::graph::ready::replace_previous`) rejects an
+/// incoming transaction with `old_priority >= tx.priority` and otherwise
+/// evicts the old one -- so any resubmission with a strictly higher tip
+/// than whatever it collides with wins the slot outright.
+///
+/// `ChargeTip` is appended as the tenth and last `TxExtension` element,
+/// after `WeightReclaim`: every extension ahead of it keeps encoding
+/// exactly the bytes it does today, so existing `extra` bytes are a strict
+/// prefix of the new `extra` bytes, not reshuffled.
+#[derive(Encode, Decode, DecodeWithMemTracking, Clone, Eq, PartialEq, TypeInfo, Debug)]
+pub struct ChargeTip(#[codec(compact)] pub u64);
+
+impl TransactionExtension<RuntimeCall> for ChargeTip {
+    const IDENTIFIER: &'static str = "ChargeTip";
+    type Implicit = ();
+    type Val = ();
+    type Pre = ();
+
+    fn weight(&self, _call: &RuntimeCall) -> Weight {
+        // Pure function of `self`, no storage reads.
+        Weight::zero()
+    }
+
+    fn validate(
+        &self,
+        origin: RuntimeOrigin,
+        _call: &RuntimeCall,
+        _info: &DispatchInfoOf<RuntimeCall>,
+        _len: usize,
+        _self_implicit: Self::Implicit,
+        _inherited_implication: &impl Encode,
+        _source: TransactionSource,
+    ) -> ValidateResult<Self::Val, RuntimeCall> {
+        let priority = self.0.saturating_add(1);
+        Ok((
+            ValidTransaction {
+                priority,
+                ..Default::default()
+            },
+            (),
+            origin,
+        ))
+    }
+
+    fn prepare(
+        self,
+        _val: Self::Val,
+        _origin: &RuntimeOrigin,
+        _call: &RuntimeCall,
+        _info: &DispatchInfoOf<RuntimeCall>,
+        _len: usize,
+    ) -> Result<Self::Pre, TransactionValidityError> {
+        // Never withdraws, reserves, or otherwise touches any account's
+        // balance -- see charge_tip_never_touches_any_balance below.
+        Ok(())
     }
 }
 
@@ -44,6 +137,7 @@ type TxExtension = (
     frame_system::CheckNonce<Runtime>,
     frame_system::CheckWeight<Runtime>,
     frame_system::WeightReclaim<Runtime>,
+    ChargeTip,
 );
 
 #[frame_construct_runtime]
@@ -598,6 +692,7 @@ pub mod interface {
 mod tests {
     use super::*;
     use codec::Encode;
+    use polkadot_sdk::sp_runtime::traits::TxBaseImplication;
 
     #[test]
     fn development_genesis_builds() {
@@ -728,5 +823,147 @@ mod tests {
             call: alloc::boxed::Box::new(registration),
         });
         assert_eq!(&sudo.encode()[..4], &[2, 0, 10, 2]);
+    }
+
+    /// A ChargeTip-shaped `register_provider_for` call, origin, and
+    /// `DispatchInfo` -- shared by the ADR-032 tests below since none of
+    /// them care which call ChargeTip is wrapping (it never inspects the
+    /// call at all).
+    fn charge_tip_test_fixture(
+        seed: u8,
+    ) -> (
+        RuntimeCall,
+        RuntimeOrigin,
+        frame_support::dispatch::DispatchInfo,
+    ) {
+        let provider = interface::AccountId::from([seed; 32]);
+        let call =
+            RuntimeCall::ProviderRegistry(pallet_provider_registry::Call::register_provider_for {
+                provider: provider.clone(),
+                public_key: [seed; 32],
+            });
+        let origin = RuntimeOrigin::signed(provider);
+        let info = frame_support::dispatch::DispatchInfo::default();
+        (call, origin, info)
+    }
+
+    /// ADR-032 Sec2: `priority = tip + 1` is the entire mechanism, for any
+    /// tip value -- including the saturating edge at `u64::MAX`, which must
+    /// not panic or wrap.
+    #[test]
+    fn charge_tip_sets_priority_to_tip_plus_one_for_a_range_of_values() {
+        let (call, origin, info) = charge_tip_test_fixture(1);
+
+        for tip in [0_u64, 1, 5, 42, 100, u64::MAX - 1, u64::MAX] {
+            let (validity, _, _) = ChargeTip(tip)
+                .validate(
+                    origin.clone(),
+                    &call,
+                    &info,
+                    0,
+                    (),
+                    &TxBaseImplication(&call),
+                    TransactionSource::External,
+                )
+                .expect("ChargeTip::validate must never itself reject a transaction");
+            let expected_priority = tip.saturating_add(1);
+            assert_eq!(
+                validity.priority, expected_priority,
+                "tip {tip} should produce priority {expected_priority}, got {}",
+                validity.priority
+            );
+        }
+    }
+
+    /// No regression for the common case (ADR-032 non-goals): a zero tip
+    /// -- what every call site used before this ADR, and every call site
+    /// except a bounded 1014 retry uses after it -- must validate exactly
+    /// like `ValidTransaction::default()` in every field except `priority`
+    /// (1, not 0): unbounded longevity, empty requires/provides, and
+    /// `propagate: true` are all untouched by ChargeTip.
+    #[test]
+    fn charge_tip_zero_matches_the_pre_adr_032_default_case_except_priority() {
+        let (call, origin, info) = charge_tip_test_fixture(2);
+
+        let (validity, _, _) = ChargeTip(0)
+            .validate(
+                origin,
+                &call,
+                &info,
+                0,
+                (),
+                &TxBaseImplication(&call),
+                TransactionSource::External,
+            )
+            .expect("ChargeTip::validate must never itself reject a transaction");
+
+        let expected = ValidTransaction {
+            priority: 1,
+            ..Default::default()
+        };
+        assert_eq!(validity, expected);
+    }
+
+    /// ADR-032 Sec1/non-goals' central guarantee, verified end to end
+    /// against the real runtime wiring (not a mock): `ChargeTip` never
+    /// withdraws, reserves, or otherwise touches any account's balance --
+    /// this chain has no fee mechanism, and this extension does not
+    /// introduce one. Both `validate` and `prepare` are exercised (the two
+    /// pipeline stages that run before/at dispatch), with a nonzero tip
+    /// specifically, since a zero tip touching no balance would be the
+    /// least interesting case to prove.
+    #[test]
+    fn charge_tip_never_touches_any_balance() {
+        use polkadot_sdk::sp_runtime::BuildStorage;
+
+        let account = interface::AccountId::from([3_u8; 32]);
+        let mut storage = frame_system::GenesisConfig::<Runtime>::default()
+            .build_storage()
+            .unwrap();
+        pallet_balances::GenesisConfig::<Runtime> {
+            balances: vec![(account.clone(), 1_000_000)],
+            ..Default::default()
+        }
+        .assimilate_storage(&mut storage)
+        .unwrap();
+        let mut ext: sp_io::TestExternalities = storage.into();
+
+        ext.execute_with(|| {
+            System::set_block_number(1);
+
+            let free_before = Balances::free_balance(&account);
+            let reserved_before = Balances::reserved_balance(&account);
+            assert_eq!(free_before, 1_000_000);
+            assert_eq!(reserved_before, 0);
+
+            let (call, origin, info) = charge_tip_test_fixture(3);
+            let tip = ChargeTip(50);
+
+            let (_, val, origin) = tip
+                .clone()
+                .validate(
+                    origin,
+                    &call,
+                    &info,
+                    0,
+                    (),
+                    &TxBaseImplication(&call),
+                    TransactionSource::External,
+                )
+                .expect("ChargeTip::validate must never itself reject a transaction");
+            tip.prepare(val, &origin, &call, &info, 0)
+                .expect("ChargeTip::prepare must never itself reject a transaction");
+
+            assert_eq!(
+                Balances::free_balance(&account),
+                free_before,
+                "ChargeTip must never change free_balance"
+            );
+            assert_eq!(
+                Balances::reserved_balance(&account),
+                reserved_before,
+                "ChargeTip must never change reserved_balance"
+            );
+        });
     }
 }
