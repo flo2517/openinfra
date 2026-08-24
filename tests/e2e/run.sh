@@ -29,10 +29,9 @@ test -f "$repo_root/.env" || {
 export E2E_REPO_ROOT="$repo_root"
 # shellcheck source=tests/e2e/lib/common.sh
 . "$repo_root/tests/e2e/lib/common.sh"
-# common.sh already built $E2E_BIN_DIR and registered its own cleanup;
-# E2E_BIN_DIR/E2E_RUN_ID are exported so every suite subprocess below
-# reuses the same binaries and run-unique resource-naming suffix instead
-# of rebuilding/re-deriving its own.
+# E2E_RUN_ID is exported by common.sh so every suite subprocess below
+# shares the same run-unique resource-naming suffix instead of deriving
+# its own.
 
 # Per-suite wall-clock budget. Generous on purpose (real on-chain finality
 # waits, real container restarts) -- see each suite's own header comment
@@ -56,6 +55,20 @@ else
 fi
 
 [[ ${#suite_paths[@]} -gt 0 ]] || { echo "run.sh: no suites found in $suites_dir" >&2; exit 1; }
+
+# Pre-build $E2E_BIN_DIR's shared binaries (agent-cli, workloadctl,
+# controlplane-admin, controlplane) exactly once here, up front, only if
+# at least one selected suite will actually need them (grep for the call
+# each such suite makes right after sourcing common.sh, rather than
+# hardcoding suite names -- correct automatically as suites are added).
+# Without this, a run that mixes e.g. 00-happy-path and
+# 30-migrations-rollback would otherwise build once per suite that needs
+# them (each is a separate `bash` subprocess, per this file's own header
+# comment); a run of only bin-free suites (30-migrations-rollback alone,
+# as CI's e2e-migrations job does) now pays zero build cost at all.
+if grep -q '^ensure_shared_binaries$' "${suite_paths[@]}" 2>/dev/null; then
+  ensure_shared_binaries
+fi
 
 echo "== E2E run $E2E_RUN_ID: ${#suite_paths[@]} suite(s), ${suite_timeout}s each =="
 

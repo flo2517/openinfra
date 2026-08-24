@@ -11,6 +11,7 @@ export E2E_REPO_ROOT="$repo_root"
 # shellcheck source=tests/e2e/lib/common.sh
 . "$repo_root/tests/e2e/lib/common.sh"
 
+ensure_shared_binaries
 require_stack_up postgres redis blockchain-node control-plane docker-socket-proxy provider-agent
 
 test_dir="$(mktemp -d)"

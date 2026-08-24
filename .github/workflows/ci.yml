@@ -149,6 +149,47 @@ jobs:
         working-directory: protocol/generated/go
         run: go test ./...
 
+  e2e-migrations:
+    name: E2E / Migrations Rollback
+    runs-on: ubuntu-24.04
+    # Real end-to-end run of tests/e2e/suites/30-migrations-rollback.sh
+    # (issue #139): the one suite in tests/e2e/ with no Substrate/Provider
+    # Agent dependency -- Postgres only, no `cargo build`/`go build` (see
+    # tests/e2e/lib/common.sh's ensure_shared_binaries and this suite's own
+    # header comment) -- so it fits a shared, time-boxed runner the way the
+    # rest of tests/e2e/ (a from-source Substrate node build alone budgets
+    # 60 minutes in the blockchain job below, plus multiple long-lived
+    # concurrent processes and real container/network chaos) does not.
+    # tests/e2e/AGENTS.md and the root CLAUDE.md's "Known gaps" note both
+    # still apply to every other suite here -- only this one is wired in.
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Prepare .env
+        # The placeholder values in .env.example are exactly what this
+        # suite needs (POSTGRES_USER/DB/PASSWORD read by
+        # deployments/docker-compose.yml and tests/e2e/lib/common.sh) --
+        # same "safe local-development placeholders only" data `make
+        # dev-up` itself relies on, nothing CI-specific to generate.
+        run: cp .env.example .env
+      - name: Start Postgres via the real Compose stack
+        # This suite deliberately drives against the actual Compose
+        # `postgres` service via `docker compose exec` (tests/e2e/AGENTS.md:
+        # "no suite here mocks a dependency"), not a bare connection
+        # string -- so it needs `docker compose up`, not GitHub Actions'
+        # native `services:` postgres container the way the control-plane
+        # job above uses (that job connects directly over a mapped port;
+        # this suite has no such connection string to give it). `postgres`
+        # has no `depends_on` in docker-compose.yml, so this starts nothing
+        # else.
+        run: docker compose --env-file .env -f deployments/docker-compose.yml up -d --wait postgres
+      - name: Run 30-migrations-rollback
+        run: tests/e2e/run.sh 30-migrations-rollback
+      - name: Tear down Compose stack
+        if: always()
+        run: docker compose --env-file .env -f deployments/docker-compose.yml down --volumes --remove-orphans
+
   blockchain:
     name: Blockchain / Substrate
     runs-on: ubuntu-24.04

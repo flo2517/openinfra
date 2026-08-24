@@ -37,6 +37,56 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # toxiproxy: opt-in ("chaos" profile, never started by `make dev-up`'s
+  # default stack or the "multi-node" profile) proxy fault-injection tool
+  # in front of Postgres, added for issue #139's "deeper fault injection"
+  # item. tests/e2e/suites/20-chaos-injection.sh's existing Redis-loss/
+  # PostgreSQL-recovery scenarios use `docker compose stop`/`start` --
+  # a clean shutdown signal Postgres itself gets to react to gracefully.
+  # toxiproxy instead severs an already-established TCP connection out
+  # from under a live client (a "reset_peer" toxic, real TCP RST) while
+  # Postgres itself stays fully up and serving every other connection
+  # normally -- a genuinely different, more realistic failure mode
+  # (mid-write/mid-transaction on the wire) than any black-box Compose
+  # start/stop/pause can produce. Scoped down deliberately from "proxy
+  # every default-stack Postgres connection through this" (would add a
+  # permanent extra hop + new hard dependency to `make dev-up` for every
+  # developer, not just this one chaos scenario) to: a profile-gated,
+  # nothing-else-touches-it proxy that only
+  # tests/e2e/suites/20-chaos-injection.sh's own disposable extra
+  # control-plane worker (lib/common.sh's start_extra_controlplane_worker,
+  # given this proxy's host-mapped port as its DATABASE_URL) ever talks
+  # through -- see that suite for the full scenario. Preloads its one
+  # proxy from local/toxiproxy/config.json (committed, no secrets, mirrors
+  # local/blockchain-testnet/'s precedent for a committed static config
+  # file under deployments/local/) rather than the HTTP admin API, so the
+  # proxy exists the instant the container is healthy -- no separate
+  # "wait then configure" step for the suite to race against. No
+  # healthcheck: the upstream image is a single static binary with no
+  # shell/curl/wget to probe itself with (unlike control-plane's
+  # grpc-health-probe or blockchain-node's curl); `docker compose up
+  # --wait` falls back to "container is running" without one, same as
+  # wait_service_healthy's own documented fallback in lib/common.sh.
+  toxiproxy:
+    profiles: ["chaos"]
+    image: ghcr.io/shopify/toxiproxy:2.9.0@sha256:b44c283298cea49e2defaba1b3028783798346f2a926684e3a345fd8441af3b8
+    command:
+      - -host=0.0.0.0
+      - -config=/etc/toxiproxy/config.json
+    volumes:
+      - ./local/toxiproxy/config.json:/etc/toxiproxy/config.json:ro
+    ports:
+      - "127.0.0.1:${TOXIPROXY_ADMIN_PORT:-8474}:8474"
+      - "127.0.0.1:${TOXIPROXY_POSTGRES_PORT:-15432}:15432"
+    networks:
+      - default
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
   blockchain-node:
     build:
       context: ../blockchain

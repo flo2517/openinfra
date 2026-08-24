@@ -218,15 +218,29 @@ build_shared_binaries() {
   go build -C "$repo_root/control-plane" -o "$bin_dir/controlplane" ./cmd/controlplane
 }
 
-# Built once by run.sh (the dispatcher) into $E2E_BIN_DIR and reused by
-# every suite; a suite run standalone (./suites/00-happy-path.sh) builds
-# its own into a throwaway dir instead so it stays runnable in isolation.
-if [[ -z "${E2E_BIN_DIR:-}" ]]; then
-  E2E_BIN_DIR="$(mktemp -d)"
-  export E2E_BIN_DIR
-  register_cleanup "rm -rf \"$E2E_BIN_DIR\""
-  build_shared_binaries "$E2E_BIN_DIR"
-fi
+# ensure_shared_binaries -- lazy, not automatic at source time. Building
+# agent-cli (a full `cargo build`) plus three `go build`s is real, non-free
+# cost that a suite with no Provider Agent / Control Plane binary
+# dependency (30-migrations-rollback: Postgres and a bash/awk ROLLBACK.md
+# parser only) has no reason to pay -- this is exactly the "no Substrate/
+# provider-agent dependency, only Postgres" property issue #139's CI-wiring
+# item relies on to keep that one suite cheap enough for a shared runner.
+# Every suite that actually touches $E2E_BIN_DIR (00/10/20, today) must
+# call this itself, right after sourcing this file. Built once by run.sh
+# (the dispatcher) into $E2E_BIN_DIR and reused by every suite it spawns
+# that needs it (run.sh pre-builds only when at least one requested suite
+# calls this, see run.sh); a suite run standalone
+# (./suites/00-happy-path.sh) builds its own into a throwaway dir instead
+# so it stays runnable in isolation. Idempotent: a second call in the same
+# process (or a child that inherited $E2E_BIN_DIR from run.sh) is a no-op.
+ensure_shared_binaries() {
+  if [[ -z "${E2E_BIN_DIR:-}" ]]; then
+    E2E_BIN_DIR="$(mktemp -d)"
+    export E2E_BIN_DIR
+    register_cleanup "rm -rf \"$E2E_BIN_DIR\""
+    build_shared_binaries "$E2E_BIN_DIR"
+  fi
+}
 
 # agent_client_tls_env / agent_server_tls_env echo `export` lines for the
 # mTLS identities suites need; sourced with `eval "$(agent_client_tls_env)"`
@@ -374,7 +388,8 @@ start_provider_agent() {
   echo "$provider_id"
 }
 
-# start_extra_controlplane_worker <work_dir> <grpc_port> <http_port> --
+# start_extra_controlplane_worker <work_dir> <grpc_port> <http_port>
+#   [database_url_override] --
 # runs a second (third, ...) `controlplane` process against the same
 # Postgres/Redis/Substrate the Compose control-plane service already uses,
 # the same way a horizontally-scaled deployment would: each instance gets
@@ -384,8 +399,16 @@ start_provider_agent() {
 # internal/workloadapi/postgres.go. Not reachable by any client in this
 # suite -- it exists purely to prove concurrent claiming is safe, so its
 # own gRPC/HTTP ports are never dialed.
+#
+# database_url_override (optional, 4th arg): when set, used as this one
+# instance's DATABASE_URL instead of the normal compose-network
+# connection string -- 20-chaos-injection.sh's torn-connection scenario
+# passes a connection string through the "chaos"-profile toxiproxy proxy
+# (deployments/docker-compose.yml) so this specific worker's Postgres
+# traffic, and only this worker's, can have a real TCP RST injected into
+# it mid-flight without touching the default stack's own control-plane.
 start_extra_controlplane_worker() {
-  local work_dir="$1" grpc_port="$2" http_port="$3"
+  local work_dir="$1" grpc_port="$2" http_port="$3" database_url_override="${4:-}"
   mkdir -p "$work_dir"
   register_cleanup "rm -rf \"$work_dir\""
   # See start_provider_agent's comment on why this is `exec`'d: without
@@ -393,6 +416,9 @@ start_extra_controlplane_worker() {
   # controlplane itself, and `kill $!` would leak it as an orphan.
   (
     export DATABASE_URL REDIS_URL SUBSTRATE_RPC_URL
+    if [[ -n "$database_url_override" ]]; then
+      export DATABASE_URL="$database_url_override"
+    fi
     export SUBSTRATE_SIGNER_KEY_FILE="$repo_root/deployments/local/certs/bridge-key.pem"
     export CONTROL_PLANE_GRPC_ADDR="127.0.0.1:${grpc_port}"
     export CONTROL_PLANE_HTTP_ADDR="127.0.0.1:${http_port}"

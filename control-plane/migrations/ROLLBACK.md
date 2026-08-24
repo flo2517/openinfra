@@ -28,6 +28,19 @@ Run manually (against a real database, never against `$POSTGRES_DB` in the
 Compose dev stack unless you mean it) with `psql -f`, applying each block in
 the order below, top to bottom.
 
+## 000016_metering_evidence_and_invoices.sql
+Drop order matters here (no `CASCADE`): `metering_disputes` references
+`invoice_lines`, which references `metering_evidence`; the other two new
+tables (`metering_evidence_rejections`, `metering_cursors`) have no FK to
+any other table this migration added.
+```sql
+DROP TABLE IF EXISTS metering_disputes;
+DROP TABLE IF EXISTS invoice_lines;
+DROP TABLE IF EXISTS metering_evidence_rejections;
+DROP TABLE IF EXISTS metering_evidence;
+DROP TABLE IF EXISTS metering_cursors;
+```
+
 ## 000015_workload_bandwidth_usage.sql
 ```sql
 DROP TABLE IF EXISTS workload_bandwidth_usage;
