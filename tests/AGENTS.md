@@ -7,3 +7,7 @@ This directory contains integration tests, E2E scenarios, and non-sensitive fixt
 - Cover failure scenarios: invalid identity, stale heartbeat, unavailable dependency, duplicate command, retry exhaustion, partial deployment, and restart recovery.
 - Verify idempotence and authoritative state transitions; never accept a mocked success as E2E evidence.
 - Fixtures must contain synthetic credentials only and clearly identify them as non-production.
+
+See `e2e/AGENTS.md` for the E2E suite matrix's own layout (`lib/common.sh`
+shared helpers, `suites/*.sh` independent scenarios, `run.sh` dispatcher) and
+what is deliberately out of scope for black-box Compose manipulation.

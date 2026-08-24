@@ -68,6 +68,36 @@ pub trait ContainerEngine: Send + Sync {
     async fn rate_limit(&self, container_id: &str, egress_mbps: i32) -> Result<(), ExecutorError>;
 }
 
+// Issue #17: `Docker::connect_with_local_defaults()` on Unix is a thin
+// wrapper over `connect_with_unix_defaults()` (bollard's own
+// docker.rs), which *only* honors `DOCKER_HOST` when it starts with the
+// literal `unix://` scheme -- for any other value (a `tcp://` URL, most
+// notably: deployments/docker-compose.yml sets
+// `DOCKER_HOST=tcp://docker-socket-proxy:2375` for the containerized
+// Agent, which never has a real Docker socket mounted, by design) it
+// silently falls back to bollard's hardcoded default *unix socket path*
+// and ignores `DOCKER_HOST` entirely. That path does not exist in this
+// container, so every real Docker operation (create/start/inspect/...)
+// fails with "error trying to connect: No such file or directory" --
+// confirmed live, 100% reproducing, while developing tests/e2e/: the
+// always-on Compose provider-agent could never actually deploy a
+// workload through docker-socket-proxy. `connect_with_local_defaults()`
+// was never wrong for a host-run Agent (no `DOCKER_HOST`, the real local
+// socket at the default path) -- only for the container's TCP case,
+// which this dispatches to `connect_with_http_defaults()`
+// (bollard.rs's own doc comment: "sourced from the DOCKER_HOST
+// environment variable") instead.
+fn connect_docker() -> Result<Docker, bollard::errors::Error> {
+    let uses_tcp = std::env::var("DOCKER_HOST")
+        .map(|host| host.starts_with("tcp://") || host.starts_with("http://"))
+        .unwrap_or(false);
+    if uses_tcp {
+        Docker::connect_with_http_defaults()
+    } else {
+        Docker::connect_with_local_defaults()
+    }
+}
+
 pub struct BollardEngine {
     docker: Docker,
     rate_limiter: RateLimiter,
@@ -76,8 +106,7 @@ pub struct BollardEngine {
 impl BollardEngine {
     pub fn connect() -> Result<Self, ExecutorError> {
         Ok(Self {
-            docker: Docker::connect_with_local_defaults()
-                .map_err(|error| ExecutorError::Engine(error.to_string()))?,
+            docker: connect_docker().map_err(|error| ExecutorError::Engine(error.to_string()))?,
             rate_limiter: RateLimiter::new(Arc::new(SystemCommandRunner)),
         })
     }
@@ -628,6 +657,17 @@ impl Executor for DockerExecutor {
         if observation.running {
             return Err(ExecutorError::StateConfirmation(container_id).into());
         }
+        // Issue #17: this used to end at the inspect() above, leaving a
+        // stopped-but-never-removed container on the host forever -- a
+        // real, unbounded resource leak (confirmed live: an E2E stop
+        // never observed the container actually disappear, no matter how
+        // long it waited) with no user-visible signal that anything was
+        // wrong, since WorkloadPhase::Stopped/capacity accounting never
+        // depended on the container object still existing. Removing it
+        // here is the same idempotent, force-remove call deploy()'s own
+        // persistence-failure cleanup path already uses (see `remove`'s
+        // call site above in this file).
+        self.engine.remove(&container_id).await?;
         record.phase = WorkloadPhase::Stopped;
         self.state.store_workload(&record)?;
         info!(%workload_id, %container_id, "Docker confirmed workload stopped");
@@ -636,9 +676,47 @@ impl Executor for DockerExecutor {
 
     async fn get_status(&self, workload_id: &str) -> Result<WorkloadStatus> {
         let record = self.state.workload(workload_id)?;
-        let container_id = record.container_id.ok_or_else(|| {
-            ExecutorError::StateConfirmation(format!("workload {workload_id} has no container"))
-        })?;
+        if record.phase == WorkloadPhase::Stopped {
+            // Issue #17: checked before ever touching container_id/
+            // inspect(). stop() now removes the container (see its own
+            // doc comment) but does not clear the now-stale
+            // container_id off the record -- inspecting it here would
+            // 404 ("No such container"), which propagated as a hard
+            // error (same failure shape as the container_id==None case
+            // below) and left control-plane's StopAndConfirm confirming
+            // a stop that had, in fact, already fully succeeded,
+            // retrying forever. STATE_COMPLETED is exactly what
+            // StopAndConfirm (control-plane/internal/agentmanager/
+            // client.go) already waits for.
+            return Ok(WorkloadStatus {
+                state: State::Completed as i32,
+                details: "stopped".to_string(),
+            });
+        }
+        let Some(container_id) = record.container_id else {
+            // Issue #17: this used to be a hard error
+            // (ExecutorError::StateConfirmation, mapped by agent-api's
+            // executor_status_error to a gRPC Internal status). A record
+            // that exists locally but has no container yet is not an
+            // error to report status for -- it is the normal, if
+            // narrow, state between deploy()'s workload reservation and
+            // its call to engine.create() (including the state a failed
+            // first create() attempt leaves behind forever, since deploy()
+            // returns before ever setting container_id on failure).
+            // internal/orchestrator/worker.go's DEPLOYING reconciliation
+            // path (GetRunningWorkload) treats a non-NotFound error as
+            // "unknown, retry the status check again" and -- confirmed
+            // live, repeatedly -- never falls through to attempt a fresh
+            // Deploy, permanently stranding the workload after any
+            // transient first-attempt failure. Reporting STATE_DEPLOYING
+            // here instead is both accurate (the workload genuinely is
+            // still mid-deploy, not lost) and lets that same client code
+            // path already handles the false/nil result cleanly.
+            return Ok(WorkloadStatus {
+                state: State::Deploying as i32,
+                details: "no container yet".to_string(),
+            });
+        };
         let observation = self.engine.inspect(&container_id).await?;
         Ok(WorkloadStatus {
             state: Self::map_observation(&observation) as i32,
@@ -698,6 +776,7 @@ mod tests {
         created: StdMutex<Vec<ContainerSpec>>,
         started: StdMutex<Vec<String>>,
         stopped: StdMutex<Vec<String>>,
+        removed: StdMutex<Vec<String>>,
         observations: StdMutex<HashMap<String, ContainerObservation>>,
         // ADR-025 §2: per-container_id canned bandwidth outcome -- `Ok`
         // for a configured reading, `Err` (or simply absent) to exercise
@@ -773,7 +852,11 @@ mod tests {
                 .ok_or_else(|| ExecutorError::Engine("container not found".to_string()))
         }
 
-        async fn remove(&self, _container_id: &str) -> Result<(), ExecutorError> {
+        async fn remove(&self, container_id: &str) -> Result<(), ExecutorError> {
+            self.removed
+                .lock()
+                .expect("removed lock")
+                .push(container_id.to_string());
             Ok(())
         }
 
@@ -897,12 +980,83 @@ mod tests {
         executor.stop(&request.workload_id).await.expect("stop");
         assert_eq!(
             engine.stopped.lock().expect("stopped lock").as_slice(),
-            &[container_id]
+            std::slice::from_ref(&container_id)
+        );
+        // Issue #17: Stop must not just mark the workload Stopped, it
+        // must actually remove the container -- confirmed live that this
+        // previously never happened, leaking a stopped container behind
+        // every workload forever.
+        assert_eq!(
+            engine.removed.lock().expect("removed lock").as_slice(),
+            &[container_id],
+            "stop() must remove the container, not just stop it"
         );
         executor
             .stop(&request.workload_id)
             .await
             .expect("idempotent stop");
+        // A second stop() on an already-Stopped workload short-circuits
+        // before touching the engine at all (see the `record.phase ==
+        // WorkloadPhase::Stopped` early return) -- remove() must not be
+        // called a second time for the same container.
+        assert_eq!(engine.removed.lock().expect("removed lock").len(), 1);
+        // Issue #17: get_status() after stop() must report COMPLETED
+        // (what control-plane's StopAndConfirm actually waits for), not
+        // error trying to inspect the now-removed container_id still on
+        // the record -- confirmed live: this previously 404'd ("No such
+        // container") and control-plane retried StopAndConfirm forever
+        // even though the stop had already fully succeeded.
+        let status = executor
+            .get_status(&request.workload_id)
+            .await
+            .expect("get_status after stop must not error");
+        assert_eq!(status.state, State::Completed as i32);
+    }
+
+    #[tokio::test]
+    async fn get_status_reports_deploying_not_an_error_for_a_record_with_no_container_yet() {
+        // Issue #17: get_status() used to return a hard error here
+        // (mapped by agent-api to a gRPC Internal status, not NotFound),
+        // for the entirely normal case of a workload record that exists
+        // locally but has no container yet -- the state deploy() leaves
+        // behind forever if its own engine.create() call ever fails once
+        // (a transient Docker connection error, for example). Confirmed
+        // live: control-plane's orchestrator treats any non-NotFound
+        // status-check error as "unknown, retry the check again" and
+        // never re-attempts Deploy, permanently stranding the workload.
+        // Reporting STATE_DEPLOYING instead lets that same reconciliation
+        // path treat it as an ordinary "not running yet" and retry
+        // Deploy again, the same way it already does for STATE_CREATED/
+        // STATE_PENDING/STATE_DEPLOYING responses from a real container.
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let workload_id = Uuid::new_v4().to_string();
+        let candidate = agent_core::local_state::WorkloadRecord {
+            workload_id: workload_id.clone(),
+            lease_id: Uuid::new_v4().to_string(),
+            image: "registry.example/image:tag".to_string(),
+            spec_hash: [0u8; 32],
+            container_id: None,
+            phase: agent_core::local_state::WorkloadPhase::Provisioning,
+            egress_mbps: 0,
+            rate_limited: false,
+        };
+        // reserve_workload (not store_workload -- that requires an
+        // existing row) is deploy()'s own first step: reserve the
+        // capacity slot and persist the record *before* ever calling
+        // engine.create(), which is exactly what leaves a container-less
+        // record behind if create() then fails.
+        executor
+            .state
+            .reserve_workload(&candidate, 1)
+            .expect("reserve a container-less record");
+
+        let status = executor
+            .get_status(&workload_id)
+            .await
+            .expect("get_status must not error for a record with no container yet");
+        assert_eq!(status.state, State::Deploying as i32);
     }
 
     #[tokio::test]
@@ -1306,15 +1460,16 @@ mod tests {
             .iter()
             .any(|value| value == "ALL"));
         executor.stop(&request.workload_id).await.expect("stop");
-        docker
-            .remove_container(
-                &container_id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .expect("remove container");
+        // Issue #17: stop() now removes the container itself (it used to
+        // stop but never remove -- a confirmed real leak), so there is no
+        // longer a leftover container here for this test to clean up
+        // manually. Assert that removal instead of redundantly (and, as
+        // of this fix, incorrectly -- the container is already gone)
+        // calling remove_container again.
+        let removed = docker.inspect_container(&container_id, None).await;
+        assert!(
+            removed.is_err(),
+            "container {container_id} should have been removed by stop(), but inspect still found it"
+        );
     }
 }
