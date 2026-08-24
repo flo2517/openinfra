@@ -23,6 +23,13 @@ enum NodeStatus {
   NODE_STATUS_OFFLINE = 3;
   NODE_STATUS_DRAINING = 4;
   NODE_STATUS_MAINTENANCE = 5;
+  // ADR-027 §4: set only by the operator `controlplane-admin
+  // revoke-provider` subcommand, never by the provider itself. Excluded
+  // from scheduling by the same `providers.status = ACTIVE` filters every
+  // other non-ACTIVE status already uses (agentmanager.ListActive), and
+  // additionally cuts mTLS connectivity via the Redis-backed revocation
+  // set (internal/pki) -- see the ADR for the full mechanism.
+  NODE_STATUS_REVOKED = 6;
 }
 
 // --- Resource Capability ---
