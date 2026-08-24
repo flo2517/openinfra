@@ -43,6 +43,17 @@ message ResourceCapability {
   GPUCapability gpu = 7;
   Bandwidth bandwidth = 8;
   string zone = 9;
+  // ADR-033 §7: whether this provider passed the Agent's fail-closed
+  // KVM_GET_API_VERSION probe (provider-agent/crates/agent-inventory's
+  // kvm.rs) and can therefore run VM-backed workloads. Additive,
+  // proto3-default-false: any Agent binary that predates this field (or
+  // that ran the probe and got a negative/inconclusive result) simply
+  // never sets it, which is exactly the fail-closed behavior wanted --
+  // "unset" and "explicitly false" are indistinguishable on the wire on
+  // purpose, matching how ADR-025 already treats an unset Bandwidth as
+  // zero capacity for that dimension. The scheduler must never offer a
+  // VM workload to a provider that hasn't explicitly reported this true.
+  bool virtualization_capable = 10;
 }
 
 message GPUCapability {
