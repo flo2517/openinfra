@@ -2,11 +2,13 @@
 
 ## Status
 
-Proposed. Written by Claude Code, autonomously, in response to issue #120, following the same
-convention established by ADR-016/018/025/026/027/028/029: this is a proposal, not yet reviewed.
-It becomes Accepted only after the repository owner reviews a summary of this ADR's decisions and
-their reasoning and confirms acceptance in an interactive session. Nothing here is implemented by
-this ADR itself.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #120, and held as Proposed
+per the convention established by ADR-016/018/025/026/027/028/029. Nothing here is implemented yet
+by this ADR itself; issue #120 is unblocked by this acceptance and now carries the implementation
+work.
 
 ## Context
 
