@@ -724,6 +724,10 @@ fn resource_capability(
         storage_available_gb: inventory.available_storage_gb,
         bandwidth,
         zone: config.agent.zone.clone(),
+        // ADR-033 §7: sourced straight from the same fail-closed
+        // KVM_GET_API_VERSION probe InventoryManager::get_inventory just
+        // ran -- never separately re-derived or defaulted true here.
+        virtualization_capable: inventory.virtualization_capable,
         ..Default::default()
     }
 }

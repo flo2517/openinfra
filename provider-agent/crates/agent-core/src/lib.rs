@@ -74,6 +74,64 @@ pub struct ExecutorSettings {
     /// one of the four quotas with no local check before being handed to
     /// `tc`.
     pub max_egress_mbps: i32,
+    /// ADR-033 §6/§7: the VM-workload ceiling, independent of
+    /// `max_workloads` -- VMs carry meaningfully heavier per-instance
+    /// overhead (a full guest kernel and its own memory footprint before
+    /// any workload runs inside it) than a shared-kernel container, so
+    /// reusing `max_workloads` for both would misrepresent real host
+    /// capacity, per the ADR's own reasoning. **Defaults to 0**: VM
+    /// workloads are disabled unless an operator explicitly configures a
+    /// nonzero value, matching the ADR's "off by default even on
+    /// KVM-capable hardware" rollout posture (§7) -- a 0 here must cause
+    /// every VM deploy attempt to be rejected explicitly, never silently
+    /// ignored (see `VmExecutor::deploy`).
+    #[serde(default)]
+    pub max_vm_workloads: usize,
+    /// Policy ceiling on a VM workload's declared vcpu count, the same
+    /// defense-in-depth role `max_cpu_cores` plays for Docker workloads.
+    #[serde(default = "default_max_vm_vcpus")]
+    pub max_vm_vcpus: u32,
+    /// Policy ceiling on a VM workload's declared memory, MB -- the
+    /// VM-side equivalent of `max_memory_mb`.
+    #[serde(default = "default_max_vm_memory_mb")]
+    pub max_vm_memory_mb: i64,
+    /// ADR-033 §4: where fetched, digest-verified qcow2 images are cached
+    /// content-addressed (keyed by their pinned SHA-256 digest) so a
+    /// repeated deploy of the same digest never re-fetches -- the VM
+    /// analog of `state_path`'s durable-local-storage convention.
+    #[serde(default = "default_vm_image_cache_dir")]
+    pub vm_image_cache_dir: PathBuf,
+    /// The `cloud-hypervisor` binary this Agent spawns per VM (ADR-033
+    /// §2: a subprocess per VM, driven over its local Unix-socket API --
+    /// no libvirt, no shared daemon). A bare command name resolves via
+    /// `PATH`, matching how `tc`/`SystemCommandRunner` are already
+    /// invoked without a hardcoded absolute path.
+    #[serde(default = "default_cloud_hypervisor_binary")]
+    pub cloud_hypervisor_binary: PathBuf,
+    /// Directory holding each running VM's Cloud Hypervisor API Unix
+    /// socket -- one file per VM, named after its workload_id.
+    #[serde(default = "default_vm_sockets_dir")]
+    pub vm_sockets_dir: PathBuf,
+}
+
+fn default_max_vm_vcpus() -> u32 {
+    8
+}
+
+fn default_max_vm_memory_mb() -> i64 {
+    16_384
+}
+
+fn default_vm_image_cache_dir() -> PathBuf {
+    PathBuf::from(".openinfra-state/vm-images")
+}
+
+fn default_cloud_hypervisor_binary() -> PathBuf {
+    PathBuf::from("cloud-hypervisor")
+}
+
+fn default_vm_sockets_dir() -> PathBuf {
+    PathBuf::from(".openinfra-state/vm-sockets")
 }
 
 impl Default for ExecutorSettings {
@@ -85,6 +143,14 @@ impl Default for ExecutorSettings {
             max_memory_mb: 16_384,
             pids_limit: 128,
             max_egress_mbps: 10_000,
+            // ADR-033 §7: VM support is off by default, full stop --
+            // even on hardware that would otherwise pass the KVM probe.
+            max_vm_workloads: 0,
+            max_vm_vcpus: default_max_vm_vcpus(),
+            max_vm_memory_mb: default_max_vm_memory_mb(),
+            vm_image_cache_dir: default_vm_image_cache_dir(),
+            cloud_hypervisor_binary: default_cloud_hypervisor_binary(),
+            vm_sockets_dir: default_vm_sockets_dir(),
         }
     }
 }
