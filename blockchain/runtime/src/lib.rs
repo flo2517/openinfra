@@ -146,6 +146,12 @@ parameter_types! {
     // -- a repeated upheld dispute compounds rather than one governance
     // call zeroing a provider's reliability score at once.
     pub const EscrowReliabilityPenaltyBps: u16 = 1_000;
+    // ADR-030 Sec4: compile-time hard cap on the governed FeeBasisPoints
+    // rate -- 2,000 bps (20%). Generous room for governance to adjust the
+    // rate for years of plausible commission-style pricing without a
+    // runtime upgrade, while hard-blocking any single set_fee_basis_points
+    // call from reaching anything close to confiscatory without one.
+    pub const EscrowMaxFeeBasisPoints: u16 = 2_000;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -418,11 +424,15 @@ impl pallet_escrow::Config for Runtime {
     type DisputeOrigin = frame_system::EnsureRoot<Self::AccountId>;
     // Sec10: emergency circuit breaker.
     type PauseOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    // ADR-030 Sec3: governs set_fee_basis_points/set_treasury_account,
+    // the same EnsureRoot surface as DisputeOrigin/PauseOrigin above.
+    type FeeGovernanceOrigin = frame_system::EnsureRoot<Self::AccountId>;
     type RefundWindow = EscrowRefundWindow;
     type DisputeWindow = EscrowDisputeWindow;
     type MaxMeteringPeriodSeconds = EscrowMaxMeteringPeriod;
     type MinEscrowAmount = MinEscrowAmount;
     type ReliabilityPenaltyBps = EscrowReliabilityPenaltyBps;
+    type MaxFeeBasisPoints = EscrowMaxFeeBasisPoints;
     type WeightInfo = ();
 }
 
