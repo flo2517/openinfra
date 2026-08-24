@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 )
@@ -256,18 +255,8 @@ func (r *Registrar) SubmitSudo(ctx context.Context, call []byte) error {
 	if err != nil {
 		return err
 	}
-	extrinsic, hash, err := r.signSudo(call, nonce, version, genesis)
-	if err != nil {
-		return err
-	}
-	submitted, err := r.rpc.SubmitExtrinsic(ctx, "0x"+hex.EncodeToString(extrinsic))
-	if err != nil {
-		return err
-	}
-	if submitted != "0x"+hex.EncodeToString(hash[:]) {
-		return errors.New("Substrate returned an unexpected extrinsic hash")
-	}
-	return nil
+	_, err = r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, call...), nonce, version, genesis)
+	return err
 }
 
 // SubmitDirect signs and submits an arbitrary call with this Registrar's
@@ -301,7 +290,8 @@ func (r *Registrar) SubmitDirect(ctx context.Context, call []byte) error {
 	if err != nil {
 		return err
 	}
-	return r.submitSigned(ctx, call, nonce, version, genesis)
+	_, err = r.submitSigned(ctx, call, nonce, version, genesis)
+	return err
 }
 
 // ValidatorRecord mirrors pallet_network_validator::pallet::ValidatorRecord.

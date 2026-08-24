@@ -78,13 +78,16 @@ func (f *fakeChain) dispatch(method string, params json.RawMessage) (any, error)
 	defer f.mu.Unlock()
 	switch method {
 	case "state_getRuntimeVersion":
-		// specVersion 3, not 2: the real runtime (blockchain/runtime/src/lib.rs)
-		// has been spec_version 3 since #37; blockchainbridge's
-		// supportedSpecVersion guard was stale at 2 until it was corrected
-		// alongside this fixture (see registrar.go), and this fake chain's
-		// value needs to stay in sync with that guard for the fake to model
-		// a real, accepted chain response rather than a rejected one.
-		return map[string]any{"specVersion": 3, "transactionVersion": 1}, nil
+		// specVersion 4, transactionVersion 2, not 3/1: ADR-032 appended
+		// ChargeTip as TxExtension's tenth element and bumped both fields
+		// in blockchain/runtime/src/lib.rs accordingly; blockchainbridge's
+		// supportedSpecVersion/supportedTransactionVersion guards were
+		// updated in the same change (see registrar.go), and this fake
+		// chain's values need to stay in sync with those guards for the
+		// fake to model a real, accepted chain response rather than a
+		// rejected one -- exactly the same reasoning that already applied
+		// to the specVersion-3-not-2 fix for #37.
+		return map[string]any{"specVersion": 4, "transactionVersion": 2}, nil
 	case "chain_getBlockHash":
 		return fixedHashHex, nil
 	case "chain_getFinalizedHead":
@@ -120,11 +123,15 @@ func (f *fakeChain) dispatch(method string, params json.RawMessage) (any, error)
 		if err != nil {
 			return nil, err
 		}
-		// Fixed body shape for this test's single-signer, nonce-always-0
-		// scenario (documented in the package test file): a 2-byte
-		// compact length prefix, then [0x84,0]+account(32)+[0]+sig(64)+
-		// extra(2), then the call itself.
-		const fixedHeaderLen = 2 + 32 + 1 + 64 + 2
+		// Fixed body shape for this test's single-signer, nonce-always-0,
+		// tip-always-0 scenario (documented in the package test file): a
+		// 2-byte compact length prefix, then [0x84,0]+account(32)+[0]+
+		// sig(64)+extra(3), then the call itself. extra is 3 bytes, not
+		// 2: era(1) ++ compact(nonce=0, 1 byte) ++ compact(tip=0, 1 byte)
+		// -- ADR-032 appended ChargeTip's Compact<u64> tip as a third
+		// extra field, one byte here since every call in this test signs
+		// with tip 0.
+		const fixedHeaderLen = 2 + 32 + 1 + 64 + 3
 		if len(extrinsic) < 2+fixedHeaderLen {
 			return nil, fmt.Errorf("fakeChain: extrinsic too short (%d bytes)", len(extrinsic))
 		}
