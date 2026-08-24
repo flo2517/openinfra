@@ -46,6 +46,21 @@ func IsTemporarilyBanned(err error) bool {
 	return errors.As(err, &rpcErr) && rpcErr.Code == 1012
 }
 
+// IsPriorityTooLow reports whether err is a Substrate transaction-pool
+// "1014: Priority is too low" rejection (ADR-032) -- a different extrinsic
+// already occupies the same (account, nonce) `provides` tag in the pool,
+// and the incoming one's `priority` is not strictly greater than what it
+// would displace. This is a genuinely different pool mechanism from 1012
+// (IsTemporarilyBanned above): 1012 means the pool has this *exact*
+// extrinsic on a cooldown, so retrying cannot help no matter what; 1014
+// means a resubmission with a strictly higher ChargeTip-derived priority
+// can win the slot outright. See Registrar.submitSigned's bounded tip-bump
+// retry, which is triggered by this predicate and this predicate only.
+func IsPriorityTooLow(err error) bool {
+	var rpcErr *RPCError
+	return errors.As(err, &rpcErr) && rpcErr.Code == 1014
+}
+
 type ChainHealth struct {
 	Peers           uint64 `json:"peers"`
 	IsSyncing       bool   `json:"isSyncing"`

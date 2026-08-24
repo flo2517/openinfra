@@ -74,7 +74,8 @@ func (r *Registrar) AnnounceOfferFor(ctx context.Context, provider [32]byte, off
 	inner = append(inner, storage...)
 	inner = append(inner, encodeBoundedBytes(offer.Capabilities)...)
 
-	return r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis)
+	_, err = r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis)
+	return err
 }
 
 // RemoveOfferFor withdraws provider's offer via remove_offer_for. Same
@@ -103,7 +104,8 @@ func (r *Registrar) RemoveOfferFor(ctx context.Context, provider [32]byte) error
 	inner := []byte{resourceMarketPalletIndex, removeOfferForCallIndex}
 	inner = append(inner, provider[:]...)
 
-	return r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis)
+	_, err = r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis)
+	return err
 }
 
 // FinalizedOffer reads pallet-resource-market's Offers map at blockHash

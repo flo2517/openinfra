@@ -18,33 +18,42 @@ import (
 )
 
 const (
-	// supportedSpecVersion is 3, not 2: #37 (commit d9d8df6, "add local
-	// Aura GRANDPA testnet") bumped runtime/src/lib.rs's spec_version
-	// from 2 to 3 for the move off manual sealing but never updated this
-	// guard, so every on-chain registrar call (EnsureActive, lease
-	// finalization, Network Validator registration) unconditionally
-	// failed with "unsupported runtime version spec=3 transaction=1"
-	// against any post-#37 node -- caught only by actually running the
-	// join -> deploy path end to end (issue #117), not by any unit test:
-	// nothing here mocks a real spec_version. The runtime's own
-	// bridge_call_indices_remain_stable_in_spec_version_three test
-	// (blockchain/runtime/src/lib.rs) confirms the pallet/call indices
-	// below did not change across that bump, so this version number is
-	// the only thing that needed correcting.
+	// supportedSpecVersion is 4, not 3, and supportedTransactionVersion is
+	// 2, not 1: ADR-032 appends ChargeTip as the tenth element of
+	// TxExtension (blockchain/runtime/src/lib.rs), which changes every
+	// extrinsic's SCALE-decoded `extra` shape -- exactly what
+	// transaction_version exists to signal, independent of any pallet
+	// dispatch logic changing; spec_version is bumped alongside it,
+	// matching this repo's established practice (#37's spec_version-only
+	// bump for the manual-sealing -> Aura/GRANDPA move).
 	//
-	// TestSupportedSpecVersionMatchesRuntime (specversion_drift_test.go,
-	// this package) reads blockchain/runtime/src/lib.rs's real
-	// spec_version and fails if it no longer matches this constant, so a
-	// future bump that forgets to update this line is caught here
-	// instead of only surfacing in a live e2e run (issue #123). This test
-	// reads a file outside the Go module, which go test's result cache
-	// has no visibility into -- `make test-control-plane` and CI both
+	// Both history and precedent for why these constants are
+	// hand-maintained copies of the runtime's real VERSION, not derived
+	// from it: #37 (commit d9d8df6, "add local Aura GRANDPA testnet")
+	// bumped spec_version from 2 to 3 for the move off manual sealing but
+	// never updated this guard, so every on-chain registrar call
+	// (EnsureActive, lease finalization, Network Validator registration)
+	// unconditionally failed with "unsupported runtime version spec=3
+	// transaction=1" against any post-#37 node -- caught only by actually
+	// running the join -> deploy path end to end (issue #117), not by any
+	// unit test: nothing here mocks a real spec_version.
+	//
+	// TestSupportedSpecVersionMatchesRuntime and
+	// TestSupportedTransactionVersionMatchesRuntime (specversion_drift_test.go,
+	// this package) read blockchain/runtime/src/lib.rs's real VERSION
+	// literal and fail if either no longer matches its constant here, so a
+	// future bump that forgets to update one of these two lines is caught
+	// here instead of only surfacing in a live e2e run (issue #123's exact
+	// failure mode -- transaction_version had no equivalent guard until
+	// ADR-032, since it had never changed since genesis before this). Both
+	// tests read a file outside the Go module, which go test's result
+	// cache has no visibility into -- `make test-control-plane` and CI both
 	// run with -count=1 for exactly this reason, so a stale cached PASS
 	// can't hide a real drift. Running `go test ./...` directly (bypassing
 	// both) does not get that guarantee. If you're changing one side,
 	// check the other.
-	supportedSpecVersion        = 3
-	supportedTransactionVersion = 1
+	supportedSpecVersion        = 4
+	supportedTransactionVersion = 2
 	runtimeExtrinsicVersion     = 4
 	sudoPalletIndex             = 2
 	sudoCallIndex               = 0
@@ -60,6 +69,27 @@ const (
 	statusRegistered            = 0
 	statusVerified              = 1
 	statusActive                = 2
+
+	// maxTipBumpAttempts and maxTip bound ADR-032 Sec4's tip-bump retry
+	// policy inside submitSigned: on a confirmed 1014 ("Priority is too
+	// low") rejection, retry the same logical call with a strictly
+	// increasing ChargeTip tip -- 1, 2, 4, doubling each attempt, matching
+	// this codebase's existing exponential-backoff style
+	// (providerjoin.Reconciler, orchestrator.Worker) -- for up to
+	// maxTipBumpAttempts resubmissions before giving up and returning the
+	// error to the caller. maxTip is NOT a spend/exposure cap the way
+	// ADR-030's MaxFeeBasisPoints is: ChargeTip never withdraws, reserves,
+	// or burns any account's balance (verified by the runtime's own
+	// charge_tip_never_touches_any_balance test), so there is nothing to
+	// bound the exposure of -- maxTip exists only to keep retry state small
+	// and predictable. Exhausting maxTipBumpAttempts without success is not
+	// a replacement for #157's MaxBackoff safety net: submitSigned simply
+	// returns the last error, letting the caller's own bounded-retry loop
+	// (providerjoin.Reconciler's backoff, orchestrator.Worker's
+	// RetryPolicy, resourcemarket's MaxWithdrawAttempts) take over exactly
+	// as it does today, including its own unchanged 1012 -> MaxBackoff jump.
+	maxTipBumpAttempts = 3
+	maxTip             = uint64(100)
 )
 
 type Registrar struct {
@@ -128,7 +158,7 @@ func (r *Registrar) EnsureLeaseCompleted(ctx context.Context, leaseID uint64) (F
 	inner := []byte{leasePalletIndex, updateLeaseStateCallIndex}
 	inner = binary.LittleEndian.AppendUint64(inner, leaseID)
 	inner = append(inner, leaseStateCompleted)
-	if err := r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis); err != nil {
+	if _, err := r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis); err != nil {
 		return FinalizedLease{}, err
 	}
 
@@ -213,7 +243,7 @@ func (r *Registrar) EnsureLeaseActive(ctx context.Context, leaseID uint64, provi
 		call = append(call, provider[:]...)
 		call = append(call, resourceHash[:]...)
 		call = binary.LittleEndian.AppendUint32(call, duration)
-		if err := r.submitSigned(ctx, call, nonce, version, genesis); err != nil {
+		if _, err := r.submitSigned(ctx, call, nonce, version, genesis); err != nil {
 			return FinalizedLease{}, err
 		}
 		nonce++
@@ -221,7 +251,7 @@ func (r *Registrar) EnsureLeaseActive(ctx context.Context, leaseID uint64, provi
 	inner := []byte{leasePalletIndex, updateLeaseStateCallIndex}
 	inner = binary.LittleEndian.AppendUint64(inner, leaseID)
 	inner = append(inner, leaseStateActive)
-	if err := r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis); err != nil {
+	if _, err := r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis); err != nil {
 		return FinalizedLease{}, err
 	}
 	for {
@@ -284,19 +314,53 @@ func (r *Registrar) finalizedLease(ctx context.Context, leaseID uint64) (Finaliz
 	return lease, true, err
 }
 
-func (r *Registrar) submitSigned(ctx context.Context, call []byte, nonce uint64, version RuntimeVersion, genesis [32]byte) error {
-	extrinsic, hash, err := r.signCall(call, nonce, version, genesis)
-	if err != nil {
-		return err
+// submitSigned signs call for nonce and submits it, applying ADR-032 Sec4's
+// bounded tip-bump policy: a confirmed 1014 ("Priority is too low", not
+// 1012's "Temporarily banned" -- see IsPriorityTooLow's doc comment for why
+// these two pool rejections need genuinely different responses) retries
+// the exact same logical call with a strictly increasing ChargeTip tip, up
+// to maxTipBumpAttempts times, capped at maxTip. Every top-level call
+// starts this local tip state fresh at 0/no-tip; nothing here is shared
+// across calls beyond the mutex every caller already takes. Any other
+// error -- including 1012 -- returns immediately on the first attempt, so
+// the caller's own bounded-retry loop (and #157's existing
+// IsTemporarilyBanned -> MaxBackoff jump) is reached unchanged.
+func (r *Registrar) submitSigned(ctx context.Context, call []byte, nonce uint64, version RuntimeVersion, genesis [32]byte) ([32]byte, error) {
+	tip := uint64(0)
+	for attempt := 0; ; attempt++ {
+		extrinsic, hash, err := r.signCall(call, nonce, tip, version, genesis)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		submitted, err := r.rpc.SubmitExtrinsic(ctx, "0x"+hex.EncodeToString(extrinsic))
+		if err == nil {
+			if submitted != "0x"+hex.EncodeToString(hash[:]) {
+				return [32]byte{}, errors.New("Substrate returned an unexpected extrinsic hash")
+			}
+			return hash, nil
+		}
+		if !IsPriorityTooLow(err) || attempt >= maxTipBumpAttempts {
+			return [32]byte{}, err
+		}
+		tip = nextTip(tip)
 	}
-	submitted, err := r.rpc.SubmitExtrinsic(ctx, "0x"+hex.EncodeToString(extrinsic))
-	if err != nil {
-		return err
+}
+
+// nextTip doubles tip (starting at 1 for a zero tip), capped at maxTip. A
+// step of 1 is already sufficient to win the pool's strict-greater-than
+// priority comparison against a same-value stuck entry (ChargeTip's
+// priority = tip + 1, ADR-032 Sec2); doubling matches this codebase's
+// existing exponential-backoff style, not a requirement the priority
+// formula imposes. Bounded via early-return, not a saturating multiply, so
+// this never depends on wraparound behavior even if maxTip is ever raised.
+func nextTip(tip uint64) uint64 {
+	if tip == 0 {
+		return 1
 	}
-	if submitted != "0x"+hex.EncodeToString(hash[:]) {
-		return errors.New("Substrate returned an unexpected extrinsic hash")
+	if tip > maxTip/2 {
+		return maxTip
 	}
-	return nil
+	return tip * 2
 }
 
 func NewRegistrarFromPKCS8File(rpc *RPCClient, path string) (*Registrar, error) {
@@ -378,16 +442,9 @@ func (r *Registrar) EnsureActive(ctx context.Context, provider [ed25519.PublicKe
 		return nil, nil, 0, err
 	}
 	for _, inner := range steps {
-		extrinsic, hash, err := r.signSudo(inner, nonce, version, genesis)
+		hash, err := r.submitSigned(ctx, append([]byte{sudoPalletIndex, sudoCallIndex}, inner...), nonce, version, genesis)
 		if err != nil {
 			return nil, nil, 0, err
-		}
-		submittedHash, err := r.rpc.SubmitExtrinsic(ctx, "0x"+hex.EncodeToString(extrinsic))
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		if submittedHash != "0x"+hex.EncodeToString(hash[:]) {
-			return nil, nil, 0, errors.New("Substrate returned an unexpected extrinsic hash")
 		}
 		lastExtrinsicHash = append(lastExtrinsicHash[:0], hash[:]...)
 		nonce++
@@ -423,14 +480,16 @@ func statusCall(provider [32]byte, status byte) []byte {
 	return append(call, status)
 }
 
-func (r *Registrar) signSudo(inner []byte, nonce uint64, version RuntimeVersion, genesis [32]byte) ([]byte, [32]byte, error) {
-	call := []byte{sudoPalletIndex, sudoCallIndex}
-	call = append(call, inner...)
-	return r.signCall(call, nonce, version, genesis)
-}
-
-func (r *Registrar) signCall(call []byte, nonce uint64, version RuntimeVersion, genesis [32]byte) ([]byte, [32]byte, error) {
+// signCall SCALE-encodes and signs call for nonce, appending tip as
+// ChargeTip's Compact<u64> -- the tenth and last TxExtension element
+// (ADR-032 Sec2/Sec3), so extra is Era(1 byte, hardcoded Immortal) ++
+// Compact(nonce) ++ Compact(tip), a strict extension of the pre-ADR-032
+// wire format: every existing caller passing tip 0 produces the exact same
+// `extra` prefix as before, with one new trailing compact-encoded zero
+// byte.
+func (r *Registrar) signCall(call []byte, nonce uint64, tip uint64, version RuntimeVersion, genesis [32]byte) ([]byte, [32]byte, error) {
 	extra := append([]byte{0}, compactUint(nonce)...)
+	extra = append(extra, compactUint(tip)...)
 	payload := append(append([]byte{}, call...), extra...)
 	implicit := make([]byte, 8, 8+64)
 	binary.LittleEndian.PutUint32(implicit[0:4], version.SpecVersion)
