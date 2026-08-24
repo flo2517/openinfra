@@ -1157,6 +1157,7 @@ mod tests {
             phase: agent_core::local_state::WorkloadPhase::Provisioning,
             egress_mbps: 0,
             rate_limited: false,
+            lease_end: None,
         };
         // reserve_workload (not store_workload -- that requires an
         // existing row) is deploy()'s own first step: reserve the
