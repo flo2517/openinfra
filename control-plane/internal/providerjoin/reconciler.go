@@ -6,6 +6,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/openinfra/network/internal/blockchainbridge"
 )
 
 // PendingChainRegistration is one row of the provider_chain_registrations
@@ -171,7 +173,24 @@ func (r *Reconciler) reconcileOne(ctx context.Context, registration PendingChain
 
 func (r *Reconciler) fail(ctx context.Context, providerID string, attemptErr error, attemptNumber int, terminal bool) {
 	slog.Error("reconciler: chain registration attempt failed", "provider_id", providerID, "error", attemptErr, "attempt", attemptNumber, "terminal", terminal)
-	nextAttemptAt := r.now().UTC().Add(r.backoffFor(attemptNumber))
+	backoff := r.backoffFor(attemptNumber)
+	// Issue #141: a "1012: Transaction is temporarily banned" rejection
+	// means the pool already has this exact extrinsic (EnsureActive's
+	// nonce is derived from *finalized* state, which cannot advance while
+	// the banned transaction is itself what's blocking finalization) on a
+	// cooldown -- confirmed live, repeatedly, in this session: retrying on
+	// the normal exponential schedule's early, short intervals just
+	// resubmits the byte-for-byte identical extrinsic and re-triggers the
+	// same ban. Jump straight to MaxBackoff instead of ramping up to it,
+	// so the retry is much more likely to land after the pool's cooldown
+	// has actually expired. This is not the full fix -- letting a retry
+	// actually displace a stuck entry (rather than just outwaiting it)
+	// needs a runtime-level tip mechanism and its own ADR, tracked
+	// separately, not this bounded, ADR-free improvement.
+	if blockchainbridge.IsTemporarilyBanned(attemptErr) && backoff < r.cfg.MaxBackoff {
+		backoff = r.cfg.MaxBackoff
+	}
+	nextAttemptAt := r.now().UTC().Add(backoff)
 	if recErr := r.store.RecordChainRegistrationFailure(ctx, providerID, attemptErr, nextAttemptAt, terminal); recErr != nil {
 		slog.Error("reconciler: failed to record chain registration attempt", "provider_id", providerID, "error", recErr)
 	}

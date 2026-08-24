@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/openinfra/network/internal/blockchainbridge"
 )
 
 type chainRegistrationRow struct {
@@ -154,6 +156,62 @@ func TestReconcileOnceSchedulesRetryWithBackoffOnFailure(t *testing.T) {
 	}
 	if !row.nextAttempt.After(before) {
 		t.Fatalf("expected next_attempt_at to be scheduled in the future")
+	}
+}
+
+// Issue #141: a "1012: Transaction is temporarily banned" rejection must
+// jump straight to MaxBackoff, not follow the normal exponential ramp --
+// confirmed live, repeatedly, that retrying on the short early-attempt
+// schedule just re-triggers the exact same ban (EnsureActive's nonce is
+// derived from finalized state, which cannot advance past the very
+// transaction that's stuck banned).
+func TestReconcileOnceJumpsToMaxBackoffOnATemporarilyBannedError(t *testing.T) {
+	store := newFakeChainStore()
+	store.addReady("provider-1", testPublicKey(1))
+	banned := &blockchainbridge.RPCError{Code: 1012, Message: "Transaction is temporarily banned"}
+	registrar := newFakeRegistrar(func(int) ([]byte, []byte, uint64, error) {
+		return nil, nil, 0, banned
+	})
+	cfg := DefaultReconcilerConfig()
+	reconciler := NewReconciler(store, store, registrar, cfg)
+
+	before := time.Now()
+	reconciler.ReconcileOnce(context.Background())
+
+	row := store.rows["provider-1"]
+	if row.state != "RETRY" {
+		t.Fatalf("expected RETRY, got %s", row.state)
+	}
+	// attempt 1's normal backoff is cfg.BaseBackoff (5s); a 1012 must skip
+	// straight to cfg.MaxBackoff (10m) instead.
+	minExpected := before.Add(cfg.MaxBackoff - time.Second) // tolerate test-run jitter
+	if row.nextAttempt.Before(minExpected) {
+		t.Fatalf("expected next_attempt_at to jump to ~MaxBackoff (%s) on a 1012, got %s after only %s",
+			cfg.MaxBackoff, row.nextAttempt, row.nextAttempt.Sub(before))
+	}
+}
+
+// Regression guard for the fix above: a non-1012 error (any other RPC
+// error, or a plain Go error) must keep using the normal exponential
+// schedule, not also jump to MaxBackoff.
+func TestReconcileOnceDoesNotJumpToMaxBackoffOnAnUnrelatedRPCError(t *testing.T) {
+	store := newFakeChainStore()
+	store.addReady("provider-1", testPublicKey(1))
+	unrelated := &blockchainbridge.RPCError{Code: 1010, Message: "Invalid Transaction"}
+	registrar := newFakeRegistrar(func(int) ([]byte, []byte, uint64, error) {
+		return nil, nil, 0, unrelated
+	})
+	cfg := DefaultReconcilerConfig()
+	reconciler := NewReconciler(store, store, registrar, cfg)
+
+	before := time.Now()
+	reconciler.ReconcileOnce(context.Background())
+
+	row := store.rows["provider-1"]
+	maxExpected := before.Add(cfg.BaseBackoff + 2*time.Second) // BaseBackoff plus generous jitter tolerance
+	if row.nextAttempt.After(maxExpected) {
+		t.Fatalf("expected next_attempt_at to stay at ~BaseBackoff (%s) on a non-1012 error, got %s after %s",
+			cfg.BaseBackoff, row.nextAttempt, row.nextAttempt.Sub(before))
 	}
 }
 
