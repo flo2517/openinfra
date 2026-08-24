@@ -42,6 +42,30 @@
 //! can write off a confirmed, irrecoverable shortfall instead of leaving an
 //! already-contaminated escrow stuck forever (see
 //! [`Event::EscrowShortfallWrittenOff`]).
+//!
+//! **Dispute re-arming / double-payment fix.** A second, independent review
+//! found that [`Pallet::resolve_dispute`] unconditionally reset
+//! `settled_at` to the resolution block on every call, which re-armed
+//! [`Pallet::dispute_escrow`]'s `DisputeWindow` check indefinitely --
+//! nothing stopped an already-`Completed`/`Refunded` escrow from being
+//! disputed and resolved an unbounded number of times. Combined with the
+//! account-level (not escrow-level) shortfall check the fix above needed
+//! (this pallet has no per-escrow tag on the shared reserved balance), a
+//! payer with a second, unrelated, still-`Funded` escrow could dispute an
+//! already-settled escrow and have `resolve_dispute`'s `PayProvider`/
+//! `RefundPayer` outcome silently draw funds from that unrelated escrow's
+//! reservation instead -- a real double payment, with `EscrowShortfallWrittenOff`
+//! never firing since nothing looked short at the *account* level. Two
+//! changes close this: (1) [`EscrowRecord::disputed_once`] makes a
+//! resolved/completed state genuinely terminal -- `dispute_escrow` grants
+//! each escrow exactly one dispute in its lifetime (ADR-029 Sec4.4/Sec11),
+//! never a second one regardless of window timing; (2)
+//! [`Pallet::resolve_dispute`] no longer attempts *any* currency movement
+//! for a dispute raised against an already-`Completed`/`Refunded` escrow
+//! (tracked via the pre-existing `funds_still_reserved` signal) -- by
+//! definition none of that escrow's own funds remain reserved at that
+//! point, so any transfer could only ever be pulling from a different
+//! escrow; the full adjudicated amount is written off honestly instead.
 
 extern crate alloc;
 
@@ -337,6 +361,19 @@ pub mod pallet {
         /// ("within `DisputeWindow` blocks" of settling) has no other
         /// anchor to measure from once an escrow is no longer `Funded`.
         pub settled_at: Option<BlockNumberFor<T>>,
+        /// Whether [`Pallet::dispute_escrow`] has ever succeeded for this
+        /// escrow, regardless of the state it was raised from or how many
+        /// times it has since been resolved. ADR-029 Sec4.4 grants each
+        /// escrow exactly one dispute opportunity in its lifetime (raised
+        /// either from `Funded`, or once post-settlement within
+        /// `DisputeWindow`) and Sec11 rules out any appeals process --
+        /// this flag is the persistent record of that opportunity having
+        /// been used, independent of `settled_at`'s timing. Without it,
+        /// `resolve_dispute` resetting `settled_at` on every resolution
+        /// would re-arm `dispute_escrow`'s window indefinitely, letting an
+        /// already-adjudicated escrow be disputed and re-resolved without
+        /// bound (see the module doc comment's fix-history note).
+        pub disputed_once: bool,
     }
 
     /// Signed, hashed, bounded, replay-resistant usage evidence (ADR-029
@@ -605,6 +642,12 @@ pub mod pallet {
         NotPartyToEscrow,
         /// The escrow is already `Disputed`.
         AlreadyDisputed,
+        /// This escrow has already used its one lifetime dispute
+        /// opportunity (ADR-029 Sec4.4/Sec11 -- no appeals process).
+        /// Raised regardless of `DisputeWindow` timing: a second dispute
+        /// is never allowed, not even a second one still nominally inside
+        /// a (re-armed) window.
+        EscrowAlreadyDisputedOnce,
         /// `DisputeWindow` blocks have elapsed since the escrow settled.
         DisputeWindowElapsed,
         /// The escrow is not currently `Disputed`.
@@ -686,6 +729,7 @@ pub mod pallet {
                     state: EscrowState::Funded,
                     funded_at,
                     settled_at: None,
+                    disputed_once: false,
                 },
             );
             PayerOpenEscrowCount::<T>::mutate(&payer, |count| *count = count.saturating_add(1));
@@ -863,7 +907,12 @@ pub mod pallet {
         /// Freeze an escrow pending governance resolution. Callable by
         /// either the payer or the provider, from `Funded` at any time, or
         /// from `Completed`/`Refunded` within `DisputeWindow` blocks of
-        /// settling (ADR-029 Sec4.4).
+        /// settling (ADR-029 Sec4.4) -- but at most **once, ever**, per
+        /// escrow (ADR-029 Sec4.4's "not disputable forever" combined with
+        /// Sec11's "no appeals process"): once `disputed_once` is set,
+        /// this call is rejected regardless of state or window timing, so
+        /// `resolve_dispute` resetting `settled_at` on a resolution can
+        /// never re-open a second dispute window.
         #[pallet::call_index(3)]
         #[pallet::weight(T::WeightInfo::dispute_escrow())]
         pub fn dispute_escrow(
@@ -882,6 +931,13 @@ pub mod pallet {
             match escrow.state {
                 EscrowState::Funded => {}
                 EscrowState::Completed | EscrowState::Refunded => {
+                    // Root-cause fix for the dispute re-arming finding: a
+                    // second dispute of an escrow that already used its one
+                    // lifetime dispute opportunity must be rejected
+                    // outright, before even looking at timing -- otherwise
+                    // `resolve_dispute` resetting `settled_at` on every
+                    // resolution would re-open this window indefinitely.
+                    ensure!(!escrow.disputed_once, Error::<T>::EscrowAlreadyDisputedOnce);
                     let settled_at = escrow.settled_at.unwrap_or(escrow.funded_at);
                     let now = frame_system::Pallet::<T>::block_number();
                     let deadline = settled_at.saturating_add(T::DisputeWindow::get());
@@ -891,6 +947,7 @@ pub mod pallet {
             }
 
             escrow.state = EscrowState::Disputed;
+            escrow.disputed_once = true;
             Escrows::<T>::insert(lease_id, escrow);
 
             Self::deposit_event(Event::EscrowDisputed {
@@ -950,32 +1007,35 @@ pub mod pallet {
             let (provider_amount, payer_amount, final_state, shortfall) = match outcome {
                 DisputeOutcome::PayProvider(amount) => {
                     ensure!(amount <= max_charge, Error::<T>::PayoutExceedsCap);
-                    // AMBIGUOUS INTERACTION, RESOLVED CONSERVATIVELY (see
-                    // the merge report): ADR-030's protocol fee and the
-                    // reserve-contamination write-off fail-safe were
-                    // developed independently and neither PR specifies how
-                    // they interact when both could apply to the same
-                    // dispute. This resolution takes the reading spelled
-                    // out in the merge instructions -- a write-off is a
-                    // degraded recovery of a contaminated escrow, not a
-                    // normal successful settlement, so it must never also
-                    // carry a protocol-fee deduction on funds that were
-                    // never actually fully available.
-                    //
-                    // Whether this escrow's reserved funds are still fully
-                    // intact is decided once, up front, via a read-only
-                    // balance check -- before any transfer below -- so the
-                    // fee-vs-write-off choice is deterministic rather than
-                    // inferred from a partial transfer's own shortfall.
-                    // This pallet has no per-escrow tag on the reserved
-                    // balance (that's the root cause of the contamination
-                    // bug itself, see the module doc comment), so an
-                    // account-level check against this escrow's own
-                    // `max_charge` is the finest precision actually
-                    // available on-chain -- consistent with, not an
-                    // approximation on top of, the shared-pool model this
-                    // pallet already lives with.
-                    if T::Currency::reserved_balance(&escrow.payer) < max_charge {
+                    // Escrow-scoped fix for the account-level shortfall
+                    // finding: if this escrow's funds were *already*
+                    // released before this dispute was even raised (it
+                    // reached `Disputed` from `Completed`/`Refunded`, i.e.
+                    // `funds_still_reserved` is false -- the legitimate
+                    // once-only post-completion dispute ADR-029 Sec4.4
+                    // allows), then by definition none of `max_charge` is
+                    // reserved for *this* escrow anymore: it was already
+                    // fully repatriated/unreserved by the
+                    // `complete_and_payout`/`refund_escrow` call that
+                    // originally settled it. `T::Currency::reserved_balance`
+                    // has no per-escrow tag (the pallet's fundamental
+                    // limitation, see the module doc comment) -- it can
+                    // only ever report the payer's *account-wide* reserved
+                    // balance, which at this point belongs entirely to the
+                    // payer's *other* open escrows. Attempting any transfer
+                    // here would silently draw on those unrelated escrows'
+                    // funds instead of this one's (the exact double-payment
+                    // mechanism the finding demonstrated) -- so no transfer
+                    // is attempted at all, and the full adjudicated amount
+                    // is reported as an honest write-off instead.
+                    if !funds_still_reserved {
+                        (
+                            Zero::zero(),
+                            Zero::zero(),
+                            EscrowState::Completed,
+                            max_charge,
+                        )
+                    } else if T::Currency::reserved_balance(&escrow.payer) < max_charge {
                         // Fail-safe path: confirmed shortfall. No protocol
                         // fee is taken; whatever is actually available is
                         // paid to the provider first, exactly as this
@@ -1066,14 +1126,32 @@ pub mod pallet {
                     }
                 }
                 DisputeOutcome::RefundPayer => {
-                    let unreleased = T::Currency::unreserve(&escrow.payer, max_charge);
-                    let returned = max_charge.saturating_sub(unreleased);
                     // ADR-029 Sec5: the provider was found in the wrong --
-                    // apply the bounded reliability penalty. A rejected
-                    // dispute (`PayProvider`) applies no penalty to either
-                    // side.
+                    // apply the bounded reliability penalty regardless of
+                    // whether any currency actually moves below (the
+                    // dispute's finding of fault is independent of what
+                    // could be recovered). A rejected dispute
+                    // (`PayProvider`) applies no penalty to either side.
                     T::ReputationPenalty::apply(&escrow.provider, T::ReliabilityPenaltyBps::get())?;
-                    (Zero::zero(), returned, EscrowState::Refunded, unreleased)
+                    if !funds_still_reserved {
+                        // Same escrow-scoping fix as the `PayProvider` arm
+                        // above: this escrow's own funds are already fully
+                        // released (it was disputed after already reaching
+                        // `Completed`/`Refunded`), so `unreserve` here would
+                        // only ever be able to draw on the payer's *other*
+                        // open escrows' reserved balance. No transfer is
+                        // attempted; the full `max_charge` is written off.
+                        (
+                            Zero::zero(),
+                            Zero::zero(),
+                            EscrowState::Refunded,
+                            max_charge,
+                        )
+                    } else {
+                        let unreleased = T::Currency::unreserve(&escrow.payer, max_charge);
+                        let returned = max_charge.saturating_sub(unreleased);
+                        (Zero::zero(), returned, EscrowState::Refunded, unreleased)
+                    }
                 }
             };
 

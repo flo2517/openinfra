@@ -1509,6 +1509,278 @@ fn resolve_dispute_without_shortfall_never_emits_writeoff_event() {
 }
 
 // ---------------------------------------------------------------------
+// Dispute re-arming / double-payment fix (second finding, same session as
+// the reserve-contamination write-off fix above).
+//
+// `dispute_of_normally_completed_escrow_cannot_double_pay_from_unrelated_escrow`
+// is the direct "would have failed before this fix, passes after" case: it
+// reproduces the exact mechanism the finding described -- escrow A settles
+// normally, a second, unrelated, still-`Funded` escrow B gives the payer
+// enough account-wide reserved balance to look "not short," and disputing
+// A (once, exactly as ADR-029 Sec4.4 allows) must not let `resolve_dispute`
+// silently pay the provider a second time out of B's reservation.
+// ---------------------------------------------------------------------
+
+#[test]
+fn dispute_of_normally_completed_escrow_cannot_double_pay_from_unrelated_escrow() {
+    new_test_ext().execute_with(|| {
+        // Escrow A (LEASE) settles normally: provider paid 80, A's own
+        // reservation is fully released back/forward, nothing left
+        // reserved for A specifically.
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            normal_evidence()
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_080);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+
+        // PAYER has a second, entirely unrelated, still-open escrow B
+        // (OTHER_LEASE) with its own 200 reserved -- this is exactly the
+        // account-wide balance the buggy shortfall check could mistake for
+        // "A still has funds available."
+        assert_ok!(fund_other_lease());
+        assert_eq!(Balances::reserved_balance(PAYER), 200);
+
+        // Within the legitimate post-completion dispute window, dispute A
+        // -- allowed exactly once, by design (ADR-029 Sec4.4).
+        System::set_block_number(1 + DisputeWindow::get());
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+
+        // Resolving that dispute as PayProvider(80) must not pay the
+        // provider a second time, and must not touch escrow B's funds at
+        // all -- before the fix, the account-level shortfall check saw
+        // B's 200 reserved, concluded "enough is reserved for A," and
+        // silently drained B to pay A's provider again.
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(80)
+        ));
+
+        assert_eq!(
+            Balances::free_balance(PROVIDER),
+            1_000_080,
+            "provider must not be paid a second time for the same charge"
+        );
+        assert_eq!(
+            Balances::reserved_balance(PAYER),
+            200,
+            "escrow B's reserved funds must be completely untouched"
+        );
+        let escrow_b = Escrow::escrows(OTHER_LEASE).unwrap();
+        assert_eq!(
+            escrow_b.state,
+            EscrowState::Funded,
+            "escrow B must be untouched and still funded"
+        );
+        assert_eq!(escrow_b.max_charge, 200);
+
+        // A's dispute resolves as a full, honest write-off: nothing left
+        // to pay, nothing left to return, since A's own funds were already
+        // fully disbursed by the earlier normal completion.
+        assert_eq!(
+            Escrow::escrows(LEASE).unwrap().state,
+            EscrowState::Completed
+        );
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff {
+                    lease_id: LEASE,
+                    payer: PAYER,
+                    provider: PROVIDER,
+                    expected_total: 200,
+                    provider_amount: 0,
+                    payer_amount: 0,
+                    shortfall: 200,
+                })
+            )
+        });
+        assert!(
+            found,
+            "EscrowShortfallWrittenOff was not emitted for A's post-completion dispute"
+        );
+    });
+}
+
+#[test]
+fn dispute_of_normally_refunded_escrow_does_not_drain_unrelated_escrow() {
+    new_test_ext().execute_with(|| {
+        // Escrow A (LEASE) self-refunds normally.
+        assert_ok!(fund(200));
+        System::set_block_number(1 + RefundWindow::get());
+        assert_ok!(Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE));
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(Balances::free_balance(PAYER), 1_000_000);
+
+        // A second, unrelated, still-open escrow B with its own reserved
+        // funds.
+        assert_ok!(fund_other_lease());
+        assert_eq!(Balances::reserved_balance(PAYER), 200);
+        assert_eq!(Balances::free_balance(PAYER), 999_800);
+
+        // Still within DisputeWindow of A's refund -- the provider disputes
+        // it, exactly once, as ADR-029 Sec4.4 allows.
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PROVIDER),
+            LEASE,
+            [3u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+
+        // Escrow B's funds must be completely untouched.
+        assert_eq!(Balances::reserved_balance(PAYER), 200);
+        assert_eq!(Balances::free_balance(PAYER), 999_800);
+        assert_eq!(
+            Escrow::escrows(OTHER_LEASE).unwrap().state,
+            EscrowState::Funded
+        );
+        // The reputation consequence still applies even though no new
+        // funds moved -- the dispute's finding of fault is independent of
+        // what could be recovered.
+        assert_eq!(penalties(), vec![(PROVIDER, ReliabilityPenaltyBps::get())]);
+
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff {
+                    lease_id: LEASE,
+                    payer: PAYER,
+                    provider: PROVIDER,
+                    expected_total: 200,
+                    provider_amount: 0,
+                    payer_amount: 0,
+                    shortfall: 200,
+                })
+            )
+        });
+        assert!(
+            found,
+            "EscrowShortfallWrittenOff was not emitted for A's post-refund dispute"
+        );
+    });
+}
+
+#[test]
+fn second_dispute_of_an_already_resolved_escrow_is_rejected() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(80)
+        ));
+        assert_eq!(
+            Escrow::escrows(LEASE).unwrap().state,
+            EscrowState::Completed
+        );
+
+        // Still well within a fresh DisputeWindow of the resolution block
+        // (settled_at was reset to it) -- the second dispute must still be
+        // rejected, regardless of window timing, because this escrow has
+        // already used its one lifetime dispute opportunity.
+        assert_noop!(
+            Escrow::dispute_escrow(RuntimeOrigin::signed(PAYER), LEASE, [2u8; 32]),
+            crate::Error::<Test>::EscrowAlreadyDisputedOnce
+        );
+    });
+}
+
+#[test]
+fn second_dispute_of_a_refund_payer_resolution_is_rejected() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Refunded);
+
+        assert_noop!(
+            Escrow::dispute_escrow(RuntimeOrigin::signed(PROVIDER), LEASE, [4u8; 32]),
+            crate::Error::<Test>::EscrowAlreadyDisputedOnce
+        );
+    });
+}
+
+#[test]
+fn first_ever_dispute_after_normal_completion_is_still_allowed() {
+    // Regression guard, per ADR-029 Sec4.4: a completed payout is
+    // disputable exactly once, within DisputeWindow -- this fix must not
+    // remove that intended feature, only block a *second* dispute.
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            normal_evidence()
+        ));
+        System::set_block_number(1 + DisputeWindow::get());
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Disputed);
+        assert!(Escrow::escrows(LEASE).unwrap().disputed_once);
+    });
+}
+
+#[test]
+fn first_legitimate_dispute_from_funded_still_pays_out_normally_with_no_other_escrows() {
+    // Regression guard: the ordinary, non-contaminated, single-escrow case
+    // (no other open escrow to ever confuse the shortfall check with) must
+    // behave exactly as before this fix -- a real transfer, not a write-off.
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(80)
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_080);
+        assert_eq!(Balances::free_balance(PAYER), 999_920);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff { .. })
+            )
+        });
+        assert!(
+            !found,
+            "a clean, single-escrow dispute from Funded must not write anything off"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------
 // ADR-030: protocol usage fee
 //
 // Every pre-existing test above runs with the fee disabled
