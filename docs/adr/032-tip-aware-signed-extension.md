@@ -2,12 +2,13 @@
 
 ## Status
 
-Proposed. Per the convention established by ADR-016/018/025/026/027/028/029/030, this ADR is
-written and held as Proposed by Claude Code, autonomously, in response to issue #156. It becomes
-Accepted only after the repository owner reviews a summary of its decisions and their reasoning
-and confirms, in an interactive session, that implementation should proceed. Nothing here is
-implemented by this ADR itself; issue #156's second half (the Go-side bounded tip-bump logic) is
-unblocked by acceptance, not by this document.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #156, and held as Proposed
+per the convention established by ADR-016/018/025/026/027/028/029/030. Nothing here is implemented
+yet by this ADR itself; issue #156 is unblocked by this acceptance and now carries the
+implementation work (the bespoke `ChargeTip` extension plus the Go-side bounded tip-bump logic).
 
 ## Context
 
