@@ -299,8 +299,19 @@ type ResourceCapability struct {
 	Gpu                *GPUCapability         `protobuf:"bytes,7,opt,name=gpu,proto3" json:"gpu,omitempty"`
 	Bandwidth          *Bandwidth             `protobuf:"bytes,8,opt,name=bandwidth,proto3" json:"bandwidth,omitempty"`
 	Zone               string                 `protobuf:"bytes,9,opt,name=zone,proto3" json:"zone,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// ADR-033 §7: whether this provider passed the Agent's fail-closed
+	// KVM_GET_API_VERSION probe (provider-agent/crates/agent-inventory's
+	// kvm.rs) and can therefore run VM-backed workloads. Additive,
+	// proto3-default-false: any Agent binary that predates this field (or
+	// that ran the probe and got a negative/inconclusive result) simply
+	// never sets it, which is exactly the fail-closed behavior wanted --
+	// "unset" and "explicitly false" are indistinguishable on the wire on
+	// purpose, matching how ADR-025 already treats an unset Bandwidth as
+	// zero capacity for that dimension. The scheduler must never offer a
+	// VM workload to a provider that hasn't explicitly reported this true.
+	VirtualizationCapable bool `protobuf:"varint,10,opt,name=virtualization_capable,json=virtualizationCapable,proto3" json:"virtualization_capable,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ResourceCapability) Reset() {
@@ -394,6 +405,13 @@ func (x *ResourceCapability) GetZone() string {
 		return x.Zone
 	}
 	return ""
+}
+
+func (x *ResourceCapability) GetVirtualizationCapable() bool {
+	if x != nil {
+		return x.VirtualizationCapable
+	}
+	return false
 }
 
 type GPUCapability struct {
@@ -1250,7 +1268,7 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\x10protocol_version\x18\x03 \x01(\tR\x0fprotocolVersion\x12#\n" +
 	"\ragent_version\x18\x04 \x01(\tR\fagentVersion\x12K\n" +
 	"\fcapabilities\x18\x05 \x01(\v2'.openinfra.shared.v1.ResourceCapabilityR\fcapabilities\x127\n" +
-	"\x06status\x18\x06 \x01(\x0e2\x1f.openinfra.shared.v1.NodeStatusR\x06status\"\x86\x03\n" +
+	"\x06status\x18\x06 \x01(\x0e2\x1f.openinfra.shared.v1.NodeStatusR\x06status\"\xbd\x03\n" +
 	"\x12ResourceCapability\x12\x1b\n" +
 	"\tcpu_total\x18\x01 \x01(\x02R\bcpuTotal\x12#\n" +
 	"\rcpu_available\x18\x02 \x01(\x02R\fcpuAvailable\x12 \n" +
@@ -1261,7 +1279,9 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\x14storage_available_gb\x18\x06 \x01(\x03R\x12storageAvailableGb\x124\n" +
 	"\x03gpu\x18\a \x01(\v2\".openinfra.shared.v1.GPUCapabilityR\x03gpu\x12<\n" +
 	"\tbandwidth\x18\b \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\x12\x12\n" +
-	"\x04zone\x18\t \x01(\tR\x04zone\"\x8b\x01\n" +
+	"\x04zone\x18\t \x01(\tR\x04zone\x125\n" +
+	"\x16virtualization_capable\x18\n" +
+	" \x01(\bR\x15virtualizationCapable\"\x8b\x01\n" +
 	"\rGPUCapability\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\"\n" +
 	"\rvram_total_mb\x18\x02 \x01(\x03R\vvramTotalMb\x12*\n" +

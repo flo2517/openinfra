@@ -62,6 +62,21 @@ impl WorkloadPhase {
     }
 }
 
+/// ADR-033 §3: which execution model owns a `WorkloadRecord`. Docker
+/// (`max_workloads`) and VM (`max_vm_workloads`) capacity are counted
+/// independently -- see `reserve_workload`'s `runtime` parameter -- since
+/// a VM's per-instance overhead is not comparable to a container's (ADR
+/// §6). `#[serde(default)]` on `WorkloadRecord::runtime` deserializes
+/// every record persisted before this field existed as `Container`,
+/// which is exactly correct: no VM workload could have existed before
+/// this PR.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WorkloadRuntime {
+    #[default]
+    Container,
+    Vm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadRecord {
     pub workload_id: String,
@@ -69,6 +84,17 @@ pub struct WorkloadRecord {
     pub image: String,
     pub spec_hash: [u8; 32],
     pub container_id: Option<String>,
+    /// ADR-033 §3/§6: the VM-side "container_id-equivalent handle" the
+    /// ADR calls for -- a Cloud Hypervisor API-socket path, populated
+    /// only for `runtime == Vm` records. Kept as its own field rather
+    /// than repurposing `container_id`, so a record's runtime is never
+    /// ambiguous from which handle field happens to be set.
+    /// `#[serde(default)]` for the same backward-compat reason as every
+    /// other field added after this struct's original shape.
+    #[serde(default)]
+    pub vm_handle: Option<String>,
+    #[serde(default)]
+    pub runtime: WorkloadRuntime,
     pub phase: WorkloadPhase,
     /// ADR-025 §3: the workload's reserved egress rate, Mbps, persisted
     /// (not just held transiently in the DeployRequest) so a process
@@ -344,6 +370,13 @@ impl LocalState {
         }
     }
 
+    /// Reserves a capacity slot for `candidate`, counted independently
+    /// per `WorkloadRuntime` (ADR-033 §6: a Docker `max_workloads` slot
+    /// and a VM `max_vm_workloads` slot are never fungible with each
+    /// other) -- `max_active` is `candidate.runtime`'s own ceiling
+    /// (`ExecutorSettings::max_workloads` for `Container`,
+    /// `max_vm_workloads` for `Vm`), and only records already stored with
+    /// the *same* runtime count against it.
     pub fn reserve_workload(
         &self,
         candidate: &WorkloadRecord,
@@ -371,7 +404,9 @@ impl LocalState {
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .filter(|record| record.phase.consumes_capacity())
+            .filter(|record| {
+                record.runtime == candidate.runtime && record.phase.consumes_capacity()
+            })
             .count();
         if active >= max_active {
             return Err(LocalStateError::WorkloadCapacity(max_active));
@@ -524,6 +559,8 @@ mod tests {
             image: "example@sha256:digest".to_string(),
             spec_hash: [7; 32],
             container_id: Some("container-1".to_string()),
+            vm_handle: None,
+            runtime: WorkloadRuntime::Container,
             phase: WorkloadPhase::Running,
             egress_mbps: 0,
             rate_limited: false,
@@ -547,6 +584,70 @@ mod tests {
         assert!(matches!(
             state.reserve_workload(&conflicting, 1),
             Err(LocalStateError::WorkloadConflict(_))
+        ));
+    }
+
+    #[test]
+    fn reserve_workload_counts_container_and_vm_capacity_independently() {
+        // ADR-033 §6: a VM's per-instance overhead is not comparable to
+        // a container's, so max_workloads and max_vm_workloads must be
+        // enforced as two independent ceilings, never sharing one active
+        // count.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = LocalState::open(directory.path()).expect("open state");
+        let container_record = |id: &str| WorkloadRecord {
+            workload_id: id.to_string(),
+            lease_id: "lease".to_string(),
+            image: "example:tag".to_string(),
+            spec_hash: [1; 32],
+            container_id: Some("container-1".to_string()),
+            vm_handle: None,
+            runtime: WorkloadRuntime::Container,
+            phase: WorkloadPhase::Running,
+            egress_mbps: 0,
+            rate_limited: false,
+            lease_end: Some(1_700_000_000),
+        };
+        let vm_record = |id: &str| WorkloadRecord {
+            workload_id: id.to_string(),
+            lease_id: "lease".to_string(),
+            image: "https://example.com/image.qcow2".to_string(),
+            spec_hash: [2; 32],
+            container_id: None,
+            vm_handle: Some("/tmp/vm-1.sock".to_string()),
+            runtime: WorkloadRuntime::Vm,
+            phase: WorkloadPhase::Running,
+            egress_mbps: 0,
+            rate_limited: false,
+            lease_end: Some(1_700_000_000),
+        };
+
+        // A container workload at max_active=1 fills the Container
+        // ceiling...
+        assert_eq!(
+            state
+                .reserve_workload(&container_record("c1"), 1)
+                .expect("reserve container"),
+            Reservation::New
+        );
+        // ...but must not count against a *separate* Vm reservation at
+        // the same max_active=1: a VM workload still gets its own slot.
+        assert_eq!(
+            state
+                .reserve_workload(&vm_record("v1"), 1)
+                .expect("reserve vm"),
+            Reservation::New
+        );
+        // A second container now correctly hits the Container ceiling...
+        assert!(matches!(
+            state.reserve_workload(&container_record("c2"), 1),
+            Err(LocalStateError::WorkloadCapacity(1))
+        ));
+        // ...and a second VM correctly hits the (independent) Vm
+        // ceiling, not the container one.
+        assert!(matches!(
+            state.reserve_workload(&vm_record("v2"), 1),
+            Err(LocalStateError::WorkloadCapacity(1))
         ));
     }
 
