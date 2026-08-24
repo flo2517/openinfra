@@ -84,6 +84,7 @@ dependencies = [
  "async-trait",
  "bollard",
  "chrono",
+ "futures-util",
  "hex",
  "prost-types",
  "sha2",
