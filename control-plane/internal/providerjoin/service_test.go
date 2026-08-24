@@ -386,3 +386,145 @@ func TestHeartbeatSucceedsWithoutValidatorSourceConfigured(t *testing.T) {
 		t.Fatalf("active_validators = %x, want nil", response.ActiveValidators)
 	}
 }
+
+// --- ADR-028 §4: workload_status validation and reconciliation wiring ---
+
+// memoryWorkloadReconciler records every call ReportHeartbeat makes to it,
+// and can be configured to fail (exercising the same fail-open degraded
+// mode ValidatorSource's tests above already cover for a different
+// optional dependency).
+type memoryWorkloadReconciler struct {
+	err       error
+	calls     int
+	providers []string
+	statuses  [][]*controlplanev1.WorkloadStatusSummary
+}
+
+func (r *memoryWorkloadReconciler) ReconcileWorkloadStatus(_ context.Context, providerID string, statuses []*controlplanev1.WorkloadStatusSummary) error {
+	r.calls++
+	r.providers = append(r.providers, providerID)
+	r.statuses = append(r.statuses, statuses)
+	return r.err
+}
+
+// workloadStatusHeartbeatFixture is heartbeatFixture plus the given
+// workload_status entries, signed fresh (workload_status is part of the
+// signed payload, so it must be set before signing -- unlike the
+// ValidatorSource tests above, which only need to inspect the response).
+func workloadStatusHeartbeatFixture(t *testing.T, statuses []*controlplanev1.WorkloadStatusSummary) (*memoryRepository, *controlplanev1.ReportHeartbeatRequest, time.Time) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	repository := newMemoryRepository()
+	providerDigest := sha256.Sum256(publicKey)
+	providerID := fmt.Sprintf("%x", providerDigest)
+	repository.completion[uuid.NewString()] = Completion{ProviderID: providerID, Challenge: Challenge{PublicKey: publicKey}, Status: sharedv1.NodeStatus_NODE_STATUS_ACTIVE}
+	now := time.Unix(1_700_000_000, 0).UTC()
+	payload := &controlplanev1.HeartbeatSigningPayload{
+		RequestId: uuid.NewString(), ProviderId: providerID, Sequence: 1,
+		ObservedAt:     timestamppb.New(now),
+		Capabilities:   &sharedv1.ResourceCapability{CpuTotal: 8, CpuAvailable: 6, RamTotalMb: 16_384, RamAvailableMb: 12_000},
+		WorkloadStatus: statuses,
+	}
+	payloadBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	request := &controlplanev1.ReportHeartbeatRequest{Payload: payload, Signature: ed25519.Sign(privateKey, append([]byte(heartbeatDomain), payloadBytes...))}
+	return repository, request, now
+}
+
+// TestHeartbeatReconcilesWorkloadStatusSynchronously proves ReportHeartbeat
+// actually invokes the configured WorkloadReconciler with this heartbeat's
+// provider_id and workload_status entries, and that the call completes
+// (synchronously, per ADR-028 §4) before the response is returned -- the
+// call having already landed by the time ReportHeartbeat returns is
+// exactly what "reconciled ... before ReportHeartbeat returns its
+// response" means operationally for this test.
+func TestHeartbeatReconcilesWorkloadStatusSynchronously(t *testing.T) {
+	statuses := []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: uuid.NewString(), Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_RUNNING, ContainerId: "container-1"},
+	}
+	repository, request, now := workloadStatusHeartbeatFixture(t, statuses)
+	reconciler := &memoryWorkloadReconciler{}
+	service := NewService(repository, newMemoryHeartbeatStore(), &memoryRegistrar{})
+	service.now = func() time.Time { return now }
+	service.SetWorkloadReconciler(reconciler)
+
+	if _, err := service.ReportHeartbeat(context.Background(), request); err != nil {
+		t.Fatalf("report heartbeat: %v", err)
+	}
+	if reconciler.calls != 1 {
+		t.Fatalf("reconciler calls = %d, want 1", reconciler.calls)
+	}
+	if reconciler.providers[0] != request.Payload.ProviderId {
+		t.Fatalf("reconciled provider = %s, want %s", reconciler.providers[0], request.Payload.ProviderId)
+	}
+	if len(reconciler.statuses[0]) != 1 || reconciler.statuses[0][0].ContainerId != "container-1" {
+		t.Fatalf("reconciled statuses = %+v, want the one workload_status entry", reconciler.statuses[0])
+	}
+}
+
+// TestHeartbeatSucceedsWhenWorkloadReconciliationFails is the degraded-mode
+// half: a reconciler failure (e.g. a Postgres error) must not fail the
+// heartbeat itself -- the same fail-open posture
+// TestHeartbeatSucceedsWithEmptyValidatorsWhenChainReadFails already
+// exercises for ValidatorSource.
+func TestHeartbeatSucceedsWhenWorkloadReconciliationFails(t *testing.T) {
+	statuses := []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: uuid.NewString(), Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_FAILED},
+	}
+	repository, request, now := workloadStatusHeartbeatFixture(t, statuses)
+	reconciler := &memoryWorkloadReconciler{err: errors.New("workload persistence unavailable")}
+	service := NewService(repository, newMemoryHeartbeatStore(), &memoryRegistrar{})
+	service.now = func() time.Time { return now }
+	service.SetWorkloadReconciler(reconciler)
+
+	response, err := service.ReportHeartbeat(context.Background(), request)
+	if err != nil {
+		t.Fatalf("report heartbeat must succeed despite a reconciliation failure: %v", err)
+	}
+	if response.Status != sharedv1.NodeStatus_NODE_STATUS_ACTIVE {
+		t.Fatalf("status = %s, want ACTIVE", response.Status)
+	}
+	if reconciler.calls != 1 {
+		t.Fatalf("reconciler calls = %d, want 1 (attempted even though it fails)", reconciler.calls)
+	}
+}
+
+// TestHeartbeatRejectsOversizedWorkloadStatus is the Control-Plane-side
+// half of ADR-028 §4's bound: independent of whatever the Agent's own
+// max_workloads enforces, a wildly out-of-proportion workload_status
+// payload is rejected outright.
+func TestHeartbeatRejectsOversizedWorkloadStatus(t *testing.T) {
+	repository, request, now := heartbeatFixture(t)
+	entries := make([]*controlplanev1.WorkloadStatusSummary, maxWorkloadStatusEntriesPerHeartbeat+1)
+	for i := range entries {
+		entries[i] = &controlplanev1.WorkloadStatusSummary{WorkloadId: uuid.NewString()}
+	}
+	request.Payload.WorkloadStatus = entries
+	service := NewService(repository, newMemoryHeartbeatStore(), &memoryRegistrar{})
+	service.now = func() time.Time { return now }
+
+	_, err := service.ReportHeartbeat(context.Background(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestHeartbeatRejectsMalformedWorkloadStatusWorkloadID guards the same
+// "malformed entry fails the whole heartbeat up front" contract
+// validateWorkloadBandwidth already enforces for its own entries.
+func TestHeartbeatRejectsMalformedWorkloadStatusWorkloadID(t *testing.T) {
+	repository, request, now := heartbeatFixture(t)
+	request.Payload.WorkloadStatus = []*controlplanev1.WorkloadStatusSummary{{WorkloadId: "not-a-uuid"}}
+	service := NewService(repository, newMemoryHeartbeatStore(), &memoryRegistrar{})
+	service.now = func() time.Time { return now }
+
+	_, err := service.ReportHeartbeat(context.Background(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument", status.Code(err))
+	}
+}

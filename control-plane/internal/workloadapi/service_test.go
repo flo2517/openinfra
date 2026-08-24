@@ -74,6 +74,35 @@ func (r *memoryRepository) RequestStop(_ context.Context, workloadID, requestID,
 	return w, nil
 }
 
+// ReconcileFromAgent mirrors PostgresRepository.ReconcileFromAgent's
+// precondition semantics (providerID and current state must both match)
+// closely enough for ReconcileWorkloadStatus's unit tests below --
+// applied==false for a state/provider mismatch, not an error.
+func (r *memoryRepository) ReconcileFromAgent(_ context.Context, workloadID, providerID string, fromStates []string, toState, containerID, errorCode string) (bool, error) {
+	w, ok := r.byID[workloadID]
+	if !ok || w.ProviderID != providerID {
+		return false, nil
+	}
+	matched := false
+	for _, state := range fromStates {
+		if w.State == state {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false, nil
+	}
+	w.State = toState
+	if containerID != "" {
+		w.ContainerID = containerID
+	}
+	w.ErrorCode = errorCode
+	r.byID[workloadID] = w
+	r.byRequest[w.RequestID] = w
+	return true, nil
+}
+
 func validRequest() *controlplanev1.SubmitWorkloadRequest {
 	return &controlplanev1.SubmitWorkloadRequest{RequestId: uuid.NewString(), Image: "redis@sha256:987c376c727652f99625c7d205a1cba3cb2c53b92b0b62aade2bd48ee1593232", Definition: &sharedv1.WorkloadDefinition{WorkloadId: uuid.NewString(), Profile: sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, Requirements: &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256}, DurationSeconds: 300}}
 }
@@ -206,6 +235,162 @@ func TestStopWorkloadIsPersistentAndIdempotent(t *testing.T) {
 	_, err = service.StopWorkload(ownerCtx(), &controlplanev1.StopWorkloadRequest{RequestId: uuid.NewString(), WorkloadId: stop.WorkloadId})
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("conflicting stop code=%s", status.Code(err))
+	}
+}
+
+// --- ADR-028 §4: ReconcileWorkloadStatus / reconciliationTransition ---
+
+func seedWorkload(t *testing.T, repository *memoryRepository, workloadID, providerID, state string) {
+	t.Helper()
+	repository.byID[workloadID] = Workload{
+		WorkloadID: workloadID,
+		RequestID:  uuid.NewString(),
+		OwnerID:    testOwner,
+		ProviderID: providerID,
+		State:      state,
+	}
+}
+
+// TestReconcileWorkloadStatusAdvancesDeployingToRunning is the
+// straightforward, non-conflicting case: the Control Plane's own dispatch
+// believed DEPLOYING, the Agent's heartbeat confirms RUNNING.
+func TestReconcileWorkloadStatusAdvancesDeployingToRunning(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	workloadID := uuid.NewString()
+	seedWorkload(t, repository, workloadID, "provider-1", "DEPLOYING")
+
+	err := service.ReconcileWorkloadStatus(context.Background(), "provider-1", []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: workloadID, Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_RUNNING, ContainerId: "container-1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	stored := repository.byID[workloadID]
+	if stored.State != "RUNNING" || stored.ContainerID != "container-1" {
+		t.Fatalf("stored = %+v, want RUNNING with container-1", stored)
+	}
+}
+
+// TestReconcileWorkloadStatusConflictHandling is the acceptance
+// criterion's "conflict handling" case, verified against ADR-028 §4's own
+// specified resolution (agent-reported state wins, since it already
+// actually happened): the Control Plane believes RUNNING, but the Agent's
+// heartbeat reports the container Lost -- the Control Plane's view must
+// be corrected to FAILED, with an explicit error_code recording why.
+func TestReconcileWorkloadStatusConflictHandling(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	workloadID := uuid.NewString()
+	seedWorkload(t, repository, workloadID, "provider-1", "RUNNING")
+
+	err := service.ReconcileWorkloadStatus(context.Background(), "provider-1", []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: workloadID, Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_LOST},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	stored := repository.byID[workloadID]
+	if stored.State != "FAILED" {
+		t.Fatalf("state = %s, want FAILED", stored.State)
+	}
+	if stored.ErrorCode != "AGENT_REPORTED_LOST" {
+		t.Fatalf("error_code = %s, want AGENT_REPORTED_LOST", stored.ErrorCode)
+	}
+}
+
+// TestReconcileWorkloadStatusExpiredLease is the acceptance criterion's
+// "expired lease" case from the Control-Plane side: the Agent already
+// stopped the workload locally (ADR-028 §3's lease-expiry enforcement,
+// most likely while disconnected) before the Control Plane's own
+// STOPPING/StopAndConfirm flow got there -- reconciliation must catch the
+// Control Plane's view up to STOPPED rather than leaving it stuck at
+// RUNNING forever.
+func TestReconcileWorkloadStatusExpiredLease(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	workloadID := uuid.NewString()
+	seedWorkload(t, repository, workloadID, "provider-1", "RUNNING")
+
+	err := service.ReconcileWorkloadStatus(context.Background(), "provider-1", []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: workloadID, Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_STOPPED},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if stored := repository.byID[workloadID]; stored.State != "STOPPED" {
+		t.Fatalf("state = %s, want STOPPED", stored.State)
+	}
+}
+
+// TestReconcileWorkloadStatusDuplicateReportIsANoOp is the acceptance
+// criterion's "duplicate command" case applied to reconciliation itself:
+// replaying the exact same workload_status entry (e.g. the same heartbeat
+// redelivered, or two consecutive heartbeats both reporting RUNNING)
+// must not double-apply or error the second time -- the row has already
+// moved past the DEPLOYING precondition, so the second call is a
+// documented no-op.
+func TestReconcileWorkloadStatusDuplicateReportIsANoOp(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	workloadID := uuid.NewString()
+	seedWorkload(t, repository, workloadID, "provider-1", "DEPLOYING")
+	entry := []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: workloadID, Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_RUNNING, ContainerId: "container-1"},
+	}
+
+	if err := service.ReconcileWorkloadStatus(context.Background(), "provider-1", entry); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if err := service.ReconcileWorkloadStatus(context.Background(), "provider-1", entry); err != nil {
+		t.Fatalf("duplicate reconcile must not error: %v", err)
+	}
+	stored := repository.byID[workloadID]
+	if stored.State != "RUNNING" || stored.ContainerID != "container-1" {
+		t.Fatalf("stored = %+v, want unchanged RUNNING with container-1", stored)
+	}
+}
+
+// TestReconcileWorkloadStatusIgnoresAnotherProvidersWorkload is a safety
+// property, not named directly by the acceptance criteria but implied by
+// them: an Agent's heartbeat must never be able to reconcile a workload
+// belonging to a different provider, even if it happens to guess a valid
+// workload_id.
+func TestReconcileWorkloadStatusIgnoresAnotherProvidersWorkload(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	workloadID := uuid.NewString()
+	seedWorkload(t, repository, workloadID, "provider-1", "DEPLOYING")
+
+	err := service.ReconcileWorkloadStatus(context.Background(), "provider-2", []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: workloadID, Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_RUNNING, ContainerId: "container-1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if stored := repository.byID[workloadID]; stored.State != "DEPLOYING" {
+		t.Fatalf("state = %s, want unchanged DEPLOYING", stored.State)
+	}
+}
+
+// TestReconcileWorkloadStatusIgnoresPhasesWithNoControlPlaneAction covers
+// Provisioning/Starting/Unspecified -- reconciliationTransition
+// deliberately has no entry for these, so ReconcileWorkloadStatus must
+// leave the Control Plane's own state untouched.
+func TestReconcileWorkloadStatusIgnoresPhasesWithNoControlPlaneAction(t *testing.T) {
+	repository := newMemoryRepository()
+	service := NewService(repository)
+	workloadID := uuid.NewString()
+	seedWorkload(t, repository, workloadID, "provider-1", "DEPLOYING")
+
+	err := service.ReconcileWorkloadStatus(context.Background(), "provider-1", []*controlplanev1.WorkloadStatusSummary{
+		{WorkloadId: workloadID, Phase: controlplanev1.AgentWorkloadPhase_AGENT_WORKLOAD_PHASE_STARTING},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if stored := repository.byID[workloadID]; stored.State != "DEPLOYING" {
+		t.Fatalf("state = %s, want unchanged DEPLOYING", stored.State)
 	}
 }
 

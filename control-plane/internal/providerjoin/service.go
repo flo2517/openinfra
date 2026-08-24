@@ -97,6 +97,18 @@ type WorkloadService interface {
 	StopWorkload(context.Context, *controlplanev1.StopWorkloadRequest) (*controlplanev1.StopWorkloadResponse, error)
 }
 
+// WorkloadReconciler reconciles this heartbeat's Agent-reported
+// workload_status against the Control Plane's own authoritative workload
+// state (ADR-028 §4). Optional, like ValidatorSource/BandwidthUsageStore:
+// SetWorkloadReconciler may be left unset, and a reconciliation failure
+// degrades to a warning log inside ReportHeartbeat rather than failing the
+// whole heartbeat -- liveness (this RPC's core job) must not depend on
+// reconciliation succeeding, the same fail-open posture every other
+// optional heartbeat side-effect in this file already uses.
+type WorkloadReconciler interface {
+	ReconcileWorkloadStatus(ctx context.Context, providerID string, statuses []*controlplanev1.WorkloadStatusSummary) error
+}
+
 // ValidatorSource reads the current active Network Validator set (raw
 // 32-byte Ed25519 public keys) so ReportHeartbeat can push it to the Agent
 // every ~15s (ADR-013 §3). Optional, like orchestrator's ReputationSource:
@@ -109,17 +121,18 @@ type ValidatorSource interface {
 
 type Service struct {
 	controlplanev1.UnimplementedControlPlaneServiceServer
-	repository        Repository
-	heartbeats        HeartbeatStore
-	registrar         ProviderRegistrar
-	now               func() time.Time
-	challengeTTL      time.Duration
-	heartbeatInterval time.Duration
-	workloads         WorkloadService
-	validators        ValidatorSource
-	bandwidthUsage    BandwidthUsageStore
-	ca                *pki.CA
-	renewalNonces     RenewalNonceStore
+	repository         Repository
+	heartbeats         HeartbeatStore
+	registrar          ProviderRegistrar
+	now                func() time.Time
+	challengeTTL       time.Duration
+	heartbeatInterval  time.Duration
+	workloads          WorkloadService
+	validators         ValidatorSource
+	bandwidthUsage     BandwidthUsageStore
+	workloadReconciler WorkloadReconciler
+	ca                 *pki.CA
+	renewalNonces      RenewalNonceStore
 }
 
 func (s *Service) SetWorkloadService(workloads WorkloadService) { s.workloads = workloads }
@@ -128,6 +141,13 @@ func (s *Service) SetWorkloadService(workloads WorkloadService) { s.workloads = 
 // on every heartbeat response. See ValidatorSource's doc comment for the
 // degraded-mode behavior when unset or when a read fails.
 func (s *Service) SetValidatorSource(validators ValidatorSource) { s.validators = validators }
+
+// SetWorkloadReconciler enables ADR-028 §4 status-first reconciliation on
+// every heartbeat. See WorkloadReconciler's doc comment for the
+// degraded-mode behavior when unset or when reconciliation fails.
+func (s *Service) SetWorkloadReconciler(reconciler WorkloadReconciler) {
+	s.workloadReconciler = reconciler
+}
 
 // SetCertificateAuthority enables ADR-027 mTLS PKI enrollment
 // (CompleteJoin) and renewal (RenewCertificate). Left unset, CompleteJoin
@@ -311,6 +331,12 @@ func (s *Service) ReportHeartbeat(ctx context.Context, request *controlplanev1.R
 		return nil, repositoryError(err)
 	}
 	s.recordBandwidthUsage(ctx, request.Payload.ProviderId, request.Payload.WorkloadBandwidth)
+	// ADR-028 §4: reconciled synchronously, before this RPC returns its
+	// response -- not a separate async pass -- so "the Control Plane
+	// never dispatches a new command against stale state" holds by
+	// construction: internal/orchestrator's dispatch path only ever acts
+	// on the Postgres state this call just updated.
+	s.reconcileWorkloadStatus(ctx, request.Payload.ProviderId, request.Payload.WorkloadStatus)
 	now := s.now().UTC()
 	return &controlplanev1.ReportHeartbeatResponse{
 		Status:               sharedv1.NodeStatus_NODE_STATUS_ACTIVE,
@@ -340,6 +366,49 @@ func (s *Service) activeValidators(ctx context.Context) [][]byte {
 		keys[i] = bytes.Clone(account[:])
 	}
 	return keys
+}
+
+// reconcileWorkloadStatus is ReportHeartbeat's ADR-028 §4 side-effect: a
+// reconciliation failure (Postgres error, etc.) is logged at warn and does
+// not fail the heartbeat -- see WorkloadReconciler's doc comment for the
+// reasoning. Skipped entirely when unset (nil workloadReconciler), the
+// same optional-dependency shape as activeValidators/recordBandwidthUsage
+// above.
+func (s *Service) reconcileWorkloadStatus(ctx context.Context, providerID string, statuses []*controlplanev1.WorkloadStatusSummary) {
+	if s.workloadReconciler == nil || len(statuses) == 0 {
+		return
+	}
+	if err := s.workloadReconciler.ReconcileWorkloadStatus(ctx, providerID, statuses); err != nil {
+		slog.Warn("workload status reconciliation failed", "provider_id", providerID, "error", err)
+	}
+}
+
+// maxWorkloadStatusEntriesPerHeartbeat mirrors
+// maxWorkloadBandwidthEntriesPerHeartbeat's reasoning (bandwidth.go):
+// bounded by the Agent's own max_workloads setting (default 8), but the
+// Control Plane enforces its own generous ceiling regardless, so a
+// legitimate Agent with a higher configured limit is never rejected while
+// a wildly out-of-proportion payload (bug or abuse) still is.
+const maxWorkloadStatusEntriesPerHeartbeat = 256
+
+// validateWorkloadStatus checks the structural shape of each
+// workload_status entry ADR-028 §4 adds to the heartbeat payload. Mirrors
+// validateWorkloadBandwidth's shape and reasoning (bandwidth.go):
+// malformed entries fail the whole heartbeat up front, the same way any
+// other malformed top-level field already does.
+func validateWorkloadStatus(entries []*controlplanev1.WorkloadStatusSummary) error {
+	if len(entries) > maxWorkloadStatusEntriesPerHeartbeat {
+		return errors.New("workload_status exceeds the maximum entries per heartbeat")
+	}
+	for _, entry := range entries {
+		if entry == nil {
+			return errors.New("workload_status entries must not be nil")
+		}
+		if _, err := uuid.Parse(entry.WorkloadId); err != nil {
+			return errors.New("workload_status[].workload_id must be a UUID")
+		}
+	}
+	return nil
 }
 
 func validateHeartbeat(request *controlplanev1.ReportHeartbeatRequest, now time.Time) error {
@@ -378,6 +447,9 @@ func validateHeartbeat(request *controlplanev1.ReportHeartbeatRequest, now time.
 		return err
 	}
 	if err := validateWorkloadBandwidth(request.Payload.WorkloadBandwidth); err != nil {
+		return err
+	}
+	if err := validateWorkloadStatus(request.Payload.WorkloadStatus); err != nil {
 		return err
 	}
 	if len(request.Signature) != ed25519.SignatureSize {

@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -412,6 +412,24 @@ impl DockerExecutor {
                 "egress_mbps must not be negative and must be within policy".to_string(),
             ));
         }
+        // ADR-028 §3: required, not optional -- without a known lease_end
+        // the Agent has no local basis to bound how long it stays
+        // authorized to run this workload if it becomes disconnected from
+        // the Control Plane. This is a stricter reading than the ADR's own
+        // text (which only says the field is *added*, not that it is
+        // mandatory); the more conservative interpretation is chosen
+        // deliberately, per this ADR's own "when ambiguous, refuse rather
+        // than guess" instruction.
+        let lease_end = request
+            .lease_end
+            .as_ref()
+            .ok_or_else(|| ExecutorError::InvalidRequest("lease_end is required".to_string()))?;
+        if lease_end.seconds <= 0 {
+            return Err(ExecutorError::InvalidRequest(
+                "lease_end must be a positive timestamp".to_string(),
+            ));
+        }
+        let lease_end_unix = lease_end.seconds;
         let memory_bytes = limits.memory_mb.checked_mul(MIB).ok_or_else(|| {
             ExecutorError::InvalidRequest("memory limit overflows bytes".to_string())
         })?;
@@ -448,6 +466,7 @@ impl DockerExecutor {
                 phase: WorkloadPhase::Provisioning,
                 egress_mbps: limits.egress_mbps,
                 rate_limited: false,
+                lease_end: Some(lease_end_unix),
             },
             ContainerSpec {
                 name: format!("openinfra-{}", request.workload_id),
@@ -502,6 +521,81 @@ impl DockerExecutor {
             self.state.store_workload(&record)?;
         }
         Ok(())
+    }
+
+    /// ADR-028 §3: local, deterministic lease-expiry enforcement, bounded
+    /// strictly by each workload's own `lease_end` -- not by any separate,
+    /// arbitrary "how long can the Agent stay disconnected" timeout (the
+    /// ADR deliberately introduces none). Intended to run unconditionally
+    /// on the Agent's existing 15s heartbeat cadence (agent-cli's own
+    /// background task), whether or not the Agent is currently connected:
+    /// while connected, the Control Plane normally sends an explicit
+    /// `StopRequest` at lease end anyway, so this rarely fires first;
+    /// while disconnected, it is the only thing that does.
+    ///
+    /// `now` is caller-supplied (not read internally) so tests can assert
+    /// the exact clock-skew boundary deterministically rather than racing
+    /// the real clock.
+    ///
+    /// Only `Starting`/`Running` records are considered: `Provisioning`
+    /// has no container yet (nothing to stop), and
+    /// `Stopping`/`Stopped`/`Failed`/`Lost` already fall outside
+    /// `WorkloadPhase::consumes_capacity` -- there is nothing left
+    /// authorized to keep running for them either. A record with no
+    /// persisted `lease_end` (only possible for one written before this
+    /// field existed) is left alone -- see `WorkloadRecord::lease_end`'s
+    /// doc comment for why guessing one would violate this ADR's
+    /// never-fabricate principle.
+    ///
+    /// Returns the workload_ids actually stopped this pass, for the
+    /// caller to log. A single workload's `stop()` failure is logged and
+    /// does not abort the pass -- one bad workload must not block
+    /// reclaiming every other already-expired lease on the same tick; it
+    /// is retried on the next tick since its phase/lease_end are
+    /// unchanged.
+    pub async fn enforce_lease_expiry(&self, now: SystemTime) -> Result<Vec<String>> {
+        // ADR-028 §3: the same 2-minute clock-skew tolerance
+        // `providerjoin.maxHeartbeatClockSkew` already uses, reused
+        // rather than inventing a new number.
+        const CLOCK_SKEW_TOLERANCE_SECS: i64 = 120;
+        let now_unix = now
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let mut stopped = Vec::new();
+        for record in self.state.workloads()? {
+            if !matches!(
+                record.phase,
+                WorkloadPhase::Starting | WorkloadPhase::Running
+            ) {
+                continue;
+            }
+            let Some(lease_end) = record.lease_end else {
+                continue;
+            };
+            if now_unix < lease_end.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+                continue;
+            }
+            match Executor::stop(self, &record.workload_id).await {
+                Ok(()) => {
+                    info!(
+                        workload_id = %record.workload_id,
+                        lease_end,
+                        now_unix,
+                        "lease expired while disconnected or connected; stopped the workload locally"
+                    );
+                    stopped.push(record.workload_id.clone());
+                }
+                Err(error) => {
+                    warn!(
+                        workload_id = %record.workload_id,
+                        %error,
+                        "failed to stop a workload past its lease_end; will retry on the next tick"
+                    );
+                }
+            }
+        }
+        Ok(stopped)
     }
 
     fn map_observation(observation: &ContainerObservation) -> State {
@@ -643,8 +737,18 @@ impl Executor for DockerExecutor {
 
     async fn stop(&self, workload_id: &str) -> Result<()> {
         let _guard = self.operation_lock.lock().await;
-        let mut record = self.state.workload(workload_id)?;
-        if record.phase == WorkloadPhase::Stopped {
+        // ADR-028 §4: Stop is idempotent for a workload_id already
+        // Stopped/Failed, and for one this Agent has never heard of --
+        // stopping something that is already stopped, or that isn't (or
+        // is no longer) known here, is not a failure condition. This is
+        // what makes a Stop redelivered after a reconnect a safe no-op
+        // rather than a surfaced error.
+        let mut record = match self.state.workload(workload_id) {
+            Ok(record) => record,
+            Err(LocalStateError::WorkloadNotFound(_)) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if matches!(record.phase, WorkloadPhase::Stopped | WorkloadPhase::Failed) {
             return Ok(());
         }
         let container_id = record.container_id.clone().ok_or_else(|| {
@@ -896,6 +1000,17 @@ mod tests {
         }
     }
 
+    // ADR-028 §3: a lease_end comfortably in the future, so ordinary
+    // deploy()/stop() tests aren't incidentally exercising lease-expiry
+    // enforcement. Tests that specifically exercise enforce_lease_expiry
+    // override this field directly.
+    fn future_lease_end() -> prost_types::Timestamp {
+        prost_types::Timestamp {
+            seconds: 4_102_444_800, // 2100-01-01T00:00:00Z
+            nanos: 0,
+        }
+    }
+
     fn request(workload_id: Uuid, lease_id: Uuid) -> DeployRequest {
         DeployRequest {
             workload_id: workload_id.to_string(),
@@ -906,6 +1021,7 @@ mod tests {
                 memory_mb: 256,
                 egress_mbps: 0,
             }),
+            lease_end: Some(future_lease_end()),
         }
     }
 
@@ -1041,6 +1157,7 @@ mod tests {
             phase: agent_core::local_state::WorkloadPhase::Provisioning,
             egress_mbps: 0,
             rate_limited: false,
+            lease_end: None,
         };
         // reserve_workload (not store_workload -- that requires an
         // existing row) is deploy()'s own first step: reserve the
@@ -1402,6 +1519,234 @@ mod tests {
         assert!(executor.deploy(request).await.is_err());
     }
 
+    // --- ADR-028: disconnected mode / durable command reconciliation ---
+
+    #[tokio::test]
+    async fn deploy_rejects_a_request_with_no_lease_end() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        request.lease_end = None;
+
+        let error = executor
+            .deploy(request)
+            .await
+            .expect_err("a DeployRequest with no lease_end must be rejected");
+        assert!(error.to_string().contains("lease_end"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_non_positive_lease_end() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        request.lease_end = Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 0,
+        });
+
+        assert!(executor.deploy(request).await.is_err());
+    }
+
+    /// ADR-028 §4 "duplicate command" acceptance test, unknown-workload
+    /// case: a Stop for a workload_id this Agent has never heard of (e.g.
+    /// redelivered after a reconnect against a since-restarted Agent, or
+    /// simply never seen here) must succeed, not error.
+    #[tokio::test]
+    async fn stop_is_idempotent_for_a_workload_unknown_to_this_agent() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+
+        executor
+            .stop("00000000-0000-0000-0000-000000000000")
+            .await
+            .expect("stop of an unknown workload_id must succeed, not error");
+    }
+
+    /// ADR-028 §4 "duplicate command" acceptance test, Failed case: a
+    /// second Stop after the first already drove the workload to Failed
+    /// (e.g. a start() failure) must also succeed, not error -- Stopped is
+    /// already covered by stop_and_status_use_the_persisted_exact_
+    /// container_id above.
+    #[tokio::test]
+    async fn stop_is_idempotent_for_an_already_failed_workload() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request(Uuid::new_v4(), Uuid::new_v4());
+        let workload_id = request.workload_id.clone();
+        executor.deploy(request).await.expect("deploy");
+        let mut record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record");
+        record.phase = WorkloadPhase::Failed;
+        executor.state.store_workload(&record).expect("store");
+
+        executor
+            .stop(&workload_id)
+            .await
+            .expect("stop of an already-failed workload must succeed, not error");
+    }
+
+    /// ADR-028 §3 "expired lease" acceptance test: a Running workload
+    /// whose lease_end has passed (beyond the clock-skew tolerance) must
+    /// be stopped by enforce_lease_expiry on its own, with no Control
+    /// Plane involvement.
+    #[tokio::test]
+    async fn enforce_lease_expiry_stops_a_running_workload_past_its_lease_end() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        let lease_end_seconds = 1_700_000_000i64;
+        request.lease_end = Some(prost_types::Timestamp {
+            seconds: lease_end_seconds,
+            nanos: 0,
+        });
+        let workload_id = request.workload_id.clone();
+        executor.deploy(request).await.expect("deploy");
+
+        // Well past lease_end plus the 2-minute clock-skew tolerance.
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_500);
+        let stopped = executor
+            .enforce_lease_expiry(now)
+            .await
+            .expect("enforce_lease_expiry");
+
+        assert_eq!(stopped, vec![workload_id.clone()]);
+        let record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record");
+        assert_eq!(record.phase, WorkloadPhase::Stopped);
+        assert_eq!(
+            engine.stopped.lock().expect("stopped lock").len(),
+            1,
+            "the container must actually have been stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_lease_expiry_leaves_a_workload_within_the_clock_skew_tolerance_running() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        let lease_end_seconds = 1_700_000_000i64;
+        request.lease_end = Some(prost_types::Timestamp {
+            seconds: lease_end_seconds,
+            nanos: 0,
+        });
+        let workload_id = request.workload_id.clone();
+        executor.deploy(request).await.expect("deploy");
+
+        // Exactly 60s past lease_end -- inside the 2-minute tolerance, must
+        // not be stopped yet.
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_060);
+        let stopped = executor
+            .enforce_lease_expiry(now)
+            .await
+            .expect("enforce_lease_expiry");
+
+        assert!(
+            stopped.is_empty(),
+            "a workload still inside clock-skew tolerance must not be stopped"
+        );
+        let record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record");
+        assert_eq!(record.phase, WorkloadPhase::Running);
+        assert!(engine.stopped.lock().expect("stopped lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn enforce_lease_expiry_ignores_a_workload_with_no_persisted_lease_end() {
+        // A record persisted before this ADR's lease_end field existed
+        // (simulated here directly, since deploy() itself now requires
+        // lease_end) must never be auto-stopped by a guessed expiry --
+        // ADR-028's "never fabricate" principle applies to locally
+        // synthesized authority too, not only to Control-Plane
+        // acknowledgements.
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request(Uuid::new_v4(), Uuid::new_v4());
+        let workload_id = request.workload_id.clone();
+        executor.deploy(request).await.expect("deploy");
+        let mut record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record");
+        record.lease_end = None;
+        executor.state.store_workload(&record).expect("store");
+
+        let far_future = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_102_444_800);
+        let stopped = executor
+            .enforce_lease_expiry(far_future)
+            .await
+            .expect("enforce_lease_expiry");
+
+        assert!(stopped.is_empty());
+        assert!(engine.stopped.lock().expect("stopped lock").is_empty());
+    }
+
+    /// ADR-028 "restart" acceptance test: an Agent process restart mid-
+    /// disconnection must not lose the durable lease_end it needs to keep
+    /// enforcing §3's policy, and must not double-continue (re-create) an
+    /// already-running workload.
+    #[tokio::test]
+    async fn restart_preserves_lease_end_and_does_not_double_continue() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4());
+        let lease_end_seconds = 4_102_444_800i64; // far future
+        request.lease_end = Some(prost_types::Timestamp {
+            seconds: lease_end_seconds,
+            nanos: 0,
+        });
+        let workload_id = request.workload_id.clone();
+        let container_id = {
+            let executor = executor(engine.clone(), directory.path(), 1);
+            executor.deploy(request).await.expect("deploy")
+        };
+
+        // The process "restarts": a fresh DockerExecutor opens the same
+        // sled directory and runs its startup recover() pass.
+        let restarted = executor(engine.clone(), directory.path(), 1);
+        restarted.recover().await.expect("recover");
+
+        let record = restarted
+            .state
+            .workload(&workload_id)
+            .expect("workload record survives the restart");
+        assert_eq!(record.phase, WorkloadPhase::Running);
+        assert_eq!(
+            record.lease_end,
+            Some(lease_end_seconds),
+            "lease_end must survive the restart unchanged"
+        );
+        assert_eq!(record.container_id.as_deref(), Some(container_id.as_str()));
+        assert_eq!(
+            engine.created.lock().expect("created lock").len(),
+            1,
+            "recover() must not double-continue by creating a second container"
+        );
+
+        // lease-expiry enforcement must still work against the recovered
+        // record, using the exact same lease_end recover() preserved.
+        let far_future = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_200_000_000);
+        let stopped = restarted
+            .enforce_lease_expiry(far_future)
+            .await
+            .expect("enforce_lease_expiry after restart");
+        assert_eq!(stopped, vec![workload_id]);
+    }
+
     #[tokio::test]
     async fn docker_integration_applies_mandatory_controls() {
         let image = match std::env::var("OPENINFRA_TEST_DOCKER_IMAGE") {
@@ -1437,6 +1782,7 @@ mod tests {
                 // module's own tests for the invocation-level coverage.
                 egress_mbps: 0,
             }),
+            lease_end: Some(future_lease_end()),
         };
         let container_id = executor.deploy(request.clone()).await.expect("deploy");
         let docker = Docker::connect_with_local_defaults().expect("Docker client");

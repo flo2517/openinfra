@@ -30,7 +30,10 @@ pub use openinfra::agent::v1 as proto;
 
 use crate::openinfra::shared::v1::MeteringSummary;
 use crate::proto::*;
-use agent_core::{identity::IdentityManager, local_state::LocalStateError, AgentConfig};
+use agent_core::{
+    disconnect::DisconnectState, identity::IdentityManager, local_state::LocalStateError,
+    AgentConfig,
+};
 use agent_inventory::InventoryManager;
 use async_trait::async_trait;
 use rand::RngCore;
@@ -193,6 +196,11 @@ pub struct AgentGrpcServer {
     pub inventory_manager: Arc<InventoryManager>,
     pub executor: Arc<dyn Executor>,
     pub bandwidth_rate_limiter: BandwidthRateLimiter,
+    /// ADR-028 §1/§2: shared with agent-cli's background heartbeat task.
+    /// `deploy()` below consults this before enqueueing any new work; the
+    /// heartbeat task is the only writer (`record_success`/
+    /// `record_failure`).
+    pub disconnect_state: DisconnectState,
 }
 
 /// Sentinel key for a MeasureBandwidth caller this handler could not
@@ -414,6 +422,20 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
         &self,
         request: Request<DeployRequest>,
     ) -> Result<Response<DeployResponse>, Status> {
+        // ADR-028 §2: refuse all new work while disconnected -- checked
+        // before touching the event bus or the request body at all, so
+        // this never depends on the executor/Docker being reachable
+        // either. This is a one-way gate for *new* commitments only;
+        // `stop` below is deliberately exempt (see its own doc comment on
+        // why refusing it would make disconnection strictly more
+        // dangerous, not less). Never a silent timeout, never a
+        // fabricated success -- an explicit, immediate refusal.
+        if self.disconnect_state.is_disconnected() {
+            return Err(Status::failed_precondition(
+                "agent is disconnected from the Control Plane, refusing new work",
+            ));
+        }
+
         let req = request.into_inner();
         info!(
             "gRPC: DeployRequest received for workload {}",
@@ -644,6 +666,14 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
     }
 
     async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
+        // ADR-028 §2: deliberately no disconnected-mode check here, unlike
+        // deploy() above -- Stop is always accepted regardless of
+        // connection state. Winding a workload down is never less safe
+        // than continuing it, including in the one-directional-partition
+        // case (the Agent cannot reach the Control Plane outbound, but the
+        // Control Plane can still open an inbound connection to this
+        // server). agent-executor::DockerExecutor::stop is idempotent for
+        // an already-Stopped/Failed/unknown workload_id (ADR-028 §4).
         let req = request.into_inner();
         info!(
             "gRPC: StopRequest received for workload {}",
@@ -809,7 +839,97 @@ mod tests {
             inventory_manager: Arc::new(InventoryManager::new()),
             executor,
             bandwidth_rate_limiter: BandwidthRateLimiter::new(),
+            disconnect_state: DisconnectState::new(),
         }
+    }
+
+    // --- ADR-028: disconnected-mode Deploy refusal ---
+
+    /// "partition" acceptance test, boundary case: exactly
+    /// agent_core::disconnect::DISCONNECT_THRESHOLD (3) consecutive
+    /// heartbeat failures must trip refusal; two must not -- proven here
+    /// by observing the request actually reach the event bus (not
+    /// short-circuited by the disconnected-mode check), not merely by
+    /// inspecting DisconnectState directly.
+    #[tokio::test]
+    async fn deploy_is_allowed_below_the_disconnect_threshold() {
+        let (identity, _dir) = test_identity();
+        let (event_bus, mut receiver) = mpsc::channel(1);
+        let server = Arc::new(AgentGrpcServer {
+            config: AgentConfig::default(),
+            event_bus,
+            identity_manager: identity,
+            inventory_manager: Arc::new(InventoryManager::new()),
+            executor: Arc::new(NoopExecutor),
+            bandwidth_rate_limiter: BandwidthRateLimiter::new(),
+            disconnect_state: DisconnectState::new(),
+        });
+        server.disconnect_state.record_failure();
+        server.disconnect_state.record_failure();
+        assert!(!server.disconnect_state.is_disconnected());
+
+        let request = Request::new(DeployRequest {
+            workload_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            lease_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            image: "busybox:1.36".to_string(),
+            limits: None,
+            lease_end: None,
+        });
+        let deploy_server = server.clone();
+        let handle = tokio::spawn(async move { deploy_server.deploy(request).await });
+
+        let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("event bus recv must not time out below the disconnect threshold")
+            .expect("event bus must have an event");
+        let AgentEvent::CmdDeploy { responder, .. } = event else {
+            panic!("expected a CmdDeploy event");
+        };
+        let _ = responder.send(Ok("container-1".to_string()));
+
+        let response = handle
+            .await
+            .expect("deploy task joined")
+            .expect("deploy must not be refused below the threshold")
+            .into_inner();
+        assert!(response.success);
+        assert_eq!(response.container_id, "container-1");
+    }
+
+    #[tokio::test]
+    async fn deploy_is_refused_once_disconnected() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity);
+        for _ in 0..agent_core::disconnect::DISCONNECT_THRESHOLD {
+            server.disconnect_state.record_failure();
+        }
+        assert!(server.disconnect_state.is_disconnected());
+
+        let request = Request::new(DeployRequest {
+            workload_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            lease_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            image: "busybox:1.36".to_string(),
+            limits: None,
+            lease_end: None,
+        });
+        let status = server
+            .deploy(request)
+            .await
+            .expect_err("Deploy must be refused while disconnected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn deploy_is_allowed_again_immediately_after_reconnecting() {
+        let (identity, _dir) = test_identity();
+        let server = test_server(identity);
+        for _ in 0..agent_core::disconnect::DISCONNECT_THRESHOLD {
+            server.disconnect_state.record_failure();
+        }
+        assert!(server.disconnect_state.is_disconnected());
+        server.disconnect_state.record_success();
+        assert!(!server.disconnect_state.is_disconnected());
     }
 
     #[tokio::test]

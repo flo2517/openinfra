@@ -7,8 +7,9 @@ use agent_api::{
     AgentEvent, AgentGrpcServer, Executor,
 };
 use agent_core::{
+    disconnect::DisconnectState,
     identity::{Ed25519IdentityManager, IdentityManager},
-    local_state::{LeafCertificate, LocalState},
+    local_state::{LeafCertificate, LocalState, WorkloadPhase},
     AgentConfig,
 };
 use agent_executor::DockerExecutor;
@@ -84,12 +85,20 @@ async fn handle_start(dev: bool) -> Result<()> {
     // (even in --dev, where it's never read) so report_heartbeat_with_state
     // has one signature regardless of mode.
     let validator_allowlist = ValidatorAllowlist::new();
+    // ADR-028 §1/§2: one DisconnectState per process, shared between the
+    // heartbeat loop below (the only writer: record_success/
+    // record_failure) and AgentGrpcServer's deploy() handler (the reader
+    // that refuses new work once disconnected). Both already share one
+    // process and one Arc<LocalState> handle -- this needs no new
+    // cross-task coordination primitive beyond another Arc-backed clone.
+    let disconnect_state = DisconnectState::new();
     let heartbeat_config = config.clone();
     let heartbeat_state = Arc::clone(&local_state);
     let heartbeat_allowlist = validator_allowlist.clone();
+    let heartbeat_disconnect_state = disconnect_state.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = report_heartbeat_with_state(
+            match report_heartbeat_with_state(
                 &heartbeat_config,
                 dev,
                 &heartbeat_state,
@@ -97,7 +106,23 @@ async fn handle_start(dev: bool) -> Result<()> {
             )
             .await
             {
-                error!(%error, "background heartbeat failed");
+                Ok(()) => heartbeat_disconnect_state.record_success(),
+                Err(error) => {
+                    error!(%error, "background heartbeat failed");
+                    // ADR-028 §1: "failed" covers any error from the
+                    // heartbeat call above -- a network error, an
+                    // unreachable Control Plane, an expired mTLS
+                    // certificate, or a non-2xx gRPC status all surface as
+                    // an Err here already, so this one call site captures
+                    // every case the ADR describes.
+                    if heartbeat_disconnect_state.record_failure() {
+                        warn!(
+                            "3 consecutive heartbeat failures: declaring this Agent disconnected \
+                             from the Control Plane; refusing new Deploy commands until \
+                             reconnected"
+                        );
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
@@ -117,6 +142,28 @@ async fn handle_start(dev: bool) -> Result<()> {
     });
     let executor =
         Arc::new(DockerExecutor::connect(Arc::clone(&local_state), config.executor.clone()).await?);
+    // ADR-028 §3: reuses the same 15s cadence as the heartbeat loop above
+    // (no new timer). Runs unconditionally, connected or not -- see
+    // DockerExecutor::enforce_lease_expiry's own doc comment for why this
+    // is deliberately not gated on disconnect_state.
+    let lease_expiry_executor = Arc::clone(&executor);
+    tokio::spawn(async move {
+        loop {
+            match lease_expiry_executor
+                .enforce_lease_expiry(std::time::SystemTime::now())
+                .await
+            {
+                Ok(stopped) if !stopped.is_empty() => {
+                    info!(?stopped, "stopped workloads past their lease_end");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    error!(%error, "lease-expiry enforcement pass failed");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    });
     let (event_bus, mut events) = tokio::sync::mpsc::channel(100);
     let event_executor = Arc::clone(&executor);
 
@@ -153,6 +200,7 @@ async fn handle_start(dev: bool) -> Result<()> {
         inventory_manager,
         executor,
         bandwidth_rate_limiter: agent_api::BandwidthRateLimiter::new(),
+        disconnect_state,
     };
 
     // tonic's default per-message limit (4 MiB, both directions) predates
@@ -341,6 +389,7 @@ async fn report_heartbeat_with_state(
         }),
         capabilities: Some(resource_capability(config, &inventory)),
         workload_bandwidth: workload_bandwidth_usage(state).await,
+        workload_status: workload_status_summary(state),
     };
     let mut signed = Vec::with_capacity(HEARTBEAT_DOMAIN.len() + payload.encoded_len());
     signed.extend_from_slice(HEARTBEAT_DOMAIN);
@@ -598,6 +647,52 @@ async fn workload_bandwidth_usage(
             })
         })
         .collect()
+}
+
+/// ADR-028 §4: this heartbeat's `workload_status` snapshot -- every
+/// locally-known workload, always, not a special "resuming after
+/// disconnect" message. Bounded by exactly the same set `LocalState`
+/// itself holds (already capped by `ExecutorSettings::max_workloads`), so
+/// no separate truncation is needed here. A record that fails to encode
+/// cleanly (should not happen; spec_hash is always exactly 32 bytes) is
+/// skipped with a warning rather than failing the whole heartbeat --
+/// liveness must not depend on every workload's status being reportable.
+fn workload_status_summary(state: &LocalState) -> Vec<controlplanev1::WorkloadStatusSummary> {
+    let workloads = match state.workloads() {
+        Ok(workloads) => workloads,
+        Err(error) => {
+            warn!(%error, "failed to list local workloads; omitting workload_status from this heartbeat");
+            return Vec::new();
+        }
+    };
+    workloads
+        .into_iter()
+        .map(|record| controlplanev1::WorkloadStatusSummary {
+            workload_id: record.workload_id,
+            phase: map_workload_phase(record.phase) as i32,
+            container_id: record.container_id.unwrap_or_default(),
+            spec_hash: record.spec_hash.to_vec(),
+        })
+        .collect()
+}
+
+/// One-to-one mapping from agent-core's local phase vocabulary to the
+/// wire enum -- see AgentWorkloadPhase's proto doc comment for why this
+/// is a distinct enum from the Control Plane's own WorkloadState, not a
+/// reuse of it.
+fn map_workload_phase(
+    phase: agent_core::local_state::WorkloadPhase,
+) -> controlplanev1::AgentWorkloadPhase {
+    use controlplanev1::AgentWorkloadPhase as Wire;
+    match phase {
+        WorkloadPhase::Provisioning => Wire::Provisioning,
+        WorkloadPhase::Starting => Wire::Starting,
+        WorkloadPhase::Running => Wire::Running,
+        WorkloadPhase::Stopping => Wire::Stopping,
+        WorkloadPhase::Stopped => Wire::Stopped,
+        WorkloadPhase::Failed => Wire::Failed,
+        WorkloadPhase::Lost => Wire::Lost,
+    }
 }
 
 /// Builds the ResourceCapability reported on both CompleteJoin and every
@@ -932,6 +1027,11 @@ mod tests {
                     nanos: 0,
                 }),
             }],
+            // Empty: proto3 does not encode an empty repeated field, so
+            // this addition (ADR-028 §4) leaves EXPECTED_WIRE_BYTES_HEX
+            // below unchanged -- verified by this test still passing
+            // unmodified.
+            workload_status: vec![],
         };
         let mut signed = Vec::with_capacity(HEARTBEAT_DOMAIN.len() + payload.encoded_len());
         signed.extend_from_slice(HEARTBEAT_DOMAIN);

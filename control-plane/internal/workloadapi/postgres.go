@@ -151,6 +151,37 @@ func (r *PostgresRepository) MarkStopped(ctx context.Context, item Workload, lea
 	return nil
 }
 
+// ReconcileFromAgent implements Repository.ReconcileFromAgent (ADR-028
+// §4). Both providerID and fromStates are part of the WHERE clause, not a
+// fetch-then-compare in Go: an Agent can only ever reconcile a row it
+// still owns, and only out of the exact precondition state
+// reconciliationTransition selected for this phase. errorCode/last_error
+// are set only for a FAILED transition (errorCode non-empty); a
+// successful RUNNING/STOPPED transition instead clears them, matching
+// MarkRunning/MarkStopped's own convention of clearing stale
+// error/retry state on a forward transition. worker_id/worker_lease_until
+// are always cleared: this write did not come from a worker claim, and
+// leaving a stale claim in place could block the next legitimate
+// ClaimNext for no reason.
+func (r *PostgresRepository) ReconcileFromAgent(ctx context.Context, workloadID, providerID string, fromStates []string, toState, containerID, errorCode string) (bool, error) {
+	if workloadID == "" || providerID == "" || toState == "" || len(fromStates) == 0 {
+		return false, errors.New("workload id, provider id, target state, and at least one source state are required")
+	}
+	var command pgconn.CommandTag
+	var err error
+	if errorCode != "" {
+		command, err = r.pool.Exec(ctx, `UPDATE workloads SET state=$1, error_code=$2, last_error=$3, version=version+1, updated_at=now(), next_attempt_at=NULL, worker_id=NULL, worker_lease_until=NULL WHERE workload_id=$4 AND provider_id=$5 AND state=ANY($6)`,
+			toState, errorCode, "Agent reported "+errorCode, workloadID, providerID, fromStates)
+	} else {
+		command, err = r.pool.Exec(ctx, `UPDATE workloads SET state=$1, container_id=COALESCE(NULLIF($2,''), container_id), error_code=NULL, last_error=NULL, version=version+1, updated_at=now(), next_attempt_at=NULL, worker_id=NULL, worker_lease_until=NULL WHERE workload_id=$3 AND provider_id=$4 AND state=ANY($5)`,
+			toState, containerID, workloadID, providerID, fromStates)
+	}
+	if err != nil {
+		return false, err
+	}
+	return command.RowsAffected() == 1, nil
+}
+
 func (r *PostgresRepository) BeginScheduling(ctx context.Context, item Workload) error {
 	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='SCHEDULING', version=version+1, updated_at=now(), error_code=NULL, last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='REQUESTED' AND version=$2 AND worker_id=$3 AND worker_lease_until>now()`, item.WorkloadID, item.Version, item.WorkerID)
 	if err != nil {
