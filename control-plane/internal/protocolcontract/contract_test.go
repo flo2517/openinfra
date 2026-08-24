@@ -16,7 +16,7 @@ func TestJoinAndHeartbeatBelongToControlPlane(t *testing.T) {
 	if controlPlane == nil {
 		t.Fatal("ControlPlaneService descriptor is missing")
 	}
-	for _, method := range []protoreflect.Name{"BeginJoin", "CompleteJoin", "ReportHeartbeat", "SubmitWorkload", "GetWorkload", "StopWorkload"} {
+	for _, method := range []protoreflect.Name{"BeginJoin", "CompleteJoin", "RenewCertificate", "ReportHeartbeat", "SubmitWorkload", "GetWorkload", "StopWorkload"} {
 		if controlPlane.Methods().ByName(method) == nil {
 			t.Fatalf("ControlPlaneService.%s is missing", method)
 		}
@@ -104,5 +104,77 @@ func TestEnumsReserveZeroForUnspecified(t *testing.T) {
 		sharedv1.WorkloadProfile_WORKLOAD_PROFILE_UNSPECIFIED != 0 ||
 		sharedv1.LeaseState_LEASE_STATE_UNSPECIFIED != 0 {
 		t.Fatal("shared enum zero values must remain unspecified")
+	}
+}
+
+// TestNodeStatusRevokedIsPinned is ADR-027 §4's contract-conformance case:
+// NODE_STATUS_REVOKED must stay exactly 6 -- agentmanager/orchestrator
+// treat any non-ACTIVE status as excluded already (see
+// PostgresRegistry.ListActive's WHERE status = $1), so this only needs to
+// pin the wire value, not add new exclusion logic.
+func TestNodeStatusRevokedIsPinned(t *testing.T) {
+	if sharedv1.NodeStatus_NODE_STATUS_REVOKED != 6 {
+		t.Fatalf("NodeStatus_NODE_STATUS_REVOKED = %d, want 6", sharedv1.NodeStatus_NODE_STATUS_REVOKED)
+	}
+}
+
+// TestCompleteJoinCarriesADR027EnrollmentFields pins the exact field
+// numbers ADR-027 §2 adds to CompleteJoinRequest/CompleteJoinResponse --
+// enrollment extends the existing RPC rather than adding a new one, so a
+// future regeneration must not silently renumber these out from under an
+// already-deployed Agent/Control Plane pair.
+func TestCompleteJoinCarriesADR027EnrollmentFields(t *testing.T) {
+	requestFields := controlplanev1.File_openinfra_controlplane_v1_control_plane_proto.Messages().ByName("CompleteJoinRequest").Fields()
+	if field := requestFields.ByName("tls_public_key"); field == nil || field.Number() != 5 {
+		t.Fatalf("CompleteJoinRequest.tls_public_key must be field 5, got %+v", field)
+	}
+	responseFields := controlplanev1.File_openinfra_controlplane_v1_control_plane_proto.Messages().ByName("CompleteJoinResponse").Fields()
+	if field := responseFields.ByName("certificate_pem"); field == nil || field.Number() != 5 {
+		t.Fatalf("CompleteJoinResponse.certificate_pem must be field 5, got %+v", field)
+	}
+	if field := responseFields.ByName("certificate_expires_at"); field == nil || field.Number() != 6 {
+		t.Fatalf("CompleteJoinResponse.certificate_expires_at must be field 6, got %+v", field)
+	}
+}
+
+// TestRenewCertificateMessagesArePinned is the RenewCertificate half of
+// ADR-027 §3's contract-conformance case, round-tripping both messages
+// through the wire and pinning their field numbers the same way
+// TestCompleteJoinCarriesADR027EnrollmentFields does for enrollment.
+func TestRenewCertificateMessagesArePinned(t *testing.T) {
+	request := &controlplanev1.RenewCertificateRequest{
+		RequestId: "request-1", ProviderId: "provider-1",
+		NewTlsPublicKey:          []byte("0123456789012345678901234567890123456789"[:32]),
+		CurrentCertificateSerial: "12345", Nonce: 7, Signature: make([]byte, 64),
+	}
+	requestBytes, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal RenewCertificateRequest: %v", err)
+	}
+	var decodedRequest controlplanev1.RenewCertificateRequest
+	if err := proto.Unmarshal(requestBytes, &decodedRequest); err != nil {
+		t.Fatalf("unmarshal RenewCertificateRequest: %v", err)
+	}
+	if decodedRequest.ProviderId != request.ProviderId || decodedRequest.CurrentCertificateSerial != request.CurrentCertificateSerial {
+		t.Fatal("RenewCertificateRequest did not round-trip")
+	}
+
+	requestFields := controlplanev1.File_openinfra_controlplane_v1_control_plane_proto.Messages().ByName("RenewCertificateRequest").Fields()
+	for name, number := range map[string]protoreflect.FieldNumber{
+		"request_id": 1, "provider_id": 2, "new_tls_public_key": 3,
+		"current_certificate_serial": 4, "timestamp": 5, "nonce": 6, "signature": 7,
+	} {
+		if field := requestFields.ByName(protoreflect.Name(name)); field == nil || field.Number() != number {
+			t.Fatalf("RenewCertificateRequest.%s must be field %d, got %+v", name, number, field)
+		}
+	}
+
+	responseFields := controlplanev1.File_openinfra_controlplane_v1_control_plane_proto.Messages().ByName("RenewCertificateResponse").Fields()
+	for name, number := range map[string]protoreflect.FieldNumber{
+		"certificate_pem": 1, "certificate_expires_at": 2, "certificate_serial": 3,
+	} {
+		if field := responseFields.ByName(protoreflect.Name(name)); field == nil || field.Number() != number {
+			t.Fatalf("RenewCertificateResponse.%s must be field %d, got %+v", name, number, field)
+		}
 	}
 }

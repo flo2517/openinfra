@@ -28,6 +28,7 @@ const (
 	ProviderAgentService_GetWorkloadStatus_FullMethodName = "/openinfra.agent.v1.ProviderAgentService/GetWorkloadStatus"
 	ProviderAgentService_StreamMetrics_FullMethodName     = "/openinfra.agent.v1.ProviderAgentService/StreamMetrics"
 	ProviderAgentService_MeasureBandwidth_FullMethodName  = "/openinfra.agent.v1.ProviderAgentService/MeasureBandwidth"
+	ProviderAgentService_GetUsageSummary_FullMethodName   = "/openinfra.agent.v1.ProviderAgentService/GetUsageSummary"
 )
 
 // ProviderAgentServiceClient is the client API for ProviderAgentService service.
@@ -48,6 +49,14 @@ type ProviderAgentServiceClient interface {
 	// live challenge loop (#85) with its existing small-payload liveness/
 	// correctness semantics, which this does not change.
 	MeasureBandwidth(ctx context.Context, in *MeasureBandwidthRequest, opts ...grpc.CallOption) (*MeasureBandwidthResponse, error)
+	// ADR-029 / issue #20: pulled by the Control Plane (or any other
+	// relayer holding a live Agent connection), not pushed by the Agent --
+	// the least-invasive fit on this service, matching GetWorkloadStatus's
+	// existing pull shape rather than ReportHeartbeat's push shape on
+	// ControlPlaneService. Returns one bounded, signed MeteringSummary
+	// covering usage since that workload's last-issued sequence. See
+	// GetUsageSummaryResponse's doc comment for the signing/hash details.
+	GetUsageSummary(ctx context.Context, in *GetUsageSummaryRequest, opts ...grpc.CallOption) (*GetUsageSummaryResponse, error)
 }
 
 type providerAgentServiceClient struct {
@@ -157,6 +166,16 @@ func (c *providerAgentServiceClient) MeasureBandwidth(ctx context.Context, in *M
 	return out, nil
 }
 
+func (c *providerAgentServiceClient) GetUsageSummary(ctx context.Context, in *GetUsageSummaryRequest, opts ...grpc.CallOption) (*GetUsageSummaryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetUsageSummaryResponse)
+	err := c.cc.Invoke(ctx, ProviderAgentService_GetUsageSummary_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ProviderAgentServiceServer is the server API for ProviderAgentService service.
 // All implementations must embed UnimplementedProviderAgentServiceServer
 // for forward compatibility.
@@ -175,6 +194,14 @@ type ProviderAgentServiceServer interface {
 	// live challenge loop (#85) with its existing small-payload liveness/
 	// correctness semantics, which this does not change.
 	MeasureBandwidth(context.Context, *MeasureBandwidthRequest) (*MeasureBandwidthResponse, error)
+	// ADR-029 / issue #20: pulled by the Control Plane (or any other
+	// relayer holding a live Agent connection), not pushed by the Agent --
+	// the least-invasive fit on this service, matching GetWorkloadStatus's
+	// existing pull shape rather than ReportHeartbeat's push shape on
+	// ControlPlaneService. Returns one bounded, signed MeteringSummary
+	// covering usage since that workload's last-issued sequence. See
+	// GetUsageSummaryResponse's doc comment for the signing/hash details.
+	GetUsageSummary(context.Context, *GetUsageSummaryRequest) (*GetUsageSummaryResponse, error)
 	mustEmbedUnimplementedProviderAgentServiceServer()
 }
 
@@ -211,6 +238,9 @@ func (UnimplementedProviderAgentServiceServer) StreamMetrics(*StreamMetricsReque
 }
 func (UnimplementedProviderAgentServiceServer) MeasureBandwidth(context.Context, *MeasureBandwidthRequest) (*MeasureBandwidthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MeasureBandwidth not implemented")
+}
+func (UnimplementedProviderAgentServiceServer) GetUsageSummary(context.Context, *GetUsageSummaryRequest) (*GetUsageSummaryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUsageSummary not implemented")
 }
 func (UnimplementedProviderAgentServiceServer) mustEmbedUnimplementedProviderAgentServiceServer() {}
 func (UnimplementedProviderAgentServiceServer) testEmbeddedByValue()                              {}
@@ -388,6 +418,24 @@ func _ProviderAgentService_MeasureBandwidth_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ProviderAgentService_GetUsageSummary_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetUsageSummaryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProviderAgentServiceServer).GetUsageSummary(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProviderAgentService_GetUsageSummary_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProviderAgentServiceServer).GetUsageSummary(ctx, req.(*GetUsageSummaryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ProviderAgentService_ServiceDesc is the grpc.ServiceDesc for ProviderAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -426,6 +474,10 @@ var ProviderAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "MeasureBandwidth",
 			Handler:    _ProviderAgentService_MeasureBandwidth_Handler,
+		},
+		{
+			MethodName: "GetUsageSummary",
+			Handler:    _ProviderAgentService_GetUsageSummary_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -4,7 +4,22 @@ use std::sync::Mutex;
 use thiserror::Error;
 
 const HEARTBEAT_SEQUENCE_KEY: &[u8] = b"heartbeat_sequence";
+// ADR-027 §3: the durably persisted, strictly increasing per-provider
+// counter RenewCertificateRequest.nonce signs -- the renewal-specific
+// sibling of HEARTBEAT_SEQUENCE_KEY, deliberately a separate counter (a
+// renewal roughly once a day must not be starved by, or interfere with,
+// the heartbeat sequence ticking every ~15s).
+const RENEWAL_NONCE_KEY: &[u8] = b"renewal_nonce";
+// ADR-027 §2/§3/§5: the Agent's current mTLS leaf identity -- its own
+// freshly generated private key (never transmitted anywhere, per §5) and
+// the Control-Plane-issued certificate for it. A single key, not a tree:
+// there is exactly one leaf identity in use for new connections at a
+// time; the ADR's overlap window is about already-open connections
+// continuing on whatever certificate they authenticated with, not about
+// this Agent process needing to remember more than one.
+const LEAF_CERTIFICATE_KEY: &[u8] = b"leaf_certificate";
 const WORKLOAD_TREE: &str = "workloads-v1";
+const METERING_TREE: &str = "metering-cursors-v1";
 
 #[derive(Debug, Error)]
 pub enum LocalStateError {
@@ -14,6 +29,10 @@ pub enum LocalStateError {
     CorruptSequence,
     #[error("heartbeat sequence overflow")]
     SequenceOverflow,
+    #[error("metering sequence overflow for workload {0}")]
+    MeteringSequenceOverflow(String),
+    #[error("stored metering cursor for workload {0} is corrupt")]
+    CorruptMeteringCursor(String),
     #[error("workload state serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("workload {0} was not found")]
@@ -75,15 +94,75 @@ pub struct WorkloadRecord {
     pub rate_limited: bool,
 }
 
+/// ADR-027 §2/§3/§5: the Agent's current mTLS leaf identity, persisted by
+/// `LocalState::store_leaf_certificate` alongside the workload map and the
+/// heartbeat/renewal counters. `private_key_pem` never leaves this Agent
+/// process -- only `certificate_pem` (already just the CA-signed public
+/// half) and, at renewal time, a *new* raw public key ever cross the wire
+/// (ADR-027 §5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeafCertificate {
+    /// PKCS8 PEM, matching what `rcgen::KeyPair::serialize_pem()` and
+    /// `tonic::transport::Identity::from_pem`'s key argument both expect.
+    pub private_key_pem: String,
+    /// The Control-Plane-issued certificate (PEM) for private_key_pem's
+    /// public half.
+    pub certificate_pem: String,
+    /// Decimal serial number, as the Control Plane's own
+    /// `x509.Certificate.SerialNumber.String()` renders it -- the exact
+    /// string a future `RenewCertificateRequest.current_certificate_serial`
+    /// must echo back for the Control Plane's own re-derivation of the
+    /// connection's peer certificate serial to match (see
+    /// control-plane/internal/providerjoin/certificates.go's
+    /// RenewCertificate).
+    pub serial: String,
+    /// Unix seconds this certificate's `NotAfter` falls on -- the renewal
+    /// timer computes "50% elapsed" as exactly "12 hours before this,"
+    /// matching ADR-027 §3's fixed 24h TTL without needing to separately
+    /// track issuance time.
+    pub expires_at_unix: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reservation {
     New,
     Existing,
 }
 
+/// One workload's next signed usage-evidence window, returned by
+/// `next_metering_period`. `sequence` is the value the caller must place
+/// on the `MeteringSummary` it signs and sends; `period_start`/
+/// `period_end` are Unix seconds bounding the usage window that sequence
+/// covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteringPeriod {
+    pub sequence: u64,
+    pub period_start: u64,
+    pub period_end: u64,
+}
+
+fn encode_metering_cursor(next_sequence: u64, period_start: u64) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&next_sequence.to_be_bytes());
+    bytes[8..].copy_from_slice(&period_start.to_be_bytes());
+    bytes
+}
+
+fn decode_metering_cursor(workload_id: &str, bytes: &[u8]) -> Result<(u64, u64), LocalStateError> {
+    if bytes.len() != 16 {
+        return Err(LocalStateError::CorruptMeteringCursor(
+            workload_id.to_string(),
+        ));
+    }
+    let next_sequence = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+    let period_start = u64::from_be_bytes(bytes[8..].try_into().unwrap());
+    Ok((next_sequence, period_start))
+}
+
 pub struct LocalState {
     database: sled::Db,
     workloads: sled::Tree,
+    metering: sled::Tree,
     workload_lock: Mutex<()>,
 }
 
@@ -91,11 +170,74 @@ impl LocalState {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LocalStateError> {
         let database = sled::open(path)?;
         let workloads = database.open_tree(WORKLOAD_TREE)?;
+        let metering = database.open_tree(METERING_TREE)?;
         Ok(Self {
             database,
             workloads,
+            metering,
             workload_lock: Mutex::new(()),
         })
+    }
+
+    /// Reserves the next monotonic sequence and bounded usage window for
+    /// `workload_id`, persisting the advance durably (sled, like
+    /// `next_heartbeat_sequence`) before returning it -- a process
+    /// restart reopens the same cursor rather than silently restarting
+    /// from sequence 1 (issue #20's "restart must not be silently
+    /// treated as a valid continuation" acceptance criterion: this store
+    /// makes a restart a non-event for sequence continuity; the Control
+    /// Plane's own monotonicity check, internal/metering, is the
+    /// authoritative backstop regardless of what this store contains).
+    ///
+    /// The very first call for a never-before-seen `workload_id` starts
+    /// the period at `now` (sequence 1) -- this store has no
+    /// container-start timestamp to anchor an earlier boundary, so
+    /// nothing before the first call is billed. Every later call starts
+    /// where the previous one's window ended.
+    ///
+    /// `period_end` is bounded to `period_start + max_period_seconds`
+    /// (never further than `now`), and never regresses before
+    /// `period_start` even if `now` is behind it (a regressed wall
+    /// clock yields a valid, zero-length window rather than an error --
+    /// the sequence still advances so a later, correctly-timed call is
+    /// never blocked).
+    pub fn next_metering_period(
+        &self,
+        workload_id: &str,
+        now: u64,
+        max_period_seconds: u64,
+    ) -> Result<MeteringPeriod, LocalStateError> {
+        loop {
+            let current = self.metering.get(workload_id.as_bytes())?;
+            let (next_sequence, period_start) = match current.as_deref() {
+                Some(bytes) => {
+                    let (sequence, period_start) = decode_metering_cursor(workload_id, bytes)?;
+                    let next_sequence = sequence.checked_add(1).ok_or_else(|| {
+                        LocalStateError::MeteringSequenceOverflow(workload_id.to_string())
+                    })?;
+                    (next_sequence, period_start)
+                }
+                None => (1, now),
+            };
+            let bound = period_start.saturating_add(max_period_seconds);
+            let period_end = now.min(bound).max(period_start);
+            let next_bytes = encode_metering_cursor(next_sequence, period_end);
+            match self.metering.compare_and_swap(
+                workload_id.as_bytes(),
+                current.as_deref(),
+                Some(next_bytes.as_slice()),
+            )? {
+                Ok(()) => {
+                    self.metering.flush()?;
+                    return Ok(MeteringPeriod {
+                        sequence: next_sequence,
+                        period_start,
+                        period_end,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
     }
 
     pub fn next_heartbeat_sequence(&self) -> Result<u64, LocalStateError> {
@@ -124,6 +266,68 @@ impl LocalState {
                 }
                 Err(_) => continue,
             }
+        }
+    }
+
+    /// ADR-027 §3's renewal nonce watermark, the exact same
+    /// compare-and-swap pattern next_heartbeat_sequence already uses for
+    /// the heartbeat sequence -- a separate counter (see
+    /// RENEWAL_NONCE_KEY's doc comment), but identical durability and
+    /// monotonicity guarantees.
+    pub fn next_renewal_nonce(&self) -> Result<u64, LocalStateError> {
+        loop {
+            let current = self.database.get(RENEWAL_NONCE_KEY)?;
+            let nonce = match current.as_deref() {
+                Some(bytes) => u64::from_be_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| LocalStateError::CorruptSequence)?,
+                ),
+                None => 0,
+            };
+            let next = nonce
+                .checked_add(1)
+                .ok_or(LocalStateError::SequenceOverflow)?;
+            let next_bytes = next.to_be_bytes();
+            match self.database.compare_and_swap(
+                RENEWAL_NONCE_KEY,
+                current.as_deref(),
+                Some(next_bytes.as_slice()),
+            )? {
+                Ok(()) => {
+                    self.database.flush()?;
+                    return Ok(next);
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Persists the Agent's current mTLS leaf identity (ADR-027 §2/§3),
+    /// replacing whatever was stored before -- a successful renewal
+    /// atomically supersedes the previous leaf certificate/key as the one
+    /// used for new connections going forward, per store_leaf_certificate's
+    /// single-key design (see LEAF_CERTIFICATE_KEY's doc comment).
+    pub fn store_leaf_certificate(
+        &self,
+        certificate: &LeafCertificate,
+    ) -> Result<(), LocalStateError> {
+        self.database.insert(
+            LEAF_CERTIFICATE_KEY,
+            serde_json::to_vec(certificate)?.as_slice(),
+        )?;
+        self.database.flush()?;
+        Ok(())
+    }
+
+    /// Returns the Agent's current mTLS leaf identity, or `None` if this
+    /// Agent has never completed ADR-027 §2 enrollment (a legacy Agent on
+    /// the pre-ADR-027 static-cert path, or one that hasn't run `join`
+    /// with mTLS enrollment enabled yet).
+    pub fn leaf_certificate(&self) -> Result<Option<LeafCertificate>, LocalStateError> {
+        match self.database.get(LEAF_CERTIFICATE_KEY)? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
         }
     }
 
@@ -218,6 +422,87 @@ mod tests {
     }
 
     #[test]
+    fn renewal_nonce_survives_reopen_and_is_independent_of_heartbeat_sequence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        {
+            let state = LocalState::open(directory.path()).expect("open state");
+            assert_eq!(state.next_heartbeat_sequence().expect("heartbeat 1"), 1);
+            assert_eq!(state.next_renewal_nonce().expect("renewal 1"), 1);
+            assert_eq!(state.next_heartbeat_sequence().expect("heartbeat 2"), 2);
+        }
+        let state = LocalState::open(directory.path()).expect("reopen state");
+        assert_eq!(
+            state.next_renewal_nonce().expect("renewal survives reopen"),
+            2
+        );
+        assert_eq!(
+            state
+                .next_heartbeat_sequence()
+                .expect("heartbeat survives reopen"),
+            3
+        );
+    }
+
+    #[test]
+    fn leaf_certificate_is_absent_until_stored_then_survives_reopen() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        {
+            let state = LocalState::open(directory.path()).expect("open state");
+            assert_eq!(
+                state.leaf_certificate().expect("read before store"),
+                None,
+                "a fresh Agent has no leaf certificate until enrollment"
+            );
+            let certificate = LeafCertificate {
+                private_key_pem: "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n"
+                    .to_string(),
+                certificate_pem: "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"
+                    .to_string(),
+                serial: "123456789012345678901234567890".to_string(),
+                expires_at_unix: 1_700_100_000,
+            };
+            state
+                .store_leaf_certificate(&certificate)
+                .expect("store leaf certificate");
+            assert_eq!(
+                state.leaf_certificate().expect("read after store"),
+                Some(certificate)
+            );
+        }
+        let state = LocalState::open(directory.path()).expect("reopen state");
+        let reloaded = state
+            .leaf_certificate()
+            .expect("read after reopen")
+            .expect("leaf certificate persisted across reopen");
+        assert_eq!(reloaded.serial, "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn storing_a_renewed_leaf_certificate_replaces_the_previous_one() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = LocalState::open(directory.path()).expect("open state");
+        let first = LeafCertificate {
+            private_key_pem: "first-key".to_string(),
+            certificate_pem: "first-cert".to_string(),
+            serial: "1".to_string(),
+            expires_at_unix: 1_700_000_000,
+        };
+        let second = LeafCertificate {
+            private_key_pem: "second-key".to_string(),
+            certificate_pem: "second-cert".to_string(),
+            serial: "2".to_string(),
+            expires_at_unix: 1_700_100_000,
+        };
+        state
+            .store_leaf_certificate(&first)
+            .expect("store first leaf certificate");
+        state
+            .store_leaf_certificate(&second)
+            .expect("store renewed leaf certificate");
+        assert_eq!(state.leaf_certificate().expect("read"), Some(second));
+    }
+
+    #[test]
     fn workload_mapping_survives_reopen_and_enforces_conflicts() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let record = WorkloadRecord {
@@ -249,5 +534,79 @@ mod tests {
             state.reserve_workload(&conflicting, 1),
             Err(LocalStateError::WorkloadConflict(_))
         ));
+    }
+
+    #[test]
+    fn metering_first_period_starts_at_now_with_sequence_one() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = LocalState::open(directory.path()).expect("open state");
+        let period = state
+            .next_metering_period("workload-1", 1_700_000_000, 3600)
+            .expect("first metering period");
+        assert_eq!(period.sequence, 1);
+        assert_eq!(period.period_start, 1_700_000_000);
+        assert_eq!(period.period_end, 1_700_000_000);
+    }
+
+    #[test]
+    fn metering_sequence_survives_reopen_and_next_period_starts_where_last_ended() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        {
+            let state = LocalState::open(directory.path()).expect("open state");
+            let first = state
+                .next_metering_period("workload-1", 1_700_000_000, 3600)
+                .expect("first metering period");
+            assert_eq!(first.sequence, 1);
+            let second = state
+                .next_metering_period("workload-1", 1_700_000_900, 3600)
+                .expect("second metering period");
+            assert_eq!(second.sequence, 2);
+            assert_eq!(second.period_start, first.period_end);
+            assert_eq!(second.period_end, 1_700_000_900);
+        }
+        // Simulates an Agent process restart: reopening the same sled
+        // path must resume from sequence 3, not silently reset to 1 --
+        // issue #20's restart acceptance criterion.
+        let state = LocalState::open(directory.path()).expect("reopen state");
+        let third = state
+            .next_metering_period("workload-1", 1_700_001_800, 3600)
+            .expect("third metering period after reopen");
+        assert_eq!(third.sequence, 3);
+        assert_eq!(third.period_start, 1_700_000_900);
+    }
+
+    #[test]
+    fn metering_period_is_bounded_by_max_period_seconds() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = LocalState::open(directory.path()).expect("open state");
+        let first = state
+            .next_metering_period("workload-1", 1_700_000_000, 3600)
+            .expect("first metering period");
+        // `now` is far beyond period_start + max_period_seconds: the
+        // window must be capped, not stretched to cover the whole gap in
+        // one unbounded summary.
+        let second = state
+            .next_metering_period("workload-1", first.period_end + 100_000, 3600)
+            .expect("second metering period");
+        assert_eq!(second.period_start, first.period_end);
+        assert_eq!(second.period_end, first.period_end + 3600);
+    }
+
+    #[test]
+    fn metering_sequence_is_independent_per_workload() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = LocalState::open(directory.path()).expect("open state");
+        let a1 = state
+            .next_metering_period("workload-a", 1_700_000_000, 3600)
+            .expect("workload-a period");
+        let b1 = state
+            .next_metering_period("workload-b", 1_700_000_000, 3600)
+            .expect("workload-b period");
+        assert_eq!(a1.sequence, 1);
+        assert_eq!(b1.sequence, 1);
+        let a2 = state
+            .next_metering_period("workload-a", 1_700_000_100, 3600)
+            .expect("workload-a second period");
+        assert_eq!(a2.sequence, 2);
     }
 }

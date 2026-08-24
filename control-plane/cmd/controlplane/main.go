@@ -21,6 +21,7 @@ import (
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/dashboard"
 	"github.com/openinfra/network/internal/orchestrator"
+	"github.com/openinfra/network/internal/pki"
 	"github.com/openinfra/network/internal/providerjoin"
 	"github.com/openinfra/network/internal/ratelimit"
 	"github.com/openinfra/network/internal/resourcemarket"
@@ -119,9 +120,30 @@ func run() error {
 	}
 	defer listener.Close()
 
-	options, err := serverOptions(address)
+	// ADR-027: the Control Plane operates a single CA (§1). CA_KEY_FILE is
+	// deliberately never set for provider-agent in deployments/docker-
+	// compose.yml -- only control-plane mounts the same ./local/certs
+	// volume ca.key already lives in, unread until now. Unset (or
+	// OPENINFRA_DEV_INSECURE) keeps the pre-ADR-027 static-cert path
+	// working, per the ADR §6 migration sequencing note: this is the
+	// "keep it behind a flag" flag, satisfied by CA_KEY_FILE's presence
+	// rather than a separate boolean, since the two are equivalent in
+	// practice -- there is no meaningful "CA loaded but issuance
+	// disabled" state worth a second knob.
+	ca, revocationChecker, err := loadPKI(redisClient)
 	if err != nil {
 		return err
+	}
+	options, err := serverOptions(address, ca, revocationChecker)
+	if err != nil {
+		return err
+	}
+	if ca != nil {
+		reconciler := pki.NewReconciler(providerjoin.NewPostgresRepository(pool), pki.NewRedisRevocationStore(redisClient), pki.DefaultReconcileInterval)
+		go reconciler.Run(ctx)
+		slog.Info("mTLS PKI enrollment/renewal/revocation enabled (ADR-027)")
+	} else {
+		slog.Warn("CA_KEY_FILE not set; falling back to the pre-ADR-027 static development mTLS certificates -- see deployments/scripts/generate-dev-certs.sh")
 	}
 	// issue #12: authenticate SubmitWorkload/GetWorkload/StopWorkload with
 	// a bearer API key and enforce a per-tenant rate limit, layered on top
@@ -130,9 +152,16 @@ func run() error {
 	userRepository := userauth.NewPostgresRepository(pool)
 	rateLimit := envIntOrDefault("USER_API_RATE_LIMIT_PER_MINUTE", 120)
 	limiter := ratelimit.NewRedisLimiter(redisClient, rateLimit, 60)
+	interceptors := []grpc.UnaryServerInterceptor{userauth.NewUnaryInterceptor(userRepository, limiter)}
+	if ca != nil {
+		// ADR-027 §4: every RPC, not only the ones the TLS handshake
+		// already gated -- an already-open connection's very next call
+		// after revocation must be rejected too.
+		interceptors = append([]grpc.UnaryServerInterceptor{pki.UnaryServerInterceptor(ca, revocationChecker)}, interceptors...)
+	}
 	options = append(options,
 		grpc.MaxRecvMsgSize(1<<20), // 1 MiB: bounds a WorkloadDefinition/image payload far above any legitimate size
-		grpc.ChainUnaryInterceptor(userauth.NewUnaryInterceptor(userRepository, limiter)),
+		grpc.ChainUnaryInterceptor(interceptors...),
 	)
 	server := grpc.NewServer(options...)
 	workloadRepository := workloadapi.NewPostgresRepository(pool)
@@ -159,6 +188,12 @@ func run() error {
 	// SetValidatorSource above already uses -- this is telemetry, not a
 	// liveness-critical path.
 	service.SetBandwidthUsageStore(providerjoin.NewPostgresBandwidthUsageStore(pool))
+	if ca != nil {
+		// ADR-027 §2/§3: CompleteJoin issues an enrollment certificate when
+		// asked (tls_public_key set), and RenewCertificate becomes callable.
+		service.SetCertificateAuthority(ca)
+		service.SetRenewalNonceStore(providerjoin.NewRedisRenewalNonceStore(redisClient))
+	}
 	// Independently drives provider_chain_registrations rows left in
 	// READY/RETRY (e.g. after a Control Plane or chain restart) to
 	// FINALIZED, without depending on the Agent retrying CompleteJoin.
@@ -266,7 +301,35 @@ func safeHTTPListener(address string) (net.Listener, error) {
 	return listener, nil
 }
 
-func serverOptions(address string) ([]grpc.ServerOption, error) {
+// loadPKI reads ADR-027's Control-Plane-operated CA (see the run() call
+// site's doc comment on why CA_KEY_FILE's presence is the flag) and
+// builds the Redis-backed revocation checker it needs. Returns (nil, nil,
+// nil) -- not an error -- when CA_KEY_FILE is unset, so run() falls back
+// to the pre-ADR-027 static-cert path unaffected.
+func loadPKI(redisClient *redis.Client) (*pki.CA, *pki.RedisRevocationStore, error) {
+	if strings.EqualFold(os.Getenv("OPENINFRA_DEV_INSECURE"), "true") {
+		return nil, nil, nil
+	}
+	caKeyFile := os.Getenv("CA_KEY_FILE")
+	if caKeyFile == "" {
+		return nil, nil, nil
+	}
+	caCertPEM, err := os.ReadFile(os.Getenv("TLS_CLIENT_CA_FILE"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read CA certificate: %w", err)
+	}
+	caKeyPEM, err := os.ReadFile(caKeyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read CA private key: %w", err)
+	}
+	ca, err := pki.LoadCA(caCertPEM, caKeyPEM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load CA: %w", err)
+	}
+	return ca, pki.NewRedisRevocationStore(redisClient), nil
+}
+
+func serverOptions(address string, ca *pki.CA, revocation pki.RevocationChecker) ([]grpc.ServerOption, error) {
 	if strings.EqualFold(os.Getenv("OPENINFRA_DEV_INSECURE"), "true") {
 		host, _, err := net.SplitHostPort(address)
 		if err != nil {
@@ -283,6 +346,15 @@ func serverOptions(address string) ([]grpc.ServerOption, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load server TLS identity: %w", err)
 	}
+
+	if ca != nil {
+		// ADR-027 §2: the dual trust basis (CA chain, or a bootstrap
+		// self-signed certificate scoped to BeginJoin/CompleteJoin by
+		// pki.UnaryServerInterceptor, wired in by run()) replaces the
+		// single fixed CA-chain-or-reject check below.
+		return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(pki.ServerTLSConfig(certificate, ca, revocation)))}, nil
+	}
+
 	clientCA, err := os.ReadFile(os.Getenv("TLS_CLIENT_CA_FILE"))
 	if err != nil {
 		return nil, fmt.Errorf("read client CA: %w", err)

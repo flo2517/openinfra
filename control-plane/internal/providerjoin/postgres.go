@@ -227,6 +227,49 @@ func (r *PostgresRepository) ActivateProvider(ctx context.Context, providerID st
 	return result, nil
 }
 
+// RevokeProvider implements ADR-027 §4's operator-only revocation path:
+// controlplane-admin revoke-provider is the sole caller. Writing
+// providers.status = REVOKED here is the entire authoritative act --
+// PostgresRegistry.ListActive's existing WHERE status = $1 filter (see
+// control-plane/internal/agentmanager/directory.go) excludes this provider
+// from scheduling starting with the very next read, with no separate
+// mechanism. Connectivity revocation (the Redis-backed live set
+// pki.RedisRevocationStore checks on every handshake/RPC) is deliberately
+// not written here: pki.Reconciler sweeps this exact status change into
+// Redis on its own short period, keeping this method free of any
+// dependency on Redis or on the pki package.
+func (r *PostgresRepository) RevokeProvider(ctx context.Context, providerID string) error {
+	command, err := r.pool.Exec(ctx, `
+		UPDATE providers SET status = $2, updated_at = now() WHERE provider_id = $1`,
+		providerID, int16(sharedv1.NodeStatus_NODE_STATUS_REVOKED))
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrProviderNotFound
+	}
+	return nil
+}
+
+// ListRevokedProviderIDs implements pki.RevokedProviderSource: the
+// authoritative (Postgres) read side pki.Reconciler sweeps into Redis.
+func (r *PostgresRepository) ListRevokedProviderIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT provider_id FROM providers WHERE status = $1`, int16(sharedv1.NodeStatus_NODE_STATUS_REVOKED))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // DueChainRegistrations implements ChainRegistrationStore for the
 // Reconciler: providers whose outbox row is READY or RETRY and due (no
 // backoff scheduled, or the backoff has elapsed), oldest first so a
