@@ -16,6 +16,7 @@ async-trait = "0.1"
 tokio-stream = "0.1"
 sha2 = "0.10"
 rand = "0.8"
+hex = "0.4"
 # Extracts a MeasureBandwidth caller's raw Ed25519 SubjectPublicKeyInfo
 # from its mTLS leaf certificate (tonic::Request::peer_certs()) for the
 # per-caller rate limiter -- a real X.509 parse, not a byte-offset guess,
@@ -26,7 +27,6 @@ x509-parser = "0.16"
 
 [dev-dependencies]
 tempfile = "3"
-hex = "0.4"
 # Builds a real self-signed Ed25519 certificate to exercise the
 # raw-public-key extraction helper against actual DER, the same fixture
 # style agent-cli/src/mtls.rs's tests already use.

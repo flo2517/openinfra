@@ -134,6 +134,37 @@ func (c *Client) DeployAndConfirm(ctx context.Context, provider RegisteredProvid
 	return response.ContainerId, nil
 }
 
+// FetchUsageSummary pulls one bounded, signed MeteringSummary from the
+// Agent's GetUsageSummary RPC (ADR-029 §6 / issue #20) -- the
+// least-invasive fit on ProviderAgentService (agent.proto's own doc
+// comment), a pull matching GetWorkloadStatus's existing shape rather
+// than ReportHeartbeat's push shape on ControlPlaneService. The caller
+// (internal/metering's Service.RecordUsage) still independently
+// verifies the response's signature against the provider's registered
+// key before accepting anything; this method only transports it.
+//
+// Deliberately not wired to any automatic polling loop in this PR --
+// see the implementing PR's description for why a periodic collection
+// scheduler (calling this for every active workload on a cadence) is
+// scoped out as its own follow-up issue rather than bundled here.
+func (c *Client) FetchUsageSummary(ctx context.Context, provider RegisteredProvider, workloadID string) (*agentv1.GetUsageSummaryResponse, error) {
+	connection, client, err := c.ConnectVerified(ctx, provider)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Close()
+	usageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	response, err := client.GetUsageSummary(usageCtx, &agentv1.GetUsageSummaryRequest{WorkloadId: workloadID})
+	if err != nil {
+		return nil, fmt.Errorf("fetch usage summary from Agent: %w", err)
+	}
+	if response.Summary == nil {
+		return nil, errors.New("Agent returned a usage summary response with no summary")
+	}
+	return response, nil
+}
+
 // StopAndConfirm is idempotent at the Agent boundary and returns only after
 // inspection reports the exact persisted workload container as completed.
 func (c *Client) StopAndConfirm(ctx context.Context, provider RegisteredProvider, workloadID string) error {
