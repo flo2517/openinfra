@@ -5,6 +5,8 @@ import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/openinfra/network/protocol/generated/go/agent/v1;agentv1";
 
+import "openinfra/shared/v1/shared.proto";
+
 service ProviderAgentService {
   rpc GetAgentInfo(GetAgentInfoRequest) returns (GetAgentInfoResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
@@ -20,6 +22,14 @@ service ProviderAgentService {
   // live challenge loop (#85) with its existing small-payload liveness/
   // correctness semantics, which this does not change.
   rpc MeasureBandwidth(MeasureBandwidthRequest) returns (MeasureBandwidthResponse);
+  // ADR-029 / issue #20: pulled by the Control Plane (or any other
+  // relayer holding a live Agent connection), not pushed by the Agent --
+  // the least-invasive fit on this service, matching GetWorkloadStatus's
+  // existing pull shape rather than ReportHeartbeat's push shape on
+  // ControlPlaneService. Returns one bounded, signed MeteringSummary
+  // covering usage since that workload's last-issued sequence. See
+  // GetUsageSummaryResponse's doc comment for the signing/hash details.
+  rpc GetUsageSummary(GetUsageSummaryRequest) returns (GetUsageSummaryResponse);
 }
 
 message GetAgentInfoResponse {
@@ -168,3 +178,20 @@ message MeasureBandwidthResponse {
 message HealthCheckRequest {}
 message HealthCheckResponse { bool healthy = 1; string status = 2; }
 message GetAgentInfoRequest {}
+
+message GetUsageSummaryRequest {
+  string workload_id = 1;
+}
+
+// evidence_hash and signature are both computed over the identical
+// canonical byte encoding of `summary` (agent-api's METERING_DOMAIN
+// construction) -- the hash is not a hash of this response message, and
+// is not itself signed separately; it is provided purely so a verifier
+// or a later on-chain relay (#21) does not need to recompute it just to
+// correlate this response with a stored evidence row. lowercase hex,
+// matching this protocol's existing provider_id convention.
+message GetUsageSummaryResponse {
+  openinfra.shared.v1.MeteringSummary summary = 1;
+  bytes signature = 2;
+  string evidence_hash = 3;
+}

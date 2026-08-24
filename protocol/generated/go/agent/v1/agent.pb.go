@@ -7,6 +7,7 @@
 package agentv1
 
 import (
+	v1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -1247,11 +1248,122 @@ func (*GetAgentInfoRequest) Descriptor() ([]byte, []int) {
 	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{18}
 }
 
+type GetUsageSummaryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkloadId    string                 `protobuf:"bytes,1,opt,name=workload_id,json=workloadId,proto3" json:"workload_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetUsageSummaryRequest) Reset() {
+	*x = GetUsageSummaryRequest{}
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUsageSummaryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUsageSummaryRequest) ProtoMessage() {}
+
+func (x *GetUsageSummaryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUsageSummaryRequest.ProtoReflect.Descriptor instead.
+func (*GetUsageSummaryRequest) Descriptor() ([]byte, []int) {
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *GetUsageSummaryRequest) GetWorkloadId() string {
+	if x != nil {
+		return x.WorkloadId
+	}
+	return ""
+}
+
+// evidence_hash and signature are both computed over the identical
+// canonical byte encoding of `summary` (agent-api's METERING_DOMAIN
+// construction) -- the hash is not a hash of this response message, and
+// is not itself signed separately; it is provided purely so a verifier
+// or a later on-chain relay (#21) does not need to recompute it just to
+// correlate this response with a stored evidence row. lowercase hex,
+// matching this protocol's existing provider_id convention.
+type GetUsageSummaryResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Summary       *v1.MeteringSummary    `protobuf:"bytes,1,opt,name=summary,proto3" json:"summary,omitempty"`
+	Signature     []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"`
+	EvidenceHash  string                 `protobuf:"bytes,3,opt,name=evidence_hash,json=evidenceHash,proto3" json:"evidence_hash,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetUsageSummaryResponse) Reset() {
+	*x = GetUsageSummaryResponse{}
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUsageSummaryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUsageSummaryResponse) ProtoMessage() {}
+
+func (x *GetUsageSummaryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUsageSummaryResponse.ProtoReflect.Descriptor instead.
+func (*GetUsageSummaryResponse) Descriptor() ([]byte, []int) {
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *GetUsageSummaryResponse) GetSummary() *v1.MeteringSummary {
+	if x != nil {
+		return x.Summary
+	}
+	return nil
+}
+
+func (x *GetUsageSummaryResponse) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+func (x *GetUsageSummaryResponse) GetEvidenceHash() string {
+	if x != nil {
+		return x.EvidenceHash
+	}
+	return ""
+}
+
 var File_openinfra_agent_v1_agent_proto protoreflect.FileDescriptor
 
 const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\n" +
-	"\x1eopeninfra/agent/v1/agent.proto\x12\x12openinfra.agent.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xde\x01\n" +
+	"\x1eopeninfra/agent/v1/agent.proto\x12\x12openinfra.agent.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a openinfra/shared/v1/shared.proto\"\xde\x01\n" +
 	"\x14GetAgentInfoResponse\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1d\n" +
@@ -1342,7 +1454,14 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x13HealthCheckResponse\x12\x18\n" +
 	"\ahealthy\x18\x01 \x01(\bR\ahealthy\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\"\x15\n" +
-	"\x13GetAgentInfoRequest2\x8a\a\n" +
+	"\x13GetAgentInfoRequest\"9\n" +
+	"\x16GetUsageSummaryRequest\x12\x1f\n" +
+	"\vworkload_id\x18\x01 \x01(\tR\n" +
+	"workloadId\"\x9c\x01\n" +
+	"\x17GetUsageSummaryResponse\x12>\n" +
+	"\asummary\x18\x01 \x01(\v2$.openinfra.shared.v1.MeteringSummaryR\asummary\x12\x1c\n" +
+	"\tsignature\x18\x02 \x01(\fR\tsignature\x12#\n" +
+	"\revidence_hash\x18\x03 \x01(\tR\fevidenceHash2\xf6\a\n" +
 	"\x14ProviderAgentService\x12a\n" +
 	"\fGetAgentInfo\x12'.openinfra.agent.v1.GetAgentInfoRequest\x1a(.openinfra.agent.v1.GetAgentInfoResponse\x12^\n" +
 	"\vHealthCheck\x12&.openinfra.agent.v1.HealthCheckRequest\x1a'.openinfra.agent.v1.HealthCheckResponse\x12a\n" +
@@ -1352,7 +1471,8 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x04Stop\x12\x1f.openinfra.agent.v1.StopRequest\x1a .openinfra.agent.v1.StopResponse\x12p\n" +
 	"\x11GetWorkloadStatus\x12,.openinfra.agent.v1.GetWorkloadStatusRequest\x1a-.openinfra.agent.v1.GetWorkloadStatusResponse\x12f\n" +
 	"\rStreamMetrics\x12(.openinfra.agent.v1.StreamMetricsRequest\x1a).openinfra.agent.v1.StreamMetricsResponse0\x01\x12m\n" +
-	"\x10MeasureBandwidth\x12+.openinfra.agent.v1.MeasureBandwidthRequest\x1a,.openinfra.agent.v1.MeasureBandwidthResponseBEZCgithub.com/openinfra/network/protocol/generated/go/agent/v1;agentv1b\x06proto3"
+	"\x10MeasureBandwidth\x12+.openinfra.agent.v1.MeasureBandwidthRequest\x1a,.openinfra.agent.v1.MeasureBandwidthResponse\x12j\n" +
+	"\x0fGetUsageSummary\x12*.openinfra.agent.v1.GetUsageSummaryRequest\x1a+.openinfra.agent.v1.GetUsageSummaryResponseBEZCgithub.com/openinfra/network/protocol/generated/go/agent/v1;agentv1b\x06proto3"
 
 var (
 	file_openinfra_agent_v1_agent_proto_rawDescOnce sync.Once
@@ -1367,7 +1487,7 @@ func file_openinfra_agent_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_openinfra_agent_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_openinfra_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_openinfra_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
 var file_openinfra_agent_v1_agent_proto_goTypes = []any{
 	(SolveChallengeRequest_Type)(0),      // 0: openinfra.agent.v1.SolveChallengeRequest.Type
 	(GetWorkloadStatusResponse_State)(0), // 1: openinfra.agent.v1.GetWorkloadStatusResponse.State
@@ -1390,36 +1510,42 @@ var file_openinfra_agent_v1_agent_proto_goTypes = []any{
 	(*HealthCheckRequest)(nil),           // 18: openinfra.agent.v1.HealthCheckRequest
 	(*HealthCheckResponse)(nil),          // 19: openinfra.agent.v1.HealthCheckResponse
 	(*GetAgentInfoRequest)(nil),          // 20: openinfra.agent.v1.GetAgentInfoRequest
-	(*timestamppb.Timestamp)(nil),        // 21: google.protobuf.Timestamp
+	(*GetUsageSummaryRequest)(nil),       // 21: openinfra.agent.v1.GetUsageSummaryRequest
+	(*GetUsageSummaryResponse)(nil),      // 22: openinfra.agent.v1.GetUsageSummaryResponse
+	(*timestamppb.Timestamp)(nil),        // 23: google.protobuf.Timestamp
+	(*v1.MeteringSummary)(nil),           // 24: openinfra.shared.v1.MeteringSummary
 }
 var file_openinfra_agent_v1_agent_proto_depIdxs = []int32{
 	0,  // 0: openinfra.agent.v1.SolveChallengeRequest.type:type_name -> openinfra.agent.v1.SolveChallengeRequest.Type
 	6,  // 1: openinfra.agent.v1.DeployRequest.limits:type_name -> openinfra.agent.v1.ResourceLimits
-	21, // 2: openinfra.agent.v1.DeployRequest.lease_end:type_name -> google.protobuf.Timestamp
+	23, // 2: openinfra.agent.v1.DeployRequest.lease_end:type_name -> google.protobuf.Timestamp
 	1,  // 3: openinfra.agent.v1.GetWorkloadStatusResponse.state:type_name -> openinfra.agent.v1.GetWorkloadStatusResponse.State
-	20, // 4: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
-	18, // 5: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
-	12, // 6: openinfra.agent.v1.ProviderAgentService.GetInventory:input_type -> openinfra.agent.v1.GetInventoryRequest
-	3,  // 7: openinfra.agent.v1.ProviderAgentService.SolveChallenge:input_type -> openinfra.agent.v1.SolveChallengeRequest
-	5,  // 8: openinfra.agent.v1.ProviderAgentService.Deploy:input_type -> openinfra.agent.v1.DeployRequest
-	8,  // 9: openinfra.agent.v1.ProviderAgentService.Stop:input_type -> openinfra.agent.v1.StopRequest
-	10, // 10: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:input_type -> openinfra.agent.v1.GetWorkloadStatusRequest
-	14, // 11: openinfra.agent.v1.ProviderAgentService.StreamMetrics:input_type -> openinfra.agent.v1.StreamMetricsRequest
-	16, // 12: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:input_type -> openinfra.agent.v1.MeasureBandwidthRequest
-	2,  // 13: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
-	19, // 14: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
-	13, // 15: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
-	4,  // 16: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
-	7,  // 17: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
-	9,  // 18: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
-	11, // 19: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
-	15, // 20: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
-	17, // 21: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:output_type -> openinfra.agent.v1.MeasureBandwidthResponse
-	13, // [13:22] is the sub-list for method output_type
-	4,  // [4:13] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	24, // 4: openinfra.agent.v1.GetUsageSummaryResponse.summary:type_name -> openinfra.shared.v1.MeteringSummary
+	20, // 5: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
+	18, // 6: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
+	12, // 7: openinfra.agent.v1.ProviderAgentService.GetInventory:input_type -> openinfra.agent.v1.GetInventoryRequest
+	3,  // 8: openinfra.agent.v1.ProviderAgentService.SolveChallenge:input_type -> openinfra.agent.v1.SolveChallengeRequest
+	5,  // 9: openinfra.agent.v1.ProviderAgentService.Deploy:input_type -> openinfra.agent.v1.DeployRequest
+	8,  // 10: openinfra.agent.v1.ProviderAgentService.Stop:input_type -> openinfra.agent.v1.StopRequest
+	10, // 11: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:input_type -> openinfra.agent.v1.GetWorkloadStatusRequest
+	14, // 12: openinfra.agent.v1.ProviderAgentService.StreamMetrics:input_type -> openinfra.agent.v1.StreamMetricsRequest
+	16, // 13: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:input_type -> openinfra.agent.v1.MeasureBandwidthRequest
+	21, // 14: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:input_type -> openinfra.agent.v1.GetUsageSummaryRequest
+	2,  // 15: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
+	19, // 16: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
+	13, // 17: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
+	4,  // 18: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
+	7,  // 19: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
+	9,  // 20: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
+	11, // 21: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
+	15, // 22: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
+	17, // 23: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:output_type -> openinfra.agent.v1.MeasureBandwidthResponse
+	22, // 24: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:output_type -> openinfra.agent.v1.GetUsageSummaryResponse
+	15, // [15:25] is the sub-list for method output_type
+	5,  // [5:15] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_openinfra_agent_v1_agent_proto_init() }
@@ -1433,7 +1559,7 @@ func file_openinfra_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_openinfra_agent_v1_agent_proto_rawDesc), len(file_openinfra_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   19,
+			NumMessages:   21,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

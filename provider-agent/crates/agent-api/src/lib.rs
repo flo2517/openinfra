@@ -28,6 +28,7 @@ pub mod openinfra {
 
 pub use openinfra::agent::v1 as proto;
 
+use crate::openinfra::shared::v1::MeteringSummary;
 use crate::proto::*;
 use agent_core::{
     disconnect::DisconnectState, identity::IdentityManager, local_state::LocalStateError,
@@ -96,6 +97,26 @@ pub const MAX_BANDWIDTH_PROBE_BYTES: usize = 8 * 1024 * 1024;
 const BANDWIDTH_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const BANDWIDTH_RATE_LIMIT_MAX_CALLS: u32 = 10;
 
+// ADR-029 §6 / issue #20: GetUsageSummary's signing domain, and the
+// explicit metering-evidence schema version this Agent build produces
+// (ADR-029 §1/§7 -- a future dimension/unit change bumps this rather
+// than silently reinterpreting old evidence). Mirrored verbatim on the
+// Control Plane side (control-plane/internal/metering) for both the
+// domain string and the canonical byte layout below -- deliberately a
+// hand-rolled encoding, not a proto marshal, for the same reason
+// SolveChallenge/MeasureBandwidth already use one (agreement no longer
+// depends on prost and protobuf-go producing byte-identical output).
+const METERING_DOMAIN: &[u8] = b"openinfra-metering-v1\0";
+const METERING_SCHEMA_VERSION: u32 = 1;
+// Bounds one GetUsageSummary call's claimed period_end - period_start
+// (ADR-029 §6/§7's MaxMeteringPeriodSeconds, mirrored here on the
+// producing side; the Control Plane enforces its own bound
+// independently and is the authoritative check). One hour: short enough
+// that a lost/delayed relay does not accumulate an unbounded backlog of
+// unbilled usage in a single summary, long enough not to require a
+// GetUsageSummary call more than once an hour under normal operation.
+const MAX_METERING_PERIOD_SECONDS: u64 = 3600;
+
 #[derive(Debug)]
 pub enum AgentEvent {
     CmdDeploy {
@@ -118,11 +139,54 @@ pub struct WorkloadStatus {
     pub details: String,
 }
 
+/// One workload's bounded usage sample for a single metering period,
+/// returned by `Executor::usage_summary` (ADR-029 §6 / issue #20).
+///
+/// `lease_id`/`sequence`/`period_start`/`period_end` are real, sourced
+/// from the Agent's own durable local state
+/// (`agent_core::local_state::LocalState::next_metering_period`) -- not
+/// stubs. **The five usage counters are honest zero stubs in this PR**:
+/// no per-container CPU/RAM/storage/network metric collection exists
+/// yet anywhere in this codebase (bollard's container stats API is
+/// unused; `agent-inventory` only reads host-level, not per-container,
+/// resources). Wiring real collection is explicitly out of scope here
+/// and tracked as its own follow-up issue (see the implementing PR's
+/// description) -- returning fabricated non-zero numbers instead would
+/// violate this repository's "never fake numbers as real" instruction
+/// far more than an honest, documented zero does. Every value here still
+/// flows through the same signed, bounded, replay-resistant evidence
+/// pipeline a later PR's real collector will populate without any wire
+/// or schema change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageSample {
+    pub lease_id: String,
+    pub sequence: u64,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub cpu_core_seconds: u64,
+    pub ram_mb_seconds: u64,
+    pub storage_gb_seconds: u64,
+    pub network_egress_mb: u64,
+    pub network_ingress_mb: u64,
+    pub gpu_seconds: u64,
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync {
     async fn deploy(&self, req: DeployRequest) -> anyhow::Result<String>;
     async fn stop(&self, workload_id: &str) -> anyhow::Result<()>;
     async fn get_status(&self, workload_id: &str) -> anyhow::Result<WorkloadStatus>;
+    /// `now`/`max_period_seconds` are passed down rather than read
+    /// internally so the caller (agent-api's `get_usage_summary` RPC
+    /// handler) owns the wall-clock read and the governed bound,
+    /// keeping this trait's implementors (real or test doubles)
+    /// deterministic given their inputs.
+    async fn usage_summary(
+        &self,
+        workload_id: &str,
+        now: u64,
+        max_period_seconds: u64,
+    ) -> anyhow::Result<UsageSample>;
 }
 
 pub struct AgentGrpcServer {
@@ -263,6 +327,60 @@ fn bandwidth_signed_bytes(
     signed.extend_from_slice(&(download_payload.len() as u32).to_be_bytes());
     signed.extend_from_slice(download_payload);
     signed.extend_from_slice(&server_processing_ms.to_be_bytes());
+    signed
+}
+
+/// Builds the exact byte sequence signed (and, hashed, correlated as
+/// `evidence_hash`) for a `GetUsageSummary` response (ADR-029 §6, issue
+/// #20). Mirrored byte-for-byte in Go by
+/// `control-plane/internal/metering`'s verification code -- a mismatch
+/// there means every metering signature fails verification.
+///
+/// ```text
+/// METERING_DOMAIN
+///   ++ be_u32(len(workload_id)) ++ workload_id
+///   ++ be_u32(len(lease_id)) ++ lease_id
+///   ++ be_u64(sequence)
+///   ++ be_u64(period_start)
+///   ++ be_u64(period_end)
+///   ++ be_u32(metering_schema_version)
+///   ++ be_u64(cpu_core_seconds)
+///   ++ be_u64(ram_mb_seconds)
+///   ++ be_u64(storage_gb_seconds)
+///   ++ be_u64(network_egress_mb)
+///   ++ be_u64(network_ingress_mb)
+///   ++ be_u64(gpu_seconds)
+/// ```
+///
+/// `workload_id`/`lease_id` are variable-length and get an explicit
+/// big-endian u32 length prefix (matching `solve_challenge`'s and
+/// `bandwidth_signed_bytes`'s existing framing convention for
+/// variable-length fields); every counter is already fixed-width.
+fn metering_signed_bytes(summary: &MeteringSummary) -> Vec<u8> {
+    let mut signed = Vec::with_capacity(
+        METERING_DOMAIN.len()
+            + 4
+            + summary.workload_id.len()
+            + 4
+            + summary.lease_id.len()
+            + 8 * 8
+            + 4,
+    );
+    signed.extend_from_slice(METERING_DOMAIN);
+    signed.extend_from_slice(&(summary.workload_id.len() as u32).to_be_bytes());
+    signed.extend_from_slice(summary.workload_id.as_bytes());
+    signed.extend_from_slice(&(summary.lease_id.len() as u32).to_be_bytes());
+    signed.extend_from_slice(summary.lease_id.as_bytes());
+    signed.extend_from_slice(&summary.sequence.to_be_bytes());
+    signed.extend_from_slice(&summary.period_start.to_be_bytes());
+    signed.extend_from_slice(&summary.period_end.to_be_bytes());
+    signed.extend_from_slice(&summary.metering_schema_version.to_be_bytes());
+    signed.extend_from_slice(&summary.cpu_core_seconds.to_be_bytes());
+    signed.extend_from_slice(&summary.ram_mb_seconds.to_be_bytes());
+    signed.extend_from_slice(&summary.storage_gb_seconds.to_be_bytes());
+    signed.extend_from_slice(&summary.network_egress_mb.to_be_bytes());
+    signed.extend_from_slice(&summary.network_ingress_mb.to_be_bytes());
+    signed.extend_from_slice(&summary.gpu_seconds.to_be_bytes());
     signed
 }
 
@@ -498,6 +616,55 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
         }))
     }
 
+    async fn get_usage_summary(
+        &self,
+        request: Request<GetUsageSummaryRequest>,
+    ) -> Result<Response<GetUsageSummaryResponse>, Status> {
+        let req = request.into_inner();
+        if req.workload_id.is_empty() || req.workload_id.len() > MAX_CHALLENGE_ID {
+            return Err(Status::invalid_argument("workload_id is empty or too long"));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let sample = self
+            .executor
+            .usage_summary(&req.workload_id, now, MAX_METERING_PERIOD_SECONDS)
+            .await
+            .map_err(executor_status_error)?;
+
+        let summary = MeteringSummary {
+            workload_id: req.workload_id,
+            lease_id: sample.lease_id,
+            sequence: sample.sequence,
+            period_start: sample.period_start,
+            period_end: sample.period_end,
+            metering_schema_version: METERING_SCHEMA_VERSION,
+            cpu_core_seconds: sample.cpu_core_seconds,
+            ram_mb_seconds: sample.ram_mb_seconds,
+            storage_gb_seconds: sample.storage_gb_seconds,
+            network_egress_mb: sample.network_egress_mb,
+            network_ingress_mb: sample.network_ingress_mb,
+            gpu_seconds: sample.gpu_seconds,
+        };
+        let signed = metering_signed_bytes(&summary);
+        let signature = self
+            .identity_manager
+            .sign(&signed)
+            .await
+            .map_err(|error| Status::internal(format!("identity signing failed: {error}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&signed);
+        let evidence_hash = hex::encode(hasher.finalize());
+
+        Ok(Response::new(GetUsageSummaryResponse {
+            summary: Some(summary),
+            signature,
+            evidence_hash,
+        }))
+    }
+
     async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
         // ADR-028 §2: deliberately no disconnected-mode check here, unlike
         // deploy() above -- Stop is always accepted regardless of
@@ -606,6 +773,41 @@ mod tests {
         async fn get_status(&self, _workload_id: &str) -> anyhow::Result<WorkloadStatus> {
             unimplemented!("not exercised by MeasureBandwidth tests")
         }
+        async fn usage_summary(
+            &self,
+            _workload_id: &str,
+            _now: u64,
+            _max_period_seconds: u64,
+        ) -> anyhow::Result<UsageSample> {
+            unimplemented!("not exercised by MeasureBandwidth tests")
+        }
+    }
+
+    /// A minimal Executor double for GetUsageSummary tests: always
+    /// returns a fixed UsageSample regardless of input, so the RPC
+    /// handler's own signing/hashing/response-shaping logic can be
+    /// exercised without a real DockerExecutor/LocalState.
+    struct FixedUsageExecutor(UsageSample);
+
+    #[async_trait]
+    impl Executor for FixedUsageExecutor {
+        async fn deploy(&self, _req: DeployRequest) -> anyhow::Result<String> {
+            unimplemented!("not exercised by GetUsageSummary tests")
+        }
+        async fn stop(&self, _workload_id: &str) -> anyhow::Result<()> {
+            unimplemented!("not exercised by GetUsageSummary tests")
+        }
+        async fn get_status(&self, _workload_id: &str) -> anyhow::Result<WorkloadStatus> {
+            unimplemented!("not exercised by GetUsageSummary tests")
+        }
+        async fn usage_summary(
+            &self,
+            _workload_id: &str,
+            _now: u64,
+            _max_period_seconds: u64,
+        ) -> anyhow::Result<UsageSample> {
+            Ok(self.0.clone())
+        }
     }
 
     /// A real generated Ed25519 identity, backed by a temp key file --
@@ -622,13 +824,20 @@ mod tests {
     }
 
     fn test_server(identity_manager: Arc<dyn IdentityManager>) -> AgentGrpcServer {
+        test_server_with_executor(identity_manager, Arc::new(NoopExecutor))
+    }
+
+    fn test_server_with_executor(
+        identity_manager: Arc<dyn IdentityManager>,
+        executor: Arc<dyn Executor>,
+    ) -> AgentGrpcServer {
         let (event_bus, _receiver) = mpsc::channel(1);
         AgentGrpcServer {
             config: AgentConfig::default(),
             event_bus,
             identity_manager,
             inventory_manager: Arc::new(InventoryManager::new()),
-            executor: Arc::new(NoopExecutor),
+            executor,
             bandwidth_rate_limiter: BandwidthRateLimiter::new(),
             disconnect_state: DisconnectState::new(),
         }
@@ -987,6 +1196,175 @@ mod tests {
         assert_ne!(
             base,
             bandwidth_signed_bytes("probe", &[1u8; 32], b"payload", 43)
+        );
+    }
+
+    fn fixed_usage_sample() -> UsageSample {
+        UsageSample {
+            lease_id: "lease-1".to_string(),
+            sequence: 1,
+            period_start: 1_700_000_000,
+            period_end: 1_700_000_900,
+            cpu_core_seconds: 0,
+            ram_mb_seconds: 0,
+            storage_gb_seconds: 0,
+            network_egress_mb: 0,
+            network_ingress_mb: 0,
+            gpu_seconds: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_usage_summary_returns_a_signature_that_verifies_against_the_response() {
+        let (identity, _dir) = test_identity();
+        let server = test_server_with_executor(
+            identity.clone(),
+            Arc::new(FixedUsageExecutor(fixed_usage_sample())),
+        );
+
+        let response = server
+            .get_usage_summary(Request::new(GetUsageSummaryRequest {
+                workload_id: "workload-1".to_string(),
+            }))
+            .await
+            .expect("get_usage_summary")
+            .into_inner();
+
+        let summary = response.summary.expect("summary is present");
+        assert_eq!(summary.workload_id, "workload-1");
+        assert_eq!(summary.lease_id, "lease-1");
+        assert_eq!(summary.sequence, 1);
+        assert_eq!(summary.metering_schema_version, METERING_SCHEMA_VERSION);
+
+        let signed = metering_signed_bytes(&summary);
+        let public_key_hex = identity.get_public_key().await.expect("public key");
+        let public_key = hex::decode(public_key_hex).expect("hex decode public key");
+        assert!(identity
+            .verify(&signed, &response.signature, &public_key)
+            .await
+            .expect("verify signature"));
+
+        let mut hasher = Sha256::new();
+        hasher.update(&signed);
+        assert_eq!(response.evidence_hash, hex::encode(hasher.finalize()));
+
+        // A tampered signature must not verify.
+        let mut tampered = response.signature.clone();
+        tampered[0] ^= 0xFF;
+        assert!(!identity
+            .verify(&signed, &tampered, &public_key)
+            .await
+            .expect("verify tampered signature"));
+    }
+
+    #[tokio::test]
+    async fn get_usage_summary_rejects_empty_workload_id() {
+        let (identity, _dir) = test_identity();
+        let server =
+            test_server_with_executor(identity, Arc::new(FixedUsageExecutor(fixed_usage_sample())));
+        let status = server
+            .get_usage_summary(Request::new(GetUsageSummaryRequest {
+                workload_id: String::new(),
+            }))
+            .await
+            .expect_err("empty workload_id must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_usage_summary_maps_unknown_workload_to_not_found() {
+        struct MissingWorkloadExecutor;
+        #[async_trait]
+        impl Executor for MissingWorkloadExecutor {
+            async fn deploy(&self, _req: DeployRequest) -> anyhow::Result<String> {
+                unimplemented!()
+            }
+            async fn stop(&self, _workload_id: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn get_status(&self, _workload_id: &str) -> anyhow::Result<WorkloadStatus> {
+                unimplemented!()
+            }
+            async fn usage_summary(
+                &self,
+                workload_id: &str,
+                _now: u64,
+                _max_period_seconds: u64,
+            ) -> anyhow::Result<UsageSample> {
+                Err(LocalStateError::WorkloadNotFound(workload_id.to_string()).into())
+            }
+        }
+        let (identity, _dir) = test_identity();
+        let server = test_server_with_executor(identity, Arc::new(MissingWorkloadExecutor));
+        let status = server
+            .get_usage_summary(Request::new(GetUsageSummaryRequest {
+                workload_id: "missing".to_string(),
+            }))
+            .await
+            .expect_err("unknown workload must be rejected");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    // ADR-029 §6's cross-language pin, the same convention
+    // heartbeat_signing_payload_wire_bytes_are_a_pinned_cross_language_fixture
+    // (agent-cli/src/main.rs) already established: a fixed-field summary,
+    // its pinned canonical-byte hex, and the Ed25519 signature over it
+    // with a fixed 32-byte seed key. Mirrored byte-for-byte in
+    // control-plane/internal/metering/signing_test.go -- a mismatch there
+    // means Go's verification has drifted from this encoding.
+    #[tokio::test]
+    async fn metering_signed_bytes_are_a_pinned_cross_language_fixture() {
+        let summary = MeteringSummary {
+            workload_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            lease_id: "42".to_string(),
+            sequence: 7,
+            period_start: 1_700_000_000,
+            period_end: 1_700_003_600,
+            metering_schema_version: 1,
+            cpu_core_seconds: 3600,
+            ram_mb_seconds: 16_384_000,
+            storage_gb_seconds: 100,
+            network_egress_mb: 512,
+            network_ingress_mb: 256,
+            gpu_seconds: 0,
+        };
+        let signed = metering_signed_bytes(&summary);
+
+        const EXPECTED_WIRE_BYTES_HEX: &str = "6f70656e696e6672612d6d65746572696e672d7631000000002432323232323232322d323232322d323232322d323232322d3232323232323232323232320000000234320000000000000007000000006553f100000000006553ff10000000010000000000000e100000000000fa00000000000000000064000000000000020000000000000001000000000000000000";
+        assert_eq!(
+            hex::encode(&signed),
+            EXPECTED_WIRE_BYTES_HEX,
+            "encoded signed bytes changed -- update this fixture and the \
+             mirrored one in signing_test.go together"
+        );
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let key_path = directory.path().join("identity.key");
+        std::fs::write(&key_path, [0x02u8; 32]).expect("write fixed key");
+        let identity = Ed25519IdentityManager::new(key_path).expect("load fixed-seed identity");
+        let public_key = identity.get_public_key().await.expect("public key");
+        let signature = identity.sign(&signed).await.expect("sign fixture");
+        assert!(identity
+            .verify(
+                &signed,
+                &signature,
+                &hex::decode(&public_key).expect("hex decode")
+            )
+            .await
+            .expect("verify fixture signature"));
+        // Pinned for signing_test.go's mirrored Go-side verification
+        // fixture (Ed25519 signature over EXPECTED_WIRE_BYTES_HEX with
+        // seed key [0x02; 32]) -- asserted here too so a future change to
+        // either side's Ed25519 stack is caught locally, not only in Go.
+        assert_eq!(
+            public_key,
+            "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+        );
+        assert_eq!(
+            hex::encode(&signature),
+            "58698a07b133dae02aad9eda2d3ce20991cfeae5fcad6b380f7fe0074233826\
+             f7181d50929242193ffb3ef0dd8dd0ec717143282e3e6798534f64678342b74\
+             0e"
         );
     }
 }
