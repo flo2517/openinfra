@@ -1,0 +1,39 @@
+[package]
+name = "pallet-escrow"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+codec = { package = "parity-scale-codec", version = "3.7.5", default-features = false, features = ["derive"] }
+scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
+frame-support = { version = "48.0.0", default-features = false }
+frame-system = { version = "48.0.0", default-features = false }
+# Unlike every other pallet in this workspace, pallet-escrow's *production*
+# code (not just its tests) needs sp-core/sp-io: ADR-029 Sec4.2/Sec6 deliberately
+# breaks from this codebase's existing "trust the relayer" precedent and
+# verifies a provider's Ed25519 signature on-chain via
+# `sp_io::crypto::ed25519_verify`, so both crates are real, no_std
+# dependencies here, not dev-only.
+sp-core = { version = "43.0.0", default-features = false }
+sp-io = { version = "48.0.0", default-features = false }
+sp-runtime = { version = "48.0.0", default-features = false }
+
+[dev-dependencies]
+# Pinned to the exact release already resolved elsewhere in this workspace
+# (via the runtime's polkadot-sdk umbrella pull), matching
+# pallet-network-validator's Cargo.toml.
+pallet-balances = { version = "=50.0.0" }
+
+[features]
+default = ["std"]
+runtime-benchmarks = []
+std = [
+    "codec/std",
+    "scale-info/std",
+    "frame-support/std",
+    "frame-system/std",
+    "sp-core/std",
+    "sp-io/std",
+    "sp-runtime/std",
+]
