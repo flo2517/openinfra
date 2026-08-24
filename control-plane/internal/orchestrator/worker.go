@@ -38,6 +38,10 @@ type PersistentStore interface {
 	AssignLease(context.Context, workloadapi.Workload, string, [32]byte, workloadapi.ProviderCapacity) (uint64, error)
 	MarkLeased(context.Context, workloadapi.Workload, uint64) error
 	RetryLater(context.Context, workloadapi.Workload, string, string, time.Duration) error
+	// MarkFailed is retry's terminal counterpart, used once RetryPolicy's
+	// MaxAttempts is reached: see PostgresRepository.MarkFailed's doc
+	// comment (issue #138).
+	MarkFailed(context.Context, workloadapi.Workload, string, string) error
 	MarkDeploying(context.Context, workloadapi.Workload, uint64) error
 	MarkRunning(context.Context, workloadapi.Workload, string) error
 	MarkStopped(context.Context, workloadapi.Workload, uint64) error
@@ -79,6 +83,51 @@ type Worker struct {
 	interval, blockTime time.Duration
 	workerID            string
 	claimDuration       time.Duration
+	retryPolicy         RetryPolicy
+}
+
+// RetryPolicy bounds how many times retry() re-queues a workload in its
+// current non-terminal state before giving up and marking it FAILED
+// instead, and how the delay between attempts grows. Mirrors
+// providerjoin.ReconcilerConfig's MaxAttempts/BaseBackoff/MaxBackoff shape
+// deliberately -- same idiom already established there for exactly this
+// "bounded retry with capped exponential backoff, then an explicit
+// terminal state" problem (issue #138).
+//
+// AttemptCount (and so the cap) is cumulative across a workload's whole
+// lifecycle, not reset per lifecycle state: workloadapi's schema has
+// always tracked it that way (no Mark* transition resets it), and
+// dashboard's operator alerting already reads it as a lifetime count (see
+// dashboard.operatorRetryExhaustionThreshold). Preserving that meaning
+// here, rather than introducing a second, differently-scoped counter,
+// keeps attempt_count meaning one thing everywhere it's read.
+type RetryPolicy struct {
+	MaxAttempts int
+	BaseBackoff time.Duration
+	MaxBackoff  time.Duration
+}
+
+// DefaultRetryPolicy matches providerjoin.DefaultReconcilerConfig's retry
+// shape exactly (same base/cap/attempt budget), so the two subsystems that
+// already use this idiom agree on what "give up" means in practice: up to
+// ~30 minutes of doubling backoff (5s, 10s, ..., capped at 10m) across 10
+// attempts before a workload is declared FAILED.
+func DefaultRetryPolicy() RetryPolicy {
+	return RetryPolicy{MaxAttempts: 10, BaseBackoff: 5 * time.Second, MaxBackoff: 10 * time.Minute}
+}
+
+func (p RetryPolicy) withDefaults() RetryPolicy {
+	defaults := DefaultRetryPolicy()
+	if p.MaxAttempts <= 0 {
+		p.MaxAttempts = defaults.MaxAttempts
+	}
+	if p.BaseBackoff <= 0 {
+		p.BaseBackoff = defaults.BaseBackoff
+	}
+	if p.MaxBackoff <= 0 {
+		p.MaxBackoff = defaults.MaxBackoff
+	}
+	return p
 }
 
 // NewWorker's ranker is required, not a setter-configured optional like
@@ -86,8 +135,15 @@ type Worker struct {
 // rank providers at all" the way there is for "we have no live reputation
 // signal" or "no WireGuard overlay in this environment".
 func NewWorker(store PersistentStore, directory ProviderDirectory, leases LeaseRegistrar, dispatcher AgentDispatcher, ranker *scheduler.Ranker) *Worker {
-	return &Worker{store: store, directory: directory, leases: leases, dispatcher: dispatcher, ranker: ranker, interval: time.Second, blockTime: 3 * time.Second, workerID: uuid.NewString(), claimDuration: 2 * time.Minute}
+	return &Worker{store: store, directory: directory, leases: leases, dispatcher: dispatcher, ranker: ranker, interval: time.Second, blockTime: 3 * time.Second, workerID: uuid.NewString(), claimDuration: 2 * time.Minute, retryPolicy: DefaultRetryPolicy()}
 }
+
+// SetRetryPolicy overrides the default RetryPolicy. A setter, like
+// SetOverlay/SetReputationSource, so production wiring and tests can tune
+// it (e.g. a small MaxAttempts to exercise exhaustion without a real
+// backoff wait) without widening NewWorker's already-five-argument
+// signature.
+func (w *Worker) SetRetryPolicy(policy RetryPolicy) { w.retryPolicy = policy.withDefaults() }
 
 // SetOverlay enables the optional WireGuard overlay. It is intentionally a
 // setter to keep existing worker tests and deployments that lack CAP_NET_ADMIN
@@ -259,11 +315,53 @@ func (w *Worker) processOne(ctx context.Context) error {
 		return nil
 	}
 }
+
+// retry re-queues item for another attempt, unless doing so would exceed
+// w.retryPolicy.MaxAttempts -- in which case it gives up and marks the
+// workload FAILED instead of re-queuing it forever against what may be a
+// permanently dead provider (issue #138). item.AttemptCount is the count
+// *before* this attempt, so attempt below is the number this call itself
+// represents; the cap check and the backoff calculation both use it
+// consistently with RetryLater/MarkFailed, which each independently
+// increment the persisted attempt_count by exactly one.
 func (w *Worker) retry(ctx context.Context, item workloadapi.Workload, code string, cause error) error {
-	if err := w.store.RetryLater(ctx, item, code, cause.Error(), 5*time.Second); err != nil {
+	attempt := item.AttemptCount + 1
+	if attempt >= w.retryPolicy.MaxAttempts {
+		terminal := fmt.Errorf("giving up after %d attempts (%s): %w", attempt, code, cause)
+		if err := w.store.MarkFailed(ctx, item, code, terminal.Error()); err != nil {
+			return err
+		}
+		return terminal
+	}
+	if err := w.store.RetryLater(ctx, item, code, cause.Error(), w.backoffFor(attempt)); err != nil {
 		return err
 	}
 	return cause
+}
+
+// backoffFor returns w.retryPolicy.BaseBackoff doubled per additional
+// attempt, capped at MaxBackoff. attempt is always >= 1. Same
+// doubling-with-cap shape as providerjoin.Reconciler.backoffFor, kept as
+// a separate copy rather than a shared helper: the two live in different
+// packages with no natural common import, and the logic is five lines of
+// plain arithmetic, not worth a cross-package dependency to deduplicate.
+func (w *Worker) backoffFor(attempt int) time.Duration {
+	const maxShift = 16 // 2^16 * BaseBackoff already exceeds any sane MaxBackoff
+	shift := attempt - 1
+	if shift > maxShift {
+		shift = maxShift
+	}
+	backoff := w.retryPolicy.BaseBackoff
+	for i := 0; i < shift; i++ {
+		backoff *= 2
+		if backoff <= 0 || backoff > w.retryPolicy.MaxBackoff {
+			return w.retryPolicy.MaxBackoff
+		}
+	}
+	if backoff > w.retryPolicy.MaxBackoff {
+		return w.retryPolicy.MaxBackoff
+	}
+	return backoff
 }
 func (w *Worker) providerKey(ctx context.Context, id string) ([32]byte, error) {
 	provider, err := w.provider(ctx, id)

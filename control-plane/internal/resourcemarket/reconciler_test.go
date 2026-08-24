@@ -27,7 +27,13 @@ type fakeMarket struct {
 	announceCalls []blockchainbridge.ResourceOffer
 	announceErr   error
 	removeCalls   [][32]byte
-	removeErr     error
+	// removeAttempts counts every RemoveOfferFor invocation regardless of
+	// outcome -- removeCalls only records successful ones, so a test
+	// asserting on retry-cap behavior against a permanently failing
+	// removeErr needs this instead to see how many submissions were
+	// actually attempted.
+	removeAttempts int
+	removeErr      error
 }
 
 func newFakeMarket() *fakeMarket {
@@ -54,6 +60,7 @@ func (m *fakeMarket) AnnounceOfferFor(_ context.Context, provider [32]byte, offe
 }
 
 func (m *fakeMarket) RemoveOfferFor(_ context.Context, provider [32]byte) error {
+	m.removeAttempts++
 	if m.removeErr != nil {
 		return m.removeErr
 	}
@@ -189,6 +196,108 @@ func TestReconcileOnceKeepsRetryingAFailedAnnounce(t *testing.T) {
 	reconciler.ReconcileOnce(context.Background())
 	if len(market.announceCalls) != 1 {
 		t.Fatalf("expected the retry to succeed on the next pass, got %d calls", len(market.announceCalls))
+	}
+}
+
+// TestReconcileStopsRetryingWithdrawalAfterMaxAttempts is issue #138's
+// resourcemarket fix: unbounded remove_offer_for retries against a
+// provider that has permanently dropped out of ListSchedulableProviders
+// produced a real, confirmed-live "1014: Priority is too low" tx-pool
+// collision. After MaxWithdrawAttempts consecutive failures, the
+// reconciler must stop resubmitting the extrinsic -- while still tracking
+// the provider (not silently dropping it) so it stays observable.
+func TestReconcileStopsRetryingWithdrawalAfterMaxAttempts(t *testing.T) {
+	provider := testProvider("p1", 1, 2, 4096, 100)
+	var key [32]byte
+	copy(key[:], provider.PublicKey)
+	market := newFakeMarket()
+	market.removeErr = errors.New("chain unavailable")
+	reconciler := NewReconciler(fakeDirectory{providers: []agentmanager.SchedulableProvider{provider}}, market, ReconcilerConfig{MaxWithdrawAttempts: 2})
+
+	reconciler.ReconcileOnce(context.Background()) // announce
+	reconciler.directory = fakeDirectory{providers: nil}
+
+	reconciler.ReconcileOnce(context.Background()) // withdrawal attempt 1: fails
+	reconciler.ReconcileOnce(context.Background()) // withdrawal attempt 2: fails, now at cap
+	reconciler.ReconcileOnce(context.Background()) // must NOT attempt a 3rd remove_offer_for call
+
+	if market.removeAttempts != 2 {
+		t.Fatalf("expected exactly 2 remove_offer_for attempts (capped at MaxWithdrawAttempts), got %d", market.removeAttempts)
+	}
+	if _, stillTracked := reconciler.offering[provider.ProviderID]; !stillTracked {
+		t.Fatal("a withdrawal-exhausted provider must stay tracked (observable), not be silently forgotten")
+	}
+	if reconciler.withdrawAttempts[provider.ProviderID] != 2 {
+		t.Fatalf("withdrawAttempts = %d, want 2", reconciler.withdrawAttempts[provider.ProviderID])
+	}
+}
+
+// TestReconcileWithdrawalSelfHealsWhenFinalizedOfferIsAlreadyGone is the
+// "a fresh state read clears it" half of the same fix: once the on-chain
+// offer is observed gone (whether from a successful-but-lost previous
+// remove_offer_for, or an operator clearing it directly), the reconciler
+// stops tracking the provider without needing to resubmit anything --
+// including a provider that had already exhausted MaxWithdrawAttempts.
+func TestReconcileWithdrawalSelfHealsWhenFinalizedOfferIsAlreadyGone(t *testing.T) {
+	provider := testProvider("p1", 1, 2, 4096, 100)
+	var key [32]byte
+	copy(key[:], provider.PublicKey)
+	market := newFakeMarket()
+	market.removeErr = errors.New("chain unavailable")
+	reconciler := NewReconciler(fakeDirectory{providers: []agentmanager.SchedulableProvider{provider}}, market, ReconcilerConfig{MaxWithdrawAttempts: 1})
+
+	reconciler.ReconcileOnce(context.Background()) // announce
+	reconciler.directory = fakeDirectory{providers: nil}
+	reconciler.ReconcileOnce(context.Background()) // withdrawal attempt 1: fails, now at cap
+	reconciler.ReconcileOnce(context.Background()) // stuck: no further remove_offer_for calls
+
+	if market.removeAttempts != 1 {
+		t.Fatalf("expected withdrawal to have stopped retrying, got %d remove_offer_for attempts", market.removeAttempts)
+	}
+
+	// The offer is now observed gone on-chain by some other means (e.g. an
+	// operator cleared it, or an earlier remove_offer_for actually
+	// succeeded and only its response was lost).
+	delete(market.offers, key)
+	market.removeErr = errors.New("must not be called again")
+
+	reconciler.ReconcileOnce(context.Background())
+
+	if market.removeAttempts != 1 {
+		t.Fatalf("a fresh FinalizedOffer read showing the offer gone must not trigger another remove_offer_for attempt, got %d", market.removeAttempts)
+	}
+	if _, stillTracked := reconciler.offering[provider.ProviderID]; stillTracked {
+		t.Fatal("expected the self-healed provider to be forgotten")
+	}
+	if _, stillTracked := reconciler.withdrawAttempts[provider.ProviderID]; stillTracked {
+		t.Fatal("expected withdrawAttempts to be cleared once self-healed")
+	}
+}
+
+// TestReconcileWithdrawalResetsAttemptsWhenProviderReappears confirms a
+// provider that comes back into ListSchedulableProviders after some
+// failed withdrawal attempts starts with a clean slate if it ever drops
+// out again, rather than carrying over a stale attempt count toward a cap
+// it hasn't actually been retrying against.
+func TestReconcileWithdrawalResetsAttemptsWhenProviderReappears(t *testing.T) {
+	provider := testProvider("p1", 1, 2, 4096, 100)
+	market := newFakeMarket()
+	market.removeErr = errors.New("chain unavailable")
+	reconciler := NewReconciler(fakeDirectory{providers: []agentmanager.SchedulableProvider{provider}}, market, ReconcilerConfig{MaxWithdrawAttempts: 5})
+
+	reconciler.ReconcileOnce(context.Background()) // announce
+	reconciler.directory = fakeDirectory{providers: nil}
+	reconciler.ReconcileOnce(context.Background()) // withdrawal attempt 1: fails
+
+	if reconciler.withdrawAttempts[provider.ProviderID] != 1 {
+		t.Fatalf("withdrawAttempts = %d, want 1", reconciler.withdrawAttempts[provider.ProviderID])
+	}
+
+	reconciler.directory = fakeDirectory{providers: []agentmanager.SchedulableProvider{provider}}
+	reconciler.ReconcileOnce(context.Background())
+
+	if _, tracked := reconciler.withdrawAttempts[provider.ProviderID]; tracked {
+		t.Fatal("expected withdrawAttempts to be cleared once the provider is schedulable again")
 	}
 }
 
