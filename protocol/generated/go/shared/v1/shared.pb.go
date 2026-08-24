@@ -31,6 +31,13 @@ const (
 	NodeStatus_NODE_STATUS_OFFLINE     NodeStatus = 3
 	NodeStatus_NODE_STATUS_DRAINING    NodeStatus = 4
 	NodeStatus_NODE_STATUS_MAINTENANCE NodeStatus = 5
+	// ADR-027 §4: set only by the operator `controlplane-admin
+	// revoke-provider` subcommand, never by the provider itself. Excluded
+	// from scheduling by the same `providers.status = ACTIVE` filters every
+	// other non-ACTIVE status already uses (agentmanager.ListActive), and
+	// additionally cuts mTLS connectivity via the Redis-backed revocation
+	// set (internal/pki) -- see the ADR for the full mechanism.
+	NodeStatus_NODE_STATUS_REVOKED NodeStatus = 6
 )
 
 // Enum value maps for NodeStatus.
@@ -42,6 +49,7 @@ var (
 		3: "NODE_STATUS_OFFLINE",
 		4: "NODE_STATUS_DRAINING",
 		5: "NODE_STATUS_MAINTENANCE",
+		6: "NODE_STATUS_REVOKED",
 	}
 	NodeStatus_value = map[string]int32{
 		"NODE_STATUS_UNSPECIFIED": 0,
@@ -50,6 +58,7 @@ var (
 		"NODE_STATUS_OFFLINE":     3,
 		"NODE_STATUS_DRAINING":    4,
 		"NODE_STATUS_MAINTENANCE": 5,
+		"NODE_STATUS_REVOKED":     6,
 	}
 )
 
@@ -1330,7 +1339,7 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	" \x01(\x04R\x0fnetworkEgressMb\x12,\n" +
 	"\x12network_ingress_mb\x18\v \x01(\x04R\x10networkIngressMb\x12\x1f\n" +
 	"\vgpu_seconds\x18\f \x01(\x04R\n" +
-	"gpuSeconds*\xaa\x01\n" +
+	"gpuSeconds*\xc3\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x17\n" +
@@ -1338,7 +1347,8 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\x12NODE_STATUS_ACTIVE\x10\x02\x12\x17\n" +
 	"\x13NODE_STATUS_OFFLINE\x10\x03\x12\x18\n" +
 	"\x14NODE_STATUS_DRAINING\x10\x04\x12\x1b\n" +
-	"\x17NODE_STATUS_MAINTENANCE\x10\x05*\xd2\x01\n" +
+	"\x17NODE_STATUS_MAINTENANCE\x10\x05\x12\x17\n" +
+	"\x13NODE_STATUS_REVOKED\x10\x06*\xd2\x01\n" +
 	"\x0fWorkloadProfile\x12 \n" +
 	"\x1cWORKLOAD_PROFILE_UNSPECIFIED\x10\x00\x12&\n" +
 	"\"WORKLOAD_PROFILE_COMPUTE_INTENSIVE\x10\x01\x12%\n" +

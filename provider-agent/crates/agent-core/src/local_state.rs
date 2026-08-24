@@ -4,6 +4,20 @@ use std::sync::Mutex;
 use thiserror::Error;
 
 const HEARTBEAT_SEQUENCE_KEY: &[u8] = b"heartbeat_sequence";
+// ADR-027 §3: the durably persisted, strictly increasing per-provider
+// counter RenewCertificateRequest.nonce signs -- the renewal-specific
+// sibling of HEARTBEAT_SEQUENCE_KEY, deliberately a separate counter (a
+// renewal roughly once a day must not be starved by, or interfere with,
+// the heartbeat sequence ticking every ~15s).
+const RENEWAL_NONCE_KEY: &[u8] = b"renewal_nonce";
+// ADR-027 §2/§3/§5: the Agent's current mTLS leaf identity -- its own
+// freshly generated private key (never transmitted anywhere, per §5) and
+// the Control-Plane-issued certificate for it. A single key, not a tree:
+// there is exactly one leaf identity in use for new connections at a
+// time; the ADR's overlap window is about already-open connections
+// continuing on whatever certificate they authenticated with, not about
+// this Agent process needing to remember more than one.
+const LEAF_CERTIFICATE_KEY: &[u8] = b"leaf_certificate";
 const WORKLOAD_TREE: &str = "workloads-v1";
 const METERING_TREE: &str = "metering-cursors-v1";
 
@@ -78,6 +92,35 @@ pub struct WorkloadRecord {
     /// reason as `egress_mbps`.
     #[serde(default)]
     pub rate_limited: bool,
+}
+
+/// ADR-027 §2/§3/§5: the Agent's current mTLS leaf identity, persisted by
+/// `LocalState::store_leaf_certificate` alongside the workload map and the
+/// heartbeat/renewal counters. `private_key_pem` never leaves this Agent
+/// process -- only `certificate_pem` (already just the CA-signed public
+/// half) and, at renewal time, a *new* raw public key ever cross the wire
+/// (ADR-027 §5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeafCertificate {
+    /// PKCS8 PEM, matching what `rcgen::KeyPair::serialize_pem()` and
+    /// `tonic::transport::Identity::from_pem`'s key argument both expect.
+    pub private_key_pem: String,
+    /// The Control-Plane-issued certificate (PEM) for private_key_pem's
+    /// public half.
+    pub certificate_pem: String,
+    /// Decimal serial number, as the Control Plane's own
+    /// `x509.Certificate.SerialNumber.String()` renders it -- the exact
+    /// string a future `RenewCertificateRequest.current_certificate_serial`
+    /// must echo back for the Control Plane's own re-derivation of the
+    /// connection's peer certificate serial to match (see
+    /// control-plane/internal/providerjoin/certificates.go's
+    /// RenewCertificate).
+    pub serial: String,
+    /// Unix seconds this certificate's `NotAfter` falls on -- the renewal
+    /// timer computes "50% elapsed" as exactly "12 hours before this,"
+    /// matching ADR-027 §3's fixed 24h TTL without needing to separately
+    /// track issuance time.
+    pub expires_at_unix: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +269,68 @@ impl LocalState {
         }
     }
 
+    /// ADR-027 §3's renewal nonce watermark, the exact same
+    /// compare-and-swap pattern next_heartbeat_sequence already uses for
+    /// the heartbeat sequence -- a separate counter (see
+    /// RENEWAL_NONCE_KEY's doc comment), but identical durability and
+    /// monotonicity guarantees.
+    pub fn next_renewal_nonce(&self) -> Result<u64, LocalStateError> {
+        loop {
+            let current = self.database.get(RENEWAL_NONCE_KEY)?;
+            let nonce = match current.as_deref() {
+                Some(bytes) => u64::from_be_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| LocalStateError::CorruptSequence)?,
+                ),
+                None => 0,
+            };
+            let next = nonce
+                .checked_add(1)
+                .ok_or(LocalStateError::SequenceOverflow)?;
+            let next_bytes = next.to_be_bytes();
+            match self.database.compare_and_swap(
+                RENEWAL_NONCE_KEY,
+                current.as_deref(),
+                Some(next_bytes.as_slice()),
+            )? {
+                Ok(()) => {
+                    self.database.flush()?;
+                    return Ok(next);
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Persists the Agent's current mTLS leaf identity (ADR-027 §2/§3),
+    /// replacing whatever was stored before -- a successful renewal
+    /// atomically supersedes the previous leaf certificate/key as the one
+    /// used for new connections going forward, per store_leaf_certificate's
+    /// single-key design (see LEAF_CERTIFICATE_KEY's doc comment).
+    pub fn store_leaf_certificate(
+        &self,
+        certificate: &LeafCertificate,
+    ) -> Result<(), LocalStateError> {
+        self.database.insert(
+            LEAF_CERTIFICATE_KEY,
+            serde_json::to_vec(certificate)?.as_slice(),
+        )?;
+        self.database.flush()?;
+        Ok(())
+    }
+
+    /// Returns the Agent's current mTLS leaf identity, or `None` if this
+    /// Agent has never completed ADR-027 §2 enrollment (a legacy Agent on
+    /// the pre-ADR-027 static-cert path, or one that hasn't run `join`
+    /// with mTLS enrollment enabled yet).
+    pub fn leaf_certificate(&self) -> Result<Option<LeafCertificate>, LocalStateError> {
+        match self.database.get(LEAF_CERTIFICATE_KEY)? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn reserve_workload(
         &self,
         candidate: &WorkloadRecord,
@@ -314,6 +419,87 @@ mod tests {
         }
         let state = LocalState::open(directory.path()).expect("reopen state");
         assert_eq!(state.next_heartbeat_sequence().expect("second sequence"), 2);
+    }
+
+    #[test]
+    fn renewal_nonce_survives_reopen_and_is_independent_of_heartbeat_sequence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        {
+            let state = LocalState::open(directory.path()).expect("open state");
+            assert_eq!(state.next_heartbeat_sequence().expect("heartbeat 1"), 1);
+            assert_eq!(state.next_renewal_nonce().expect("renewal 1"), 1);
+            assert_eq!(state.next_heartbeat_sequence().expect("heartbeat 2"), 2);
+        }
+        let state = LocalState::open(directory.path()).expect("reopen state");
+        assert_eq!(
+            state.next_renewal_nonce().expect("renewal survives reopen"),
+            2
+        );
+        assert_eq!(
+            state
+                .next_heartbeat_sequence()
+                .expect("heartbeat survives reopen"),
+            3
+        );
+    }
+
+    #[test]
+    fn leaf_certificate_is_absent_until_stored_then_survives_reopen() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        {
+            let state = LocalState::open(directory.path()).expect("open state");
+            assert_eq!(
+                state.leaf_certificate().expect("read before store"),
+                None,
+                "a fresh Agent has no leaf certificate until enrollment"
+            );
+            let certificate = LeafCertificate {
+                private_key_pem: "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n"
+                    .to_string(),
+                certificate_pem: "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"
+                    .to_string(),
+                serial: "123456789012345678901234567890".to_string(),
+                expires_at_unix: 1_700_100_000,
+            };
+            state
+                .store_leaf_certificate(&certificate)
+                .expect("store leaf certificate");
+            assert_eq!(
+                state.leaf_certificate().expect("read after store"),
+                Some(certificate)
+            );
+        }
+        let state = LocalState::open(directory.path()).expect("reopen state");
+        let reloaded = state
+            .leaf_certificate()
+            .expect("read after reopen")
+            .expect("leaf certificate persisted across reopen");
+        assert_eq!(reloaded.serial, "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn storing_a_renewed_leaf_certificate_replaces_the_previous_one() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = LocalState::open(directory.path()).expect("open state");
+        let first = LeafCertificate {
+            private_key_pem: "first-key".to_string(),
+            certificate_pem: "first-cert".to_string(),
+            serial: "1".to_string(),
+            expires_at_unix: 1_700_000_000,
+        };
+        let second = LeafCertificate {
+            private_key_pem: "second-key".to_string(),
+            certificate_pem: "second-cert".to_string(),
+            serial: "2".to_string(),
+            expires_at_unix: 1_700_100_000,
+        };
+        state
+            .store_leaf_certificate(&first)
+            .expect("store first leaf certificate");
+        state
+            .store_leaf_certificate(&second)
+            .expect("store renewed leaf certificate");
+        assert_eq!(state.leaf_certificate().expect("read"), Some(second));
     }
 
     #[test]

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openinfra/network/internal/pki"
 	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	"google.golang.org/grpc/codes"
@@ -117,6 +118,8 @@ type Service struct {
 	workloads         WorkloadService
 	validators        ValidatorSource
 	bandwidthUsage    BandwidthUsageStore
+	ca                *pki.CA
+	renewalNonces     RenewalNonceStore
 }
 
 func (s *Service) SetWorkloadService(workloads WorkloadService) { s.workloads = workloads }
@@ -125,6 +128,23 @@ func (s *Service) SetWorkloadService(workloads WorkloadService) { s.workloads = 
 // on every heartbeat response. See ValidatorSource's doc comment for the
 // degraded-mode behavior when unset or when a read fails.
 func (s *Service) SetValidatorSource(validators ValidatorSource) { s.validators = validators }
+
+// SetCertificateAuthority enables ADR-027 mTLS PKI enrollment
+// (CompleteJoin) and renewal (RenewCertificate). Left unset, CompleteJoin
+// silently skips issuance for a caller that doesn't set tls_public_key
+// (legacy Agents on the pre-ADR-027 static-cert path keep working
+// unaffected, matching the ADR §6 migration sequencing), and both
+// RenewCertificate and a CompleteJoin that DOES set tls_public_key fail
+// loudly with Unavailable rather than silently omitting a certificate the
+// caller explicitly asked for.
+func (s *Service) SetCertificateAuthority(ca *pki.CA) { s.ca = ca }
+
+// SetRenewalNonceStore enables RenewCertificate's replay protection (the
+// nonce half of ADR-027 §3's timestamp+nonce shape, mirroring
+// ReportHeartbeat's sequence check). Required whenever a CA is configured;
+// RenewCertificate returns Unavailable without it rather than accepting a
+// renewal with no replay protection at all.
+func (s *Service) SetRenewalNonceStore(store RenewalNonceStore) { s.renewalNonces = store }
 
 func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.SubmitWorkloadRequest) (*controlplanev1.SubmitWorkloadResponse, error) {
 	if s.workloads == nil {
@@ -237,12 +257,31 @@ func (s *Service) CompleteJoin(ctx context.Context, request *controlplanev1.Comp
 			return nil, repositoryError(err)
 		}
 	}
-	return &controlplanev1.CompleteJoinResponse{
+	response := &controlplanev1.CompleteJoinResponse{
 		ProviderId:               completed.ProviderID,
 		Status:                   completed.Status,
 		RegisteredAt:             timestamppb.New(completed.RegisteredAt),
 		HeartbeatIntervalSeconds: uint32(s.heartbeatInterval / time.Second),
-	}, nil
+	}
+	// ADR-027 §2: enrollment extends CompleteJoin rather than adding a new
+	// step. tls_public_key is optional on the wire (a caller that doesn't
+	// ask for mTLS enrollment isn't issued a certificate), but a caller
+	// that DOES ask and finds no CA configured gets a loud error, not a
+	// silently empty certificate_pem it would only discover was missing
+	// once it tries to dial with it.
+	if len(request.TlsPublicKey) == ed25519.PublicKeySize {
+		if s.ca == nil {
+			return nil, status.Error(codes.Unavailable, "certificate issuance is unavailable")
+		}
+		issued, err := s.ca.IssueLeaf(completed.ProviderID, ed25519.PublicKey(request.TlsPublicKey), now, pki.DefaultLeafTTL)
+		if err != nil {
+			slog.Error("leaf certificate issuance failed", "provider_id", completed.ProviderID, "error", err)
+			return nil, status.Error(codes.Internal, "certificate issuance failed")
+		}
+		response.CertificatePem = issued.CertificatePEM
+		response.CertificateExpiresAt = timestamppb.New(issued.ExpiresAt)
+	}
+	return response, nil
 }
 
 func (s *Service) ReportHeartbeat(ctx context.Context, request *controlplanev1.ReportHeartbeatRequest) (*controlplanev1.ReportHeartbeatResponse, error) {
@@ -390,6 +429,12 @@ func validateCompleteJoin(request *controlplanev1.CompleteJoinRequest) error {
 	}
 	if err := validateCapabilities(request.Capabilities); err != nil {
 		return err
+	}
+	// ADR-027 §2: optional -- a caller not asking for mTLS enrollment
+	// leaves this empty. When set, it must be exactly a raw Ed25519 public
+	// key; anything else is a malformed request, not "no key requested."
+	if len(request.TlsPublicKey) != 0 && len(request.TlsPublicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("tls_public_key must be empty or %d bytes", ed25519.PublicKeySize)
 	}
 	return nil
 }
