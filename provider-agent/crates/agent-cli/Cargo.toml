@@ -32,14 +32,27 @@ tokio-stream = "0.1"
 # Parses the peer certificate's DER to extract its raw Ed25519
 # SubjectPublicKeyInfo for the allowlist check -- a real X.509 parse, not a
 # byte-offset guess, since a wrong extraction here is a security bug, not
-# just a correctness one.
+# just a correctness one. ADR-027 §2/§3 also uses this to read back the
+# decimal serial number of a Control-Plane-issued leaf certificate
+# (pki::leaf_certificate_serial), the exact string RenewCertificateRequest
+# .current_certificate_serial must echo.
 x509-parser = "0.16"
+# ADR-027 §2/§3: generates the Agent's fresh mTLS leaf keypairs (the
+# bootstrap self-signed certificate CompleteJoin's connection presents,
+# and each subsequent RenewCertificate's new_tls_public_key) -- promoted
+# from dev-dependencies (where ADR-013 §3's test fixtures already used it)
+# since keypair generation is now a real production code path, not just a
+# test fixture.
+rcgen = "0.13"
+# ADR-027 §3: current_certificate_serial and a freshly issued
+# certificate's serial are both decimal strings of an arbitrary-precision
+# integer (Go's big.Int.String() on the Control Plane side) -- BigUint's
+# from_bytes_be/to_string on the same raw DER serial bytes x509-parser
+# already extracts reproduces that exact decimal string without hand-
+# rolling base-256-to-base-10 conversion.
+num-bigint = "0.4"
 
 [dev-dependencies]
-# Test-only: generates both a CA-issued client cert (to exercise the
-# existing chain-verification path unchanged) and a self-signed Ed25519
-# cert (to exercise the new allowlist path), per ADR-011 §2.
-rcgen = "0.13"
 # Test-only: a fixed-seed identity key file for the ADR-025 §2
 # cross-language heartbeat wire-bytes fixture.
 tempfile = "3"

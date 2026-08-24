@@ -22,6 +22,13 @@
 //     why it lives here and not in cmd/networkvalidator, which
 //     deliberately only ever signs with an ordinary validator's own
 //     account.
+//   - revoke-provider (ADR-027 §4, issue #13): the only way a provider's
+//     status becomes REVOKED -- immediate scheduling exclusion (the
+//     existing providers.status = ACTIVE scheduling filter, no new
+//     mechanism) plus, within one internal/pki.Reconciler sweep interval,
+//     rejected mTLS connectivity. Same break-glass trust boundary as
+//     grant-role: there is no self-service or automated way for a
+//     provider to be revoked or to un-revoke itself.
 //   - fund-account (local dev bootstrap only): the Control Plane's own
 //     bridge/sudo account is the sole account endowed at genesis
 //     (blockchain/node/src/chain_spec.rs); a freshly generated Network
@@ -48,6 +55,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/providerjoin"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/migrations"
 )
@@ -68,6 +76,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "create-user", "issue-key", "revoke-key", "grant-role":
 		return runUserCommand(ctx, args)
+	case "revoke-provider":
+		return runRevokeProvider(ctx, args)
 	case "resolve-dispute":
 		return runResolveDispute(ctx, args)
 	case "fund-account":
@@ -75,6 +85,35 @@ func run(args []string) error {
 	default:
 		return usageError()
 	}
+}
+
+// runRevokeProvider is ADR-027 §4's break-glass revocation path -- see the
+// package doc comment. A direct Postgres write, the same operational
+// shape as create-user/issue-key/revoke-key/grant-role above: an offline
+// operation requiring this binary's own DATABASE_URL access, never a
+// self-service RPC.
+func runRevokeProvider(ctx context.Context, args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: controlplane-admin revoke-provider <provider-id>")
+	}
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return fmt.Errorf("configure PostgreSQL: %w", err)
+	}
+	defer pool.Close()
+	if err := migrations.Apply(ctx, pool); err != nil {
+		return fmt.Errorf("migrate PostgreSQL: %w", err)
+	}
+	repository := providerjoin.NewPostgresRepository(pool)
+	if err := repository.RevokeProvider(ctx, args[1]); err != nil {
+		return fmt.Errorf("revoke provider: %w", err)
+	}
+	fmt.Printf("provider %s is now REVOKED -- excluded from scheduling immediately, mTLS connectivity cut within one revocation-reconciliation interval\n", args[1])
+	return nil
 }
 
 func runUserCommand(ctx context.Context, args []string) error {
@@ -276,5 +315,5 @@ func parseUpholdOrReject(value string) (bool, error) {
 }
 
 func usageError() error {
-	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator_readonly|operator_admin> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject> | fund-account <account-hex> <amount>>")
+	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator_readonly|operator_admin> | revoke-provider <provider-id> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject> | fund-account <account-hex> <amount>>")
 }
