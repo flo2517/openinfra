@@ -1,6 +1,9 @@
 use crate as pallet_escrow;
 use crate::{DisputeOutcome, EscrowState, LeaseId, MeteringSummary, PriceSchedule};
-use frame_support::{assert_noop, assert_ok, derive_impl, parameter_types, traits::ConstU64};
+use frame_support::{
+    assert_noop, assert_ok, derive_impl, parameter_types,
+    traits::{ConstU64, ReservableCurrency},
+};
 use sp_core::{ed25519, Pair};
 use sp_runtime::{BuildStorage, DispatchError};
 
@@ -59,6 +62,30 @@ thread_local! {
     static LEASE_EXISTS: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) };
     static PENALTIES: std::cell::RefCell<Vec<(u64, u16)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static REGISTERED_VALIDATORS: std::cell::RefCell<std::collections::BTreeSet<u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Mock for the reserve-contamination guard's forward direction
+/// (`fund_escrow` rejects a payer who is a registered Network Validator).
+/// Controlled per-test via [`set_registered_validator`], independent of
+/// `pallet-network-validator` -- this pallet carries no dependency on it,
+/// same narrow-trait pattern as `TestProviderKeyLookup`/`TestLeaseExists`.
+pub struct TestValidatorInspector;
+impl crate::ValidatorRegistrationInspector<u64> for TestValidatorInspector {
+    fn is_registered(account: &u64) -> bool {
+        REGISTERED_VALIDATORS.with(|set| set.borrow().contains(account))
+    }
+}
+
+fn set_registered_validator(account: u64, registered: bool) {
+    REGISTERED_VALIDATORS.with(|set| {
+        if registered {
+            set.borrow_mut().insert(account);
+        } else {
+            set.borrow_mut().remove(&account);
+        }
+    });
 }
 
 pub struct TestLeaseExists;
@@ -87,6 +114,7 @@ fn penalties() -> Vec<(u64, u16)> {
 fn reset_fixtures() {
     set_lease_exists(true);
     PENALTIES.with(|cell| cell.borrow_mut().clear());
+    REGISTERED_VALIDATORS.with(|set| set.borrow_mut().clear());
 }
 
 parameter_types! {
@@ -102,6 +130,7 @@ impl crate::Config for Test {
     type ProviderKeyLookup = TestProviderKeyLookup;
     type LeaseExists = TestLeaseExists;
     type ReputationPenalty = RecordingReputationPenalty;
+    type ValidatorInspector = TestValidatorInspector;
     type DisputeOrigin = frame_system::EnsureRoot<u64>;
     type PauseOrigin = frame_system::EnsureRoot<u64>;
     type RefundWindow = RefundWindow;
@@ -1128,4 +1157,330 @@ fn invariant_total_balance_conserved_and_charge_plus_remainder_equals_max_charge
             );
         });
     }
+}
+
+// ---------------------------------------------------------------------
+// Reserve-balance contamination guard: fund_escrow rejects a payer who is
+// currently a registered Network Validator (the same account is not
+// blocked in escrow's own tests from also being tracked by
+// `pallet-network-validator` in production -- both reserve against the
+// same untagged pallet_balances reserved pool, see this pallet's module
+// doc comment).
+// ---------------------------------------------------------------------
+
+#[test]
+fn fund_escrow_rejects_registered_validator() {
+    new_test_ext().execute_with(|| {
+        set_registered_validator(PAYER, true);
+        assert_noop!(fund(200), crate::Error::<Test>::PayerIsRegisteredValidator);
+        // No partial state: nothing reserved, no record created.
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert!(Escrow::escrows(LEASE).is_none());
+    });
+}
+
+#[test]
+fn fund_escrow_succeeds_once_validator_status_is_cleared() {
+    new_test_ext().execute_with(|| {
+        set_registered_validator(PAYER, true);
+        assert_noop!(fund(200), crate::Error::<Test>::PayerIsRegisteredValidator);
+        set_registered_validator(PAYER, false);
+        assert_ok!(fund(200));
+    });
+}
+
+#[test]
+fn fund_escrow_does_not_reject_an_unrelated_validator() {
+    new_test_ext().execute_with(|| {
+        // Only PAYER's own validator status matters, not the provider's or
+        // some other account's.
+        set_registered_validator(PROVIDER, true);
+        set_registered_validator(OTHER, true);
+        assert_ok!(fund(200));
+    });
+}
+
+// ---------------------------------------------------------------------
+// PayerOpenEscrowCount bookkeeping: backs the reverse guard (a Network
+// Validator registration must not succeed for an account with an open
+// escrow as payer). Exercised directly here since pallet-escrow has no
+// dependency on pallet-network-validator to dispatch through.
+// ---------------------------------------------------------------------
+
+#[test]
+fn fund_escrow_increments_payer_open_escrow_count() {
+    new_test_ext().execute_with(|| {
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+        assert_ok!(fund(200));
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 1);
+        assert_ok!(fund_other_lease());
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 2);
+    });
+}
+
+#[test]
+fn complete_and_payout_decrements_payer_open_escrow_count() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 1);
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            normal_evidence()
+        ));
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+    });
+}
+
+#[test]
+fn refund_escrow_decrements_payer_open_escrow_count() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        System::set_block_number(1 + RefundWindow::get());
+        assert_ok!(Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE));
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+    });
+}
+
+#[test]
+fn resolve_dispute_from_funded_decrements_payer_open_escrow_count_once() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        // Still open (Disputed still holds the reservation) until resolved.
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 1);
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+    });
+}
+
+#[test]
+fn redispute_after_completion_does_not_double_decrement_payer_open_escrow_count() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            normal_evidence()
+        ));
+        // Already decremented by complete_and_payout.
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+        System::set_block_number(1 + DisputeWindow::get());
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+        // Must not underflow past zero (saturating) or go negative.
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+    });
+}
+
+// ---------------------------------------------------------------------
+// resolve_dispute's shortfall write-off fail-safe.
+//
+// These reproduce the actual finding's mechanism directly with Balances
+// primitives (reserve + slash_reserved), the same shape any other pallet
+// sharing this account's reserved balance would trigger -- exactly what
+// pallet-network-validator's slash_round_submitters does in production,
+// without needing pallet-escrow to depend on pallet-network-validator to
+// demonstrate it. `reserve_contamination_strands_escrow_until_writeoff`
+// is the direct "would have failed before this fix, passes after" case:
+// every existing settlement path (complete_and_payout, refund_escrow)
+// still fails closed exactly as before -- that guarantee is not weakened
+// -- but resolve_dispute can now recover the escrow instead of leaving it
+// permanently stuck.
+// ---------------------------------------------------------------------
+
+#[test]
+fn reserve_contamination_strands_escrow_until_writeoff() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        assert_eq!(Balances::reserved_balance(PAYER), 200);
+
+        // Simulate an unrelated pallet (e.g. pallet-network-validator)
+        // also reserving against the *same* AccountId, then slashing a
+        // flat amount from the account's total reserved balance --
+        // exactly what pallet_balances::ReservableCurrency's untagged
+        // reserved pool allows, and exactly the mechanism this PR's fix
+        // closes off going forward via the fund_escrow/register_validator
+        // guards. Reserve 500 (e.g. validator stake), then slash 600 --
+        // more than that 500 -- so the slash eats into the escrow's own
+        // 200, leaving only 100 actually reserved for PAYER in total.
+        assert_ok!(Balances::reserve(&PAYER, 500));
+        assert_eq!(Balances::reserved_balance(PAYER), 700);
+        let (imbalance, shortfall) = Balances::slash_reserved(&PAYER, 600);
+        drop(imbalance);
+        assert_eq!(
+            shortfall, 0,
+            "600 was available to slash out of 700 reserved"
+        );
+        assert_eq!(Balances::reserved_balance(PAYER), 100);
+
+        // Every fund-moving path now fails closed -- no partial payment,
+        // the escrow stays exactly as it was (Funded, still recording
+        // max_charge = 200) because it genuinely cannot deliver on that
+        // recorded amount from what's actually left reserved.
+        assert_noop!(
+            Escrow::complete_and_payout(RuntimeOrigin::signed(OTHER), LEASE, normal_evidence()),
+            crate::Error::<Test>::ReserveAccountingInconsistent
+        );
+        System::set_block_number(1 + RefundWindow::get());
+        assert_noop!(
+            Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE),
+            crate::Error::<Test>::ReserveAccountingInconsistent
+        );
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Funded);
+
+        // The fail-safe: a root-gated resolve_dispute can now recover it.
+        // Dispute evidence indicates the provider should be paid the full
+        // 80 owed; pay that first (same priority the normal path always
+        // used), return whatever's left to the payer, and write off
+        // exactly the portion that's genuinely gone.
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(80)
+        ));
+
+        // Provider made whole for the full disputed amount (it was
+        // actually available: 100 reserved >= 80 owed).
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_080);
+        // Payer gets back only what was actually left (100 - 80 = 20),
+        // not the nominal remainder (200 - 80 = 120) -- the other 100 was
+        // already gone before this call ever ran. PAYER's free balance
+        // reflects: 1_000_000 - 200 (fund_escrow) - 500 (the simulated
+        // other-pallet reserve, never returned -- it was slashed) + 20
+        // (the remainder actually recovered here) = 999_320.
+        assert_eq!(Balances::free_balance(PAYER), 999_320);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(
+            Escrow::escrows(LEASE).unwrap().state,
+            EscrowState::Completed
+        );
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff {
+                    lease_id: LEASE,
+                    payer: PAYER,
+                    provider: PROVIDER,
+                    expected_total: 200,
+                    provider_amount: 80,
+                    payer_amount: 20,
+                    shortfall: 100,
+                })
+            )
+        });
+        assert!(
+            found,
+            "EscrowShortfallWrittenOff was not emitted with the expected amounts"
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_refund_payer_writes_off_confirmed_shortfall() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(200));
+        // Drain everything but 50 of PAYER's reserved balance via the same
+        // shared-pool mechanism.
+        assert_ok!(Balances::reserve(&PAYER, 500));
+        let (imbalance, shortfall) = Balances::slash_reserved(&PAYER, 650);
+        drop(imbalance);
+        assert_eq!(shortfall, 0);
+        assert_eq!(Balances::reserved_balance(PAYER), 50);
+
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PROVIDER),
+            LEASE,
+            [2u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+
+        // Payer gets back only the 50 that was actually there, not the
+        // nominal 200. PAYER's free balance reflects: 1_000_000 - 200
+        // (fund_escrow) - 500 (the simulated other-pallet reserve, never
+        // returned -- it was slashed) + 50 (actually recovered here) =
+        // 999_350.
+        assert_eq!(Balances::free_balance(PAYER), 999_350);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Refunded);
+        // The provider-loss reliability penalty still applies -- the
+        // write-off changes what could be *paid*, not the dispute's own
+        // finding of who was at fault.
+        assert_eq!(penalties(), vec![(PROVIDER, ReliabilityPenaltyBps::get())]);
+
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff {
+                    lease_id: LEASE,
+                    payer: PAYER,
+                    provider: PROVIDER,
+                    expected_total: 200,
+                    provider_amount: 0,
+                    payer_amount: 50,
+                    shortfall: 150,
+                })
+            )
+        });
+        assert!(
+            found,
+            "EscrowShortfallWrittenOff was not emitted with the expected amounts"
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_without_shortfall_never_emits_writeoff_event() {
+    new_test_ext().execute_with(|| {
+        // The ordinary, non-contaminated case -- confirms the write-off
+        // event is genuinely conditional, not emitted on every resolution.
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(80)
+        ));
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff { .. })
+            )
+        });
+        assert!(
+            !found,
+            "EscrowShortfallWrittenOff must not fire when nothing is actually short"
+        );
+    });
 }
