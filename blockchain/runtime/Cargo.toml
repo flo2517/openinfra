@@ -9,6 +9,7 @@ build = "build.rs"
 codec = { workspace = true }
 polkadot-sdk = { version = "=2606.0.0", default-features = false, features = ["pallet-aura", "pallet-balances", "pallet-grandpa", "pallet-sudo", "pallet-timestamp", "runtime", "sp-consensus-aura", "sp-consensus-grandpa"] }
 pallet-availability = { path = "../pallets/availability", default-features = false }
+pallet-escrow = { path = "../pallets/escrow", default-features = false }
 pallet-network-validator = { path = "../pallets/network-validator", default-features = false }
 pallet-openinfra-lease = { path = "../pallets/lease", default-features = false }
 pallet-openinfra-rewards = { path = "../pallets/rewards", default-features = false }
@@ -27,6 +28,7 @@ std = [
     "codec/std",
     "polkadot-sdk/std",
     "pallet-availability/std",
+    "pallet-escrow/std",
     "pallet-network-validator/std",
     "pallet-openinfra-lease/std",
     "pallet-openinfra-rewards/std",
