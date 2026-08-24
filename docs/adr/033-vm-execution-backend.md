@@ -2,25 +2,16 @@
 
 ## Status
 
-Proposed. Written by Claude Code, autonomously, in direct response to the repository owner's
-request ("prepare the ground for VMs") made immediately after accepting **ADR-031 (OpenStack
-compatibility architecture)**, which deliberately left this exact question open and named it as its
-own required follow-up (ADR-031 §4: "The VM-backend half of issue #24 ... is explicitly deferred to
-its own follow-up ADR that must be written, reviewed, and accepted before any of that work starts").
-This is that ADR.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
 
-**This ADR explicitly proposes lifting ADR-006's Docker-only prohibition.** ADR-006 states plainly:
-"Use Docker through bollard for MVP workload execution. Kubernetes, VM orchestration, and
-alternative runtimes are deferred," and `AGENTS.md` names it directly: "Kubernetes remains
-prohibited under ADR-006, which fixes Docker as the runtime; adopting it needs its own accepted
-ADR." A VM execution backend is squarely "VM orchestration" — the same class of change ADR-006
-itself named as deferred, not something an implementation can quietly work around. Per
-`AGENTS.md`'s frozen-architecture rule ("Do not change a language, framework, database, or
-component boundary without an accepted ADR"), lifting that prohibition is the single most
-consequential decision in this document, given the same weight ADR-031 gave its own most
-consequential call (real OpenStack wire compatibility). **It does not become effective until the
-repository owner reviews a summary of this ADR in an interactive session and explicitly confirms —
-a Proposed status here is not a request for a rubber stamp.**
+Originally written by Claude Code, autonomously, in direct response to the repository owner's
+request ("prepare the ground for VMs") made immediately after accepting ADR-031 (OpenStack
+compatibility architecture), which deliberately left this exact question open and named it as its
+own required follow-up. This ADR explicitly lifted ADR-006's Docker-only prohibition — additively,
+per this document's own design (Docker stays the default execution path; VMs are a second, opt-in
+path). Nothing here is implemented yet by this ADR itself; issue #24's VM half is unblocked by this
+acceptance and now carries the implementation work.
 
 ## Context
 
