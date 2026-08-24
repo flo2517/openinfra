@@ -10,6 +10,7 @@ import (
 	v1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -369,11 +370,22 @@ func (x *SolveChallengeResponse) GetSignature() []byte {
 }
 
 type DeployRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	WorkloadId    string                 `protobuf:"bytes,1,opt,name=workload_id,json=workloadId,proto3" json:"workload_id,omitempty"`
-	LeaseId       string                 `protobuf:"bytes,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
-	Image         string                 `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
-	Limits        *ResourceLimits        `protobuf:"bytes,4,opt,name=limits,proto3" json:"limits,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	WorkloadId string                 `protobuf:"bytes,1,opt,name=workload_id,json=workloadId,proto3" json:"workload_id,omitempty"`
+	LeaseId    string                 `protobuf:"bytes,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	Image      string                 `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
+	Limits     *ResourceLimits        `protobuf:"bytes,4,opt,name=limits,proto3" json:"limits,omitempty"`
+	// ADR-028 §3: when this workload's lease authorization ends. Sourced from
+	// the same lease term the orchestrator already computes before calling
+	// Deploy (control-plane/internal/orchestrator/worker.go). Required: the
+	// Agent refuses a DeployRequest with no lease_end (see agent-executor's
+	// deployment() validation) because it would otherwise have no way to
+	// locally bound how long it is authorized to keep the workload running if
+	// it becomes disconnected from the Control Plane (ADR-028 §2/§3) -- a
+	// stricter reading than the ADR's own text, which only says the field is
+	// added, not that it is mandatory; treated as mandatory here as the more
+	// conservative interpretation.
+	LeaseEnd      *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=lease_end,json=leaseEnd,proto3" json:"lease_end,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -432,6 +444,13 @@ func (x *DeployRequest) GetImage() string {
 func (x *DeployRequest) GetLimits() *ResourceLimits {
 	if x != nil {
 		return x.Limits
+	}
+	return nil
+}
+
+func (x *DeployRequest) GetLeaseEnd() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LeaseEnd
 	}
 	return nil
 }
@@ -1344,7 +1363,7 @@ var File_openinfra_agent_v1_agent_proto protoreflect.FileDescriptor
 
 const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\n" +
-	"\x1eopeninfra/agent/v1/agent.proto\x12\x12openinfra.agent.v1\x1a openinfra/shared/v1/shared.proto\"\xde\x01\n" +
+	"\x1eopeninfra/agent/v1/agent.proto\x12\x12openinfra.agent.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a openinfra/shared/v1/shared.proto\"\xde\x01\n" +
 	"\x14GetAgentInfoResponse\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1d\n" +
@@ -1370,13 +1389,14 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x06result\x18\x03 \x01(\fR\x06result\x12\x1f\n" +
 	"\vduration_ms\x18\x04 \x01(\rR\n" +
 	"durationMs\x12\x1c\n" +
-	"\tsignature\x18\x05 \x01(\fR\tsignature\"\x9d\x01\n" +
+	"\tsignature\x18\x05 \x01(\fR\tsignature\"\xd6\x01\n" +
 	"\rDeployRequest\x12\x1f\n" +
 	"\vworkload_id\x18\x01 \x01(\tR\n" +
 	"workloadId\x12\x19\n" +
 	"\blease_id\x18\x02 \x01(\tR\aleaseId\x12\x14\n" +
 	"\x05image\x18\x03 \x01(\tR\x05image\x12:\n" +
-	"\x06limits\x18\x04 \x01(\v2\".openinfra.agent.v1.ResourceLimitsR\x06limits\"k\n" +
+	"\x06limits\x18\x04 \x01(\v2\".openinfra.agent.v1.ResourceLimitsR\x06limits\x127\n" +
+	"\tlease_end\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\bleaseEnd\"k\n" +
 	"\x0eResourceLimits\x12\x1b\n" +
 	"\tcpu_cores\x18\x01 \x01(\x02R\bcpuCores\x12\x1b\n" +
 	"\tmemory_mb\x18\x02 \x01(\x03R\bmemoryMb\x12\x1f\n" +
@@ -1492,38 +1512,40 @@ var file_openinfra_agent_v1_agent_proto_goTypes = []any{
 	(*GetAgentInfoRequest)(nil),          // 20: openinfra.agent.v1.GetAgentInfoRequest
 	(*GetUsageSummaryRequest)(nil),       // 21: openinfra.agent.v1.GetUsageSummaryRequest
 	(*GetUsageSummaryResponse)(nil),      // 22: openinfra.agent.v1.GetUsageSummaryResponse
-	(*v1.MeteringSummary)(nil),           // 23: openinfra.shared.v1.MeteringSummary
+	(*timestamppb.Timestamp)(nil),        // 23: google.protobuf.Timestamp
+	(*v1.MeteringSummary)(nil),           // 24: openinfra.shared.v1.MeteringSummary
 }
 var file_openinfra_agent_v1_agent_proto_depIdxs = []int32{
 	0,  // 0: openinfra.agent.v1.SolveChallengeRequest.type:type_name -> openinfra.agent.v1.SolveChallengeRequest.Type
 	6,  // 1: openinfra.agent.v1.DeployRequest.limits:type_name -> openinfra.agent.v1.ResourceLimits
-	1,  // 2: openinfra.agent.v1.GetWorkloadStatusResponse.state:type_name -> openinfra.agent.v1.GetWorkloadStatusResponse.State
-	23, // 3: openinfra.agent.v1.GetUsageSummaryResponse.summary:type_name -> openinfra.shared.v1.MeteringSummary
-	20, // 4: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
-	18, // 5: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
-	12, // 6: openinfra.agent.v1.ProviderAgentService.GetInventory:input_type -> openinfra.agent.v1.GetInventoryRequest
-	3,  // 7: openinfra.agent.v1.ProviderAgentService.SolveChallenge:input_type -> openinfra.agent.v1.SolveChallengeRequest
-	5,  // 8: openinfra.agent.v1.ProviderAgentService.Deploy:input_type -> openinfra.agent.v1.DeployRequest
-	8,  // 9: openinfra.agent.v1.ProviderAgentService.Stop:input_type -> openinfra.agent.v1.StopRequest
-	10, // 10: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:input_type -> openinfra.agent.v1.GetWorkloadStatusRequest
-	14, // 11: openinfra.agent.v1.ProviderAgentService.StreamMetrics:input_type -> openinfra.agent.v1.StreamMetricsRequest
-	16, // 12: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:input_type -> openinfra.agent.v1.MeasureBandwidthRequest
-	21, // 13: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:input_type -> openinfra.agent.v1.GetUsageSummaryRequest
-	2,  // 14: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
-	19, // 15: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
-	13, // 16: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
-	4,  // 17: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
-	7,  // 18: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
-	9,  // 19: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
-	11, // 20: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
-	15, // 21: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
-	17, // 22: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:output_type -> openinfra.agent.v1.MeasureBandwidthResponse
-	22, // 23: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:output_type -> openinfra.agent.v1.GetUsageSummaryResponse
-	14, // [14:24] is the sub-list for method output_type
-	4,  // [4:14] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	23, // 2: openinfra.agent.v1.DeployRequest.lease_end:type_name -> google.protobuf.Timestamp
+	1,  // 3: openinfra.agent.v1.GetWorkloadStatusResponse.state:type_name -> openinfra.agent.v1.GetWorkloadStatusResponse.State
+	24, // 4: openinfra.agent.v1.GetUsageSummaryResponse.summary:type_name -> openinfra.shared.v1.MeteringSummary
+	20, // 5: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
+	18, // 6: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
+	12, // 7: openinfra.agent.v1.ProviderAgentService.GetInventory:input_type -> openinfra.agent.v1.GetInventoryRequest
+	3,  // 8: openinfra.agent.v1.ProviderAgentService.SolveChallenge:input_type -> openinfra.agent.v1.SolveChallengeRequest
+	5,  // 9: openinfra.agent.v1.ProviderAgentService.Deploy:input_type -> openinfra.agent.v1.DeployRequest
+	8,  // 10: openinfra.agent.v1.ProviderAgentService.Stop:input_type -> openinfra.agent.v1.StopRequest
+	10, // 11: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:input_type -> openinfra.agent.v1.GetWorkloadStatusRequest
+	14, // 12: openinfra.agent.v1.ProviderAgentService.StreamMetrics:input_type -> openinfra.agent.v1.StreamMetricsRequest
+	16, // 13: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:input_type -> openinfra.agent.v1.MeasureBandwidthRequest
+	21, // 14: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:input_type -> openinfra.agent.v1.GetUsageSummaryRequest
+	2,  // 15: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
+	19, // 16: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
+	13, // 17: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
+	4,  // 18: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
+	7,  // 19: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
+	9,  // 20: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
+	11, // 21: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
+	15, // 22: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
+	17, // 23: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:output_type -> openinfra.agent.v1.MeasureBandwidthResponse
+	22, // 24: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:output_type -> openinfra.agent.v1.GetUsageSummaryResponse
+	15, // [15:25] is the sub-list for method output_type
+	5,  // [5:15] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_openinfra_agent_v1_agent_proto_init() }

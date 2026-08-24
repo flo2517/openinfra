@@ -154,6 +154,56 @@ message HeartbeatSigningPayload {
   // same key signing the same data on the same transport, and two
   // verifications that can disagree are worse than one that cannot.
   repeated WorkloadBandwidthUsage workload_bandwidth = 6;
+  // ADR-028 §4: one entry per workload the Agent currently knows about
+  // locally (agent-core::local_state::LocalState), on *every* heartbeat --
+  // not a special "resuming after disconnect" message. Bounded by the same
+  // max_workloads cap LocalState itself already enforces (default 8); the
+  // Control Plane additionally enforces its own ceiling regardless (see
+  // maxWorkloadStatusEntriesPerHeartbeat), the same defense-in-depth
+  // WorkloadBandwidthUsage above already gets. This is what makes
+  // reconciliation on reconnect "status-first by construction": the first
+  // heartbeat that succeeds after some failed ones carries exactly this
+  // same payload shape as any other heartbeat, so the Agent's actual
+  // observed state rides on the very call that re-establishes contact.
+  repeated WorkloadStatusSummary workload_status = 7;
+}
+
+// ADR-028 §4: one workload's Agent-local status, as
+// agent-core::local_state::WorkloadRecord itself understands it -- never a
+// claim of Control-Plane-confirmed state (see WorkloadPhase's own doc
+// comment: it is entirely a vocabulary of locally observed truth).
+// providerjoin.Service.ReportHeartbeat reconciles this against its own
+// authoritative WorkloadState using the existing state machine; it does not
+// invent a new one.
+message WorkloadStatusSummary {
+  string workload_id = 1;
+  AgentWorkloadPhase phase = 2;
+  // Empty when the Agent has not yet created a container for this
+  // workload (AGENT_WORKLOAD_PHASE_PROVISIONING).
+  string container_id = 3;
+  // The exact spec_hash agent-core::local_state::WorkloadRecord persisted
+  // for this workload -- lets the Control Plane detect (though this ADR
+  // does not yet act on) a workload whose locally-persisted spec disagrees
+  // with what the Control Plane most recently asked for.
+  bytes spec_hash = 4;
+}
+
+// AgentWorkloadPhase mirrors agent-core::local_state::WorkloadPhase
+// one-to-one -- deliberately not WorkloadState (this message's cousin
+// below): the two vocabularies answer different questions ("what does the
+// Agent locally observe about this container" vs. "what does the Control
+// Plane's own workload lifecycle believe"), and conflating them would let
+// an Agent-local phase silently masquerade as Control-Plane-confirmed
+// state, which ADR-028 §2 explicitly prohibits.
+enum AgentWorkloadPhase {
+  AGENT_WORKLOAD_PHASE_UNSPECIFIED = 0;
+  AGENT_WORKLOAD_PHASE_PROVISIONING = 1;
+  AGENT_WORKLOAD_PHASE_STARTING = 2;
+  AGENT_WORKLOAD_PHASE_RUNNING = 3;
+  AGENT_WORKLOAD_PHASE_STOPPING = 4;
+  AGENT_WORKLOAD_PHASE_STOPPED = 5;
+  AGENT_WORKLOAD_PHASE_FAILED = 6;
+  AGENT_WORKLOAD_PHASE_LOST = 7;
 }
 
 // WorkloadBandwidthUsage is one workload's cumulative byte counters, as
