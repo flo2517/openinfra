@@ -215,6 +215,92 @@ func TestWorkerReleasesClaimThroughCASRetry(t *testing.T) {
 	}
 }
 
+// TestRetryMarksWorkloadFailedOnceRetryPolicyMaxAttemptsIsReached is
+// issue #138's core fix: a workload that has already exhausted
+// RetryPolicy.MaxAttempts-1 attempts must, on its next failure, be marked
+// FAILED instead of re-queued forever against what may be a permanently
+// dead provider.
+func TestRetryMarksWorkloadFailedOnceRetryPolicyMaxAttemptsIsReached(t *testing.T) {
+	item := workloadapi.Workload{WorkloadID: "workload", State: "SCHEDULING", Definition: []byte("invalid"), Version: 11, AttemptCount: 2}
+	store := &recordingStore{item: item}
+	worker := NewWorker(store, staticDirectory{}, successfulLeases{}, successfulDispatcher{}, testRanker())
+	worker.SetRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Millisecond, MaxBackoff: time.Millisecond})
+	worker.workerID = "recovery-worker"
+	if err := worker.processOne(context.Background()); err == nil {
+		t.Fatal("invalid definition must still surface an error even on the terminal path")
+	}
+	if store.action != "mark-failed" {
+		t.Fatalf("action = %q, want mark-failed: attempt 3 of MaxAttempts 3 must be terminal", store.action)
+	}
+	if store.mutated.Version != 11 || store.mutated.WorkerID != worker.workerID {
+		t.Fatalf("mark-failed did not retain the claimed CAS identity: %+v", store.mutated)
+	}
+}
+
+// TestRetryStaysNonTerminalBelowMaxAttempts is the companion boundary case:
+// one attempt short of the cap must still retry normally, not jump to
+// FAILED early.
+func TestRetryStaysNonTerminalBelowMaxAttempts(t *testing.T) {
+	item := workloadapi.Workload{WorkloadID: "workload", State: "SCHEDULING", Definition: []byte("invalid"), Version: 11, AttemptCount: 1}
+	store := &recordingStore{item: item}
+	worker := NewWorker(store, staticDirectory{}, successfulLeases{}, successfulDispatcher{}, testRanker())
+	worker.SetRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Second, MaxBackoff: time.Minute})
+	worker.workerID = "recovery-worker"
+	if err := worker.processOne(context.Background()); err == nil {
+		t.Fatal("invalid definition must fail")
+	}
+	if store.action != "retry" {
+		t.Fatalf("action = %q, want retry: attempt 2 of MaxAttempts 3 must not yet be terminal", store.action)
+	}
+	if store.mutated.Version != 11 || store.mutated.WorkerID != worker.workerID {
+		t.Fatalf("retry did not retain the claimed CAS identity: %+v", store.mutated)
+	}
+}
+
+// TestRetrySucceedingBeforeCapDoesNotTerminate is the no-regression case:
+// a workload that has already accumulated most of its retry budget (here,
+// 9 of the default 10 attempts) but then succeeds on its next step must
+// reach its normal success transition -- a high attempt_count alone must
+// never terminate a workload outside of the retry() path itself.
+func TestRetrySucceedingBeforeCapDoesNotTerminate(t *testing.T) {
+	definition, err := proto.Marshal(&sharedv1.WorkloadDefinition{Requirements: &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := workloadapi.Workload{WorkloadID: "workload", State: "DEPLOYING", Definition: definition, ProviderID: "provider", LeaseID: "42", Version: 4, AttemptCount: 9}
+	store := &recordingStore{item: item}
+	provider := agentmanager.SchedulableProvider{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "provider", AgentEndpoint: "https://agent:50052"}}
+	worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, successfulDispatcher{}, testRanker())
+	if err := worker.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.action != "mark-running" {
+		t.Fatalf("action = %q, want mark-running: a successful deploy must not be affected by a high attempt_count", store.action)
+	}
+}
+
+// TestBackoffForDoublesAndCapsAtMaxBackoff pins retry()'s delay schedule
+// directly, independent of the DB-level MarkFailed/RetryLater tests.
+func TestBackoffForDoublesAndCapsAtMaxBackoff(t *testing.T) {
+	worker := NewWorker(nil, nil, nil, nil, testRanker())
+	worker.SetRetryPolicy(RetryPolicy{MaxAttempts: 100, BaseBackoff: time.Second, MaxBackoff: 8 * time.Second})
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{1, time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{4, 8 * time.Second},
+		{5, 8 * time.Second}, // capped
+	}
+	for _, c := range cases {
+		if got := worker.backoffFor(c.attempt); got != c.want {
+			t.Errorf("backoffFor(%d) = %v, want %v", c.attempt, got, c.want)
+		}
+	}
+}
+
 func TestDeployRetryReconcilesStatusBeforeIdempotentReplay(t *testing.T) {
 	definition, err := proto.Marshal(&sharedv1.WorkloadDefinition{Requirements: &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256}})
 	if err != nil {
@@ -436,6 +522,10 @@ func (s *recordingStore) MarkLeased(_ context.Context, item workloadapi.Workload
 }
 func (s *recordingStore) RetryLater(_ context.Context, item workloadapi.Workload, _, _ string, _ time.Duration) error {
 	s.record("retry", item)
+	return nil
+}
+func (s *recordingStore) MarkFailed(_ context.Context, item workloadapi.Workload, _, _ string) error {
+	s.record("mark-failed", item)
 	return nil
 }
 func (s *recordingStore) MarkDeploying(_ context.Context, item workloadapi.Workload, _ uint64) error {
