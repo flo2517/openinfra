@@ -89,6 +89,8 @@ mod runtime {
     pub type Availability = pallet_availability::Pallet<Runtime>;
     #[runtime::pallet_index(16)]
     pub type NetworkValidator = pallet_network_validator::Pallet<Runtime>;
+    #[runtime::pallet_index(17)]
+    pub type Escrow = pallet_escrow::Pallet<Runtime>;
 }
 
 parameter_types! {
@@ -119,6 +121,31 @@ parameter_types! {
     // upheld disputes compound instead of one governance call being able
     // to destroy a participant's entire stake at once.
     pub const ValidatorSlashAmount: u64 = 100;
+    // ADR-029 §4.3: self-service refund window for an uncompleted escrow.
+    // ~1 day at 6s blocks, same order of magnitude as
+    // ValidatorUnbondingPeriod -- long enough that a slow-but-honest relayer
+    // still has time to submit completion evidence before a payer reclaims
+    // its funds.
+    pub const EscrowRefundWindow: u32 = 14_400;
+    // ADR-029 §4.4/§7: mirrors ValidatorDisputeWindow -- ~30 minutes at 6s
+    // blocks to contest a settled escrow.
+    pub const EscrowDisputeWindow: u32 = 300;
+    // ADR-029 §1/§6: safety cap on a single evidence record's claimed
+    // period_end - period_start, mirroring MaxProofAge's shape. Not the
+    // expected reporting cadence (that is #20's own, much shorter,
+    // metering-interval concern) -- this only bounds how large one
+    // complete_and_payout call's claimed period may be. ~1 day at 6s
+    // blocks.
+    pub const EscrowMaxMeteringPeriod: u32 = 14_400;
+    // ADR-029 §4.1/§7: dust threshold, just above ExistentialDeposit --
+    // rejects escrows too small to be worth the storage.
+    pub const MinEscrowAmount: u64 = 100;
+    // ADR-029 §5: bounded per-incident reliability penalty on
+    // resolve_dispute's RefundPayer outcome, in basis points (0..=10_000).
+    // 10%, the same fraction ValidatorSlashAmount uses of MinValidatorStake
+    // -- a repeated upheld dispute compounds rather than one governance
+    // call zeroing a provider's reliability score at once.
+    pub const EscrowReliabilityPenaltyBps: u16 = 1_000;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -331,6 +358,71 @@ impl pallet_network_validator::Config for Runtime {
     type DisputeWindow = ValidatorDisputeWindow;
     type PointsPerAcceptedSubmission = ValidatorPointsPerAcceptedSubmission;
     type SlashAmount = ValidatorSlashAmount;
+    type WeightInfo = ();
+}
+
+/// Bridges `pallet-provider-registry`'s already-on-chain
+/// `Provider.public_key` into escrow's narrow `ProviderKeyLookup` trait
+/// (ADR-029 §3), so `pallet-escrow` carries no hard compile dependency on
+/// `pallet-provider-registry`.
+pub struct ProviderKeyLookupBridge;
+impl pallet_escrow::ProviderKeyLookup<interface::AccountId> for ProviderKeyLookupBridge {
+    fn public_key(provider: &interface::AccountId) -> Option<[u8; 32]> {
+        pallet_provider_registry::Providers::<Runtime>::get(provider)
+            .map(|record| record.public_key)
+    }
+}
+
+/// Narrow, read-only sanity check that a lease id exists -- deliberately
+/// not a check against `pallet-lease`'s `consumer` field (ADR-029 §3).
+pub struct LeaseExistsBridge;
+impl pallet_escrow::LeaseExists for LeaseExistsBridge {
+    fn exists(lease_id: pallet_escrow::LeaseId) -> bool {
+        pallet_openinfra_lease::Leases::<Runtime>::contains_key(lease_id)
+    }
+}
+
+/// Applies escrow's dispute-loss consequence (ADR-029 §5) to a provider's
+/// `Reliability` reputation dimension, through `pallet-reputation`'s
+/// existing non-extrinsic `set_dimension_score` entry point -- the same
+/// pattern `ScoringReputationUpdater` above already uses, so
+/// `pallet-reputation` stays the only writer of the reputation vector
+/// regardless of which pallet triggered the update.
+pub struct EscrowReputationPenaltyBridge;
+impl pallet_escrow::ReputationPenalty<interface::AccountId> for EscrowReputationPenaltyBridge {
+    fn apply(
+        provider: &interface::AccountId,
+        penalty_bps: u16,
+    ) -> frame::deps::sp_runtime::DispatchResult {
+        let current = pallet_reputation::Pallet::<Runtime>::dimension_score_bps(
+            provider,
+            pallet_reputation::pallet::VectorDimension::Reliability,
+        );
+        let penalized = current.saturating_sub(penalty_bps);
+        pallet_reputation::Pallet::<Runtime>::set_dimension_score(
+            provider,
+            pallet_reputation::pallet::VectorDimension::Reliability,
+            penalized,
+        )
+    }
+}
+
+impl pallet_escrow::Config for Runtime {
+    // Sec2: reuses pallet_balances, the same ReservableCurrency already
+    // backing Network Validator stake -- no new asset pallet.
+    type Currency = Balances;
+    type ProviderKeyLookup = ProviderKeyLookupBridge;
+    type LeaseExists = LeaseExistsBridge;
+    type ReputationPenalty = EscrowReputationPenaltyBridge;
+    // Sec4.5/Sec9: the sole remaining sudo-key surface in this pallet.
+    type DisputeOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    // Sec10: emergency circuit breaker.
+    type PauseOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    type RefundWindow = EscrowRefundWindow;
+    type DisputeWindow = EscrowDisputeWindow;
+    type MaxMeteringPeriodSeconds = EscrowMaxMeteringPeriod;
+    type MinEscrowAmount = MinEscrowAmount;
+    type ReliabilityPenaltyBps = EscrowReliabilityPenaltyBps;
     type WeightInfo = ();
 }
 
