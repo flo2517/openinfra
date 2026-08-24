@@ -23,6 +23,17 @@
 //!
 //! Still open per ADR-011: unpredictable (VRF-backed) committee entropy --
 //! see [`Pallet::committee`] for why assignment is currently predictable.
+//!
+//! **Reserve-balance contamination guard.** [`Pallet::register_validator`]
+//! refuses to bond stake for an account that currently has funds locked in
+//! an open `pallet-escrow` escrow as `payer` ([`EscrowPayerInspector`]),
+//! symmetric to `pallet-escrow::fund_escrow`'s own guard against the same
+//! account holding both roles. Both pallets reserve against the same
+//! untagged, per-account `pallet_balances` reserved balance, and
+//! [`Pallet::slash_round_submitters`]'s `slash_reserved` call is scoped
+//! only to the account, not to this pallet's own `stake` bookkeeping -- see
+//! `pallet-escrow`'s module doc comment for the full mechanism this guards
+//! against.
 
 extern crate alloc;
 
@@ -109,6 +120,27 @@ impl<AccountId> NetworkValidatorInspector<AccountId> for () {
     }
 }
 
+/// Narrow, read-only check for whether an account currently has funds
+/// locked in an open `pallet-escrow` escrow as `payer`. Backs
+/// [`Pallet::register_validator`]'s reserve-contamination guard: registering
+/// bonds `stake` into the same untagged, per-account `pallet_balances`
+/// reserved balance an escrow payer's `max_charge` is already sitting in,
+/// and `slash_round_submitters`'s `slash_reserved` is scoped only to the
+/// account, not to this pallet's own `stake` bookkeeping -- so an account
+/// that is both an escrow payer and a Network Validator risks an upheld
+/// dispute against the validator role slashing funds an unrelated escrow
+/// still depends on. Symmetric to `pallet-escrow`'s own
+/// `ValidatorRegistrationInspector` guard on `fund_escrow`.
+pub trait EscrowPayerInspector<AccountId> {
+    fn has_open_escrow(payer: &AccountId) -> bool;
+}
+
+impl<AccountId> EscrowPayerInspector<AccountId> for () {
+    fn has_open_escrow(_: &AccountId) -> bool {
+        false
+    }
+}
+
 pub trait WeightInfo {
     fn register_validator() -> Weight;
     fn request_exit() -> Weight;
@@ -171,6 +203,10 @@ pub mod pallet {
         /// Credits Reward Points to non-outlier submitters; the runtime
         /// wires this to `pallet-rewards`.
         type ValidatorRewards: ValidatorRewards<Self::AccountId>;
+        /// Backs [`Pallet::register_validator`]'s reserve-contamination
+        /// guard; the runtime wires this to
+        /// `pallet-escrow::PayerOpenEscrowCount`.
+        type EscrowInspector: EscrowPayerInspector<Self::AccountId>;
         #[pallet::constant]
         type MinStake: Get<BalanceOf<Self>>;
         #[pallet::constant]
@@ -484,6 +520,12 @@ pub mod pallet {
         AlreadyDisputed,
         /// The round is not under dispute, so there is nothing to resolve.
         NotDisputed,
+        /// The caller currently has funds locked in an open `pallet-escrow`
+        /// escrow as `payer`. Rejected because registering would reserve
+        /// `stake` into the same untagged, per-account reserved balance
+        /// that escrow's `max_charge` is already sitting in -- see
+        /// [`EscrowPayerInspector`].
+        PayerHasOpenEscrow,
     }
 
     #[pallet::call]
@@ -501,6 +543,14 @@ pub mod pallet {
                 Error::<T>::AlreadyRegistered
             );
             ensure!(stake >= T::MinStake::get(), Error::<T>::InsufficientStake);
+            // Reserve-contamination guard: an account with funds locked in
+            // an open escrow as payer may not also bond validator stake,
+            // since both reserve against the same untagged per-account
+            // balance (see `EscrowPayerInspector`'s doc comment).
+            ensure!(
+                !T::EscrowInspector::has_open_escrow(&who),
+                Error::<T>::PayerHasOpenEscrow
+            );
             Self::join_active_set(&who)?;
             T::Currency::reserve(&who, stake).map_err(|_| Error::<T>::InsufficientFreeBalance)?;
             let now = frame_system::Pallet::<T>::block_number();

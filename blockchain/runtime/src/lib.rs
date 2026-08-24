@@ -347,6 +347,21 @@ impl pallet_network_validator::ValidatorRewards<interface::AccountId> for Valida
     }
 }
 
+/// Bridges `pallet-escrow`'s per-payer open-escrow counter into
+/// `pallet-network-validator`'s narrow `EscrowPayerInspector` trait (the
+/// reserve-contamination fix's reverse guard, symmetric to
+/// `EscrowValidatorInspectorBridge` below): `register_validator` must not
+/// succeed for an account that currently has funds locked in an open
+/// escrow as `payer`.
+pub struct EscrowPayerInspectorBridge;
+impl pallet_network_validator::EscrowPayerInspector<interface::AccountId>
+    for EscrowPayerInspectorBridge
+{
+    fn has_open_escrow(payer: &interface::AccountId) -> bool {
+        pallet_escrow::PayerOpenEscrowCount::<Runtime>::get(payer) > 0
+    }
+}
+
 impl pallet_network_validator::Config for Runtime {
     type Currency = Balances;
     type ReputationUpdater = ScoringReputationUpdater;
@@ -355,6 +370,9 @@ impl pallet_network_validator::Config for Runtime {
     // committee/governance origin is ADR-011 §5 follow-up work, not decided
     // by this pallet yet.
     type SuspensionOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    // Reserve-contamination fix: register_validator must not bond stake for
+    // an account with funds locked in an open escrow as payer.
+    type EscrowInspector = EscrowPayerInspectorBridge;
     type MinStake = MinValidatorStake;
     type UnbondingPeriod = ValidatorUnbondingPeriod;
     type MaxSubmissionsPerRound = MaxValidatorSubmissionsPerRound;
@@ -413,6 +431,22 @@ impl pallet_escrow::ReputationPenalty<interface::AccountId> for EscrowReputation
     }
 }
 
+/// Bridges `pallet-network-validator`'s registry into `pallet-escrow`'s
+/// narrow `ValidatorRegistrationInspector` trait (the reserve-contamination
+/// fix): checks presence in `Validators` regardless of status --
+/// `Active`, `Suspended`, and `Exiting` all still hold real bonded stake
+/// reserved until `withdraw_unbonded` actually releases it, unlike
+/// `ActiveValidatorLookup` above, which deliberately narrows to `Active`
+/// for a different purpose (gating submission rights).
+pub struct EscrowValidatorInspectorBridge;
+impl pallet_escrow::ValidatorRegistrationInspector<interface::AccountId>
+    for EscrowValidatorInspectorBridge
+{
+    fn is_registered(account: &interface::AccountId) -> bool {
+        pallet_network_validator::Validators::<Runtime>::contains_key(account)
+    }
+}
+
 impl pallet_escrow::Config for Runtime {
     // Sec2: reuses pallet_balances, the same ReservableCurrency already
     // backing Network Validator stake -- no new asset pallet.
@@ -420,6 +454,9 @@ impl pallet_escrow::Config for Runtime {
     type ProviderKeyLookup = ProviderKeyLookupBridge;
     type LeaseExists = LeaseExistsBridge;
     type ReputationPenalty = EscrowReputationPenaltyBridge;
+    // Reserve-contamination fix: fund_escrow must not accept a payer who
+    // is currently a registered Network Validator.
+    type ValidatorInspector = EscrowValidatorInspectorBridge;
     // Sec4.5/Sec9: the sole remaining sudo-key surface in this pallet.
     type DisputeOrigin = frame_system::EnsureRoot<Self::AccountId>;
     // Sec10: emergency circuit breaker.
@@ -565,6 +602,116 @@ mod tests {
     #[test]
     fn development_genesis_builds() {
         assert!(genesis_config_presets::development_config_genesis().is_object());
+    }
+
+    /// End-to-end reproduction of the reserve-balance contamination
+    /// finding's exact attack shape, exercised against the real runtime
+    /// wiring (not a pallet-level mock): register an account as a Network
+    /// Validator, then attempt to fund an escrow as that same account, and
+    /// the symmetric order. Both are rejected outright, with the specific
+    /// new error and no state change -- the precondition the finding
+    /// depends on (one AccountId holding both roles, both drawing on the
+    /// same untagged `pallet_balances` reserved pool) can no longer be
+    /// created through either pallet's real, wired-together entry point.
+    #[test]
+    fn escrow_payer_and_network_validator_roles_are_mutually_exclusive() {
+        use frame_support::{assert_noop, assert_ok};
+        use polkadot_sdk::sp_runtime::BuildStorage;
+
+        let already_validator = interface::AccountId::from([1_u8; 32]);
+        let already_payer = interface::AccountId::from([2_u8; 32]);
+        let provider = interface::AccountId::from([3_u8; 32]);
+
+        let mut storage = frame_system::GenesisConfig::<Runtime>::default()
+            .build_storage()
+            .unwrap();
+        pallet_balances::GenesisConfig::<Runtime> {
+            balances: vec![
+                (already_validator.clone(), 1_000_000),
+                (already_payer.clone(), 1_000_000),
+            ],
+            ..Default::default()
+        }
+        .assimilate_storage(&mut storage)
+        .unwrap();
+        let mut ext: sp_io::TestExternalities = storage.into();
+
+        ext.execute_with(|| {
+            System::set_block_number(1);
+
+            // Satisfy fund_escrow's LeaseExists sanity check directly --
+            // this test is about the validator/payer guard, not lease
+            // creation's own provider-eligibility flow.
+            let lease_id: pallet_escrow::LeaseId = 1;
+            pallet_openinfra_lease::Leases::<Runtime>::insert(
+                lease_id,
+                pallet_openinfra_lease::Lease::<Runtime> {
+                    provider: provider.clone(),
+                    consumer: already_validator.clone(),
+                    resource_hash: [0u8; 32],
+                    start: 0,
+                    end: 1_000,
+                    state: pallet_openinfra_lease::LeaseState::Created,
+                },
+            );
+            let price = pallet_escrow::PriceSchedule {
+                cpu_core_second: 1,
+                ram_mb_second: 1,
+                storage_gb_second: 1,
+                network_mb: 1,
+            };
+
+            // Direction 1: register as a Network Validator first, then
+            // attempt to fund an escrow as the same account as payer.
+            assert_ok!(NetworkValidator::register_validator(
+                RuntimeOrigin::signed(already_validator.clone()),
+                MinValidatorStake::get(),
+            ));
+            assert_noop!(
+                Escrow::fund_escrow(
+                    RuntimeOrigin::signed(already_validator.clone()),
+                    lease_id,
+                    provider.clone(),
+                    MinEscrowAmount::get() + 100,
+                    price,
+                    1,
+                ),
+                pallet_escrow::Error::<Runtime>::PayerIsRegisteredValidator
+            );
+            assert!(pallet_escrow::Escrows::<Runtime>::get(lease_id).is_none());
+
+            // Direction 2 (symmetric order): fund an escrow as payer
+            // first, then attempt to register the same account as a
+            // Network Validator while that escrow is still open.
+            let other_lease_id: pallet_escrow::LeaseId = 2;
+            pallet_openinfra_lease::Leases::<Runtime>::insert(
+                other_lease_id,
+                pallet_openinfra_lease::Lease::<Runtime> {
+                    provider: provider.clone(),
+                    consumer: already_payer.clone(),
+                    resource_hash: [0u8; 32],
+                    start: 0,
+                    end: 1_000,
+                    state: pallet_openinfra_lease::LeaseState::Created,
+                },
+            );
+            assert_ok!(Escrow::fund_escrow(
+                RuntimeOrigin::signed(already_payer.clone()),
+                other_lease_id,
+                provider.clone(),
+                MinEscrowAmount::get() + 100,
+                price,
+                1,
+            ));
+            assert_noop!(
+                NetworkValidator::register_validator(
+                    RuntimeOrigin::signed(already_payer.clone()),
+                    MinValidatorStake::get(),
+                ),
+                pallet_network_validator::Error::<Runtime>::PayerHasOpenEscrow
+            );
+            assert!(pallet_network_validator::Validators::<Runtime>::get(&already_payer).is_none());
+        });
     }
 
     #[test]

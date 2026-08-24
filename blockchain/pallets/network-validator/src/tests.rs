@@ -106,6 +106,33 @@ fn points_of(validator: u64) -> u64 {
     POINTS.with(|store| store.borrow().get(&validator).copied().unwrap_or(0))
 }
 
+// Mock for the reserve-contamination guard's reverse direction
+// (`register_validator` rejects an account with funds locked in an open
+// escrow as payer). Controlled per-test via `set_has_open_escrow`,
+// independent of `pallet-escrow` -- this pallet carries no dependency on
+// it, same narrow-trait pattern as `RecordingUpdater`/`RecordingRewards`.
+thread_local! {
+    static OPEN_ESCROW_PAYERS: std::cell::RefCell<std::collections::BTreeSet<u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+pub struct TestEscrowInspector;
+impl crate::EscrowPayerInspector<u64> for TestEscrowInspector {
+    fn has_open_escrow(payer: &u64) -> bool {
+        OPEN_ESCROW_PAYERS.with(|set| set.borrow().contains(payer))
+    }
+}
+
+fn set_has_open_escrow(account: u64, has_open_escrow: bool) {
+    OPEN_ESCROW_PAYERS.with(|set| {
+        if has_open_escrow {
+            set.borrow_mut().insert(account);
+        } else {
+            set.borrow_mut().remove(&account);
+        }
+    });
+}
+
 fn current_score(provider: u64, dimension: ScoreDimension) -> u16 {
     <RecordingUpdater as crate::ReputationUpdater<u64>>::dimension_score(&provider, dimension)
 }
@@ -139,6 +166,7 @@ impl crate::Config for Test {
     type SuspensionOrigin = frame_system::EnsureRoot<u64>;
     type ReputationUpdater = RecordingUpdater;
     type ValidatorRewards = RecordingRewards;
+    type EscrowInspector = TestEscrowInspector;
     type MinStake = MinStake;
     type UnbondingPeriod = UnbondingPeriod;
     type MaxSubmissionsPerRound = MaxSubmissionsPerRound;
@@ -152,6 +180,13 @@ impl crate::Config for Test {
 }
 
 fn new_test_ext() -> sp_io::TestExternalities {
+    // thread_local fixtures can outlive one #[test] fn if the test harness
+    // reuses the same OS thread for a later test -- reset every one of
+    // them here (mirroring pallet-escrow's `reset_fixtures`) rather than
+    // relying on each test to remember to call `clear_recorded`/clear
+    // `OPEN_ESCROW_PAYERS` itself.
+    clear_recorded();
+    OPEN_ESCROW_PAYERS.with(|set| set.borrow_mut().clear());
     let mut storage = frame_system::GenesisConfig::<Test>::default()
         .build_storage()
         .unwrap();
@@ -210,6 +245,57 @@ fn register_rejects_double_registration() {
             NetworkValidator::register_validator(RuntimeOrigin::signed(1), 100),
             crate::Error::<Test>::AlreadyRegistered
         );
+    });
+}
+
+// ---------------------------------------------------------------------
+// Reserve-balance contamination guard, reverse direction:
+// register_validator rejects an account that currently has funds locked
+// in an open pallet-escrow escrow as payer -- symmetric to pallet-escrow's
+// own fund_escrow guard (see this pallet's module doc comment).
+// ---------------------------------------------------------------------
+
+#[test]
+fn register_rejects_payer_with_open_escrow() {
+    new_test_ext().execute_with(|| {
+        set_has_open_escrow(1, true);
+        assert_noop!(
+            NetworkValidator::register_validator(RuntimeOrigin::signed(1), 100),
+            crate::Error::<Test>::PayerHasOpenEscrow
+        );
+        // No partial state: nothing reserved, no record created.
+        assert_eq!(Balances::reserved_balance(1), 0);
+        assert!(!NetworkValidator::is_active(&1));
+    });
+}
+
+#[test]
+fn register_succeeds_once_open_escrow_is_cleared() {
+    new_test_ext().execute_with(|| {
+        set_has_open_escrow(1, true);
+        assert_noop!(
+            NetworkValidator::register_validator(RuntimeOrigin::signed(1), 100),
+            crate::Error::<Test>::PayerHasOpenEscrow
+        );
+        set_has_open_escrow(1, false);
+        assert_ok!(NetworkValidator::register_validator(
+            RuntimeOrigin::signed(1),
+            100
+        ));
+        assert!(NetworkValidator::is_active(&1));
+    });
+}
+
+#[test]
+fn register_does_not_reject_an_unrelated_account_with_open_escrow() {
+    new_test_ext().execute_with(|| {
+        // Only account 1's own open-escrow status matters, not some other
+        // account's.
+        set_has_open_escrow(2, true);
+        assert_ok!(NetworkValidator::register_validator(
+            RuntimeOrigin::signed(1),
+            100
+        ));
     });
 }
 

@@ -22,6 +22,26 @@
 //! **This pallet moves real, spendable monetary value. It must not accept
 //! non-test-network funds before an independent security review, separate
 //! from the ADR's own acceptance -- ADR-029 Sec10.**
+//!
+//! **Reserve-balance contamination fix.** This pallet and
+//! `pallet-network-validator` both reserve funds against the same untagged,
+//! per-account `pallet_balances` reserved balance (this codebase predates
+//! `fungible::MutateHold`/`HoldReason`). An account holding both roles --
+//! escrow `payer` and Network Validator -- let a validator slash
+//! (`slash_reserved`, scoped only to the account, not to any one pallet's
+//! bookkeeping) consume an unrelated escrow's reserved `max_charge`,
+//! permanently stranding that escrow (`complete_and_payout`/
+//! `refund_escrow` fail closed, by design, on any such inconsistency, with
+//! no other extrinsic able to reconcile it). Two changes close this: (1)
+//! [`Pallet::fund_escrow`] rejects a payer who is currently a registered
+//! Network Validator ([`ValidatorRegistrationInspector`]), and the runtime
+//! symmetrically rejects `pallet-network-validator::register_validator` for
+//! an account with funds locked in an open escrow as payer
+//! ([`PayerOpenEscrowCount`]); (2) [`Pallet::resolve_dispute`] -- and only
+//! that root-gated call, never the two self-service/permissionless paths --
+//! can write off a confirmed, irrecoverable shortfall instead of leaving an
+//! already-contaminated escrow stuck forever (see
+//! [`Event::EscrowShortfallWrittenOff`]).
 
 extern crate alloc;
 
@@ -91,6 +111,35 @@ pub trait ReputationPenalty<AccountId> {
 impl<AccountId> ReputationPenalty<AccountId> for () {
     fn apply(_: &AccountId, _: u16) -> frame_support::dispatch::DispatchResult {
         Ok(())
+    }
+}
+
+/// Narrow, read-only check for whether an account is currently a
+/// registered Network Validator, **regardless of status** (`Active`,
+/// `Suspended`, or `Exiting` all still hold real bonded stake in
+/// `pallet_balances`'s reserved balance until `withdraw_unbonded` actually
+/// releases it -- unlike `NetworkValidatorInspector::is_active` elsewhere in
+/// this workspace, which deliberately excludes `Suspended`/`Exiting` for a
+/// different purpose, gating submission rights).
+///
+/// This backs [`Pallet::fund_escrow`]'s guard against reserve-balance
+/// contamination: `pallet-escrow` and `pallet-network-validator` both call
+/// `ReservableCurrency` against the same untagged, per-account `reserved`
+/// balance (this codebase predates `fungible::MutateHold`/`HoldReason`).
+/// `pallet-network-validator::slash_round_submitters` slashes a flat,
+/// validator-scoped amount from that shared pool, unconditionally --
+/// nothing in `slash_reserved` distinguishes "this validator's own bonded
+/// stake" from "an unrelated escrow's `max_charge` reserved by the same
+/// `AccountId` as `payer`". The smallest closure of that precondition is
+/// refusing to let one account hold both roles: a registered Network
+/// Validator may not also become an escrow `payer`.
+pub trait ValidatorRegistrationInspector<AccountId> {
+    fn is_registered(account: &AccountId) -> bool;
+}
+
+impl<AccountId> ValidatorRegistrationInspector<AccountId> for () {
+    fn is_registered(_: &AccountId) -> bool {
+        false
     }
 }
 
@@ -170,6 +219,9 @@ pub mod pallet {
         /// [`Pallet::resolve_dispute`]; the runtime wires this to
         /// `pallet-reputation`.
         type ReputationPenalty: ReputationPenalty<Self::AccountId>;
+        /// Backs [`Pallet::fund_escrow`]'s reserve-contamination guard; the
+        /// runtime wires this to `pallet-network-validator::Validators`.
+        type ValidatorInspector: ValidatorRegistrationInspector<Self::AccountId>;
         /// Sole remaining sudo-key surface in this pallet (ADR-029 Sec4.5):
         /// resolves a frozen, disputed escrow. `EnsureRoot` for the MVP,
         /// same as every other adjudicated decision in this codebase
@@ -361,6 +413,20 @@ pub mod pallet {
     #[pallet::storage]
     pub type EscrowPaused<T: Config> = StorageValue<_, bool, ValueQuery>;
 
+    /// Count of this account's escrows currently holding reserved funds as
+    /// `payer` (state `Funded`, or `Disputed` reached directly from
+    /// `Funded` -- i.e. an escrow whose `max_charge` is still actually
+    /// reserved on-chain, not yet repatriated/unreserved/written off).
+    /// Backs the reverse half of the reserve-contamination guard: the
+    /// runtime's `pallet-network-validator::register_validator` reads this
+    /// directly (`PayerOpenEscrowCount::<Runtime>::get(who) > 0`) to refuse
+    /// registering an account that currently has escrow funds locked as
+    /// payer. Bounded per account (a `u32` counter, not an unbounded list),
+    /// so no new unbounded storage is introduced.
+    #[pallet::storage]
+    pub type PayerOpenEscrowCount<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
+
     /// ADR-030 Sec4: 100 bps (1%), a deliberately conservative MVP
     /// default -- easy to justify as negligible against a payer's total
     /// cost, a starting point for governance to raise deliberately as the
@@ -427,6 +493,33 @@ pub mod pallet {
         EscrowPausedSet {
             paused: bool,
         },
+        /// A confirmed, irrecoverable shortfall between this escrow's own
+        /// `max_charge` bookkeeping and what is actually reserved on-chain
+        /// for `payer` was written off by [`Pallet::resolve_dispute`]
+        /// rather than left permanently stuck. Only ever emitted from that
+        /// root-gated path -- `complete_and_payout`/`refund_escrow` still
+        /// fail closed (`Error::ReserveAccountingInconsistent`) on any such
+        /// inconsistency, by design; this event exists specifically for the
+        /// case that guard cannot self-resolve. `provider_amount`/
+        /// `payer_amount` are what was actually moved from what was
+        /// actually available (in the same priority order the outcome
+        /// already implies -- `PayProvider` pays the provider first, any
+        /// leftover reservation returns to the payer; `RefundPayer` returns
+        /// whatever remains to the payer); `shortfall` is the portion of
+        /// `expected_total` (`max_charge`) that could not be recovered at
+        /// all, e.g. because it was already moved or burned elsewhere
+        /// against the same shared reserved balance. No protocol fee
+        /// (ADR-030) is ever taken on a write-off -- see
+        /// [`Pallet::resolve_dispute`]'s doc comment.
+        EscrowShortfallWrittenOff {
+            lease_id: LeaseId,
+            payer: T::AccountId,
+            provider: T::AccountId,
+            expected_total: BalanceOf<T>,
+            provider_amount: BalanceOf<T>,
+            payer_amount: BalanceOf<T>,
+            shortfall: BalanceOf<T>,
+        },
         /// Emitted by `set_fee_basis_points` on every change, carrying both
         /// the old and new rate so a rate change is always visible in the
         /// on-chain event log (ADR-030 Sec4).
@@ -446,7 +539,9 @@ pub mod pallet {
         /// split is visible without needing to know to look for it.
         /// Never emitted for a zero fee (ADR-030 Sec2/Sec4): a `$0`
         /// "fee collected" event carries no information, matching this
-        /// pallet's existing skip-the-zero-value-transfer behavior.
+        /// pallet's existing skip-the-zero-value-transfer behavior. Also
+        /// never emitted alongside [`Event::EscrowShortfallWrittenOff`] --
+        /// see [`Pallet::resolve_dispute`]'s doc comment.
         ProtocolFeeCollected {
             lease_id: LeaseId,
             fee_amount: BalanceOf<T>,
@@ -516,6 +611,15 @@ pub mod pallet {
         NotDisputed,
         /// `resolve_dispute`'s `PayProvider(amount)` exceeds `max_charge`.
         PayoutExceedsCap,
+        /// `payer` is currently a registered Network Validator (any
+        /// status -- `Active`, `Suspended`, or `Exiting` all still hold
+        /// reserved stake). Rejected because `pallet-escrow` and
+        /// `pallet-network-validator` share one untagged, per-account
+        /// `ReservableCurrency` reserved balance: a validator slash is not
+        /// scoped to the validator's own stake, so an account holding both
+        /// roles risks an unrelated slash consuming this escrow's reserved
+        /// `max_charge`. See [`ValidatorRegistrationInspector`].
+        PayerIsRegisteredValidator,
         /// `set_fee_basis_points`'s `new_bps` exceeds `MaxFeeBasisPoints`.
         FeeExceedsCap,
         /// A payout with `FeeBasisPoints > 0` was attempted with no
@@ -556,6 +660,14 @@ pub mod pallet {
                 T::LeaseExists::exists(lease_id),
                 Error::<T>::LeaseDoesNotExist
             );
+            // Reserve-contamination guard: a registered Network Validator
+            // (any status) may not also become an escrow payer, since both
+            // pallets reserve against the same untagged per-account balance
+            // (see `ValidatorRegistrationInspector`'s doc comment).
+            ensure!(
+                !T::ValidatorInspector::is_registered(&payer),
+                Error::<T>::PayerIsRegisteredValidator
+            );
 
             T::Currency::reserve(&payer, max_charge)
                 .map_err(|_| Error::<T>::InsufficientFreeBalance)?;
@@ -576,6 +688,7 @@ pub mod pallet {
                     settled_at: None,
                 },
             );
+            PayerOpenEscrowCount::<T>::mutate(&payer, |count| *count = count.saturating_add(1));
 
             Self::deposit_event(Event::EscrowFunded {
                 lease_id,
@@ -694,6 +807,7 @@ pub mod pallet {
             let now = frame_system::Pallet::<T>::block_number();
             escrow.settled_at = Some(now);
             let provider = escrow.provider.clone();
+            Self::decrement_payer_open_count(&escrow.payer);
             Escrows::<T>::insert(lease_id, escrow);
 
             Self::deposit_event(Event::EscrowSettled {
@@ -735,6 +849,7 @@ pub mod pallet {
             escrow.settled_at = Some(now);
             let amount = escrow.max_charge;
             let payer = escrow.payer.clone();
+            Self::decrement_payer_open_count(&escrow.payer);
             Escrows::<T>::insert(lease_id, escrow);
 
             Self::deposit_event(Event::EscrowRefunded {
@@ -802,86 +917,174 @@ pub mod pallet {
                 escrow.state == EscrowState::Disputed,
                 Error::<T>::NotDisputed
             );
+            // Whether this escrow's `max_charge` is still actually reserved
+            // for `payer` (never yet released by complete_and_payout/
+            // refund_escrow): decided before any mutation below, since this
+            // call itself sets `settled_at` at the end and it's the only
+            // signal left once a `Completed`/`Refunded` escrow is disputed
+            // again within `DisputeWindow` (ADR-029 Sec4.4) -- that path's
+            // funds were already released the first time it settled, so
+            // `PayerOpenEscrowCount` must not be decremented a second time
+            // for it here.
+            let funds_still_reserved = escrow.settled_at.is_none();
+            let max_charge = escrow.max_charge;
 
-            let (provider_amount, payer_amount, final_state) = match outcome {
+            // Fail-safe for a confirmed, irrecoverable reserve shortfall
+            // (see the PR description for the mechanism): unlike
+            // `complete_and_payout`/`refund_escrow`, which still fail
+            // closed (`Error::ReserveAccountingInconsistent`) on *any*
+            // inconsistency between this escrow's own `max_charge`
+            // bookkeeping and what is actually reserved on-chain for
+            // `payer`, this root-gated path tolerates it: it pays out
+            // whatever is actually available, in the same priority order
+            // the normal path already uses (`PayProvider` pays the
+            // provider first, any leftover reservation returns to the
+            // payer; `RefundPayer` returns whatever remains to the payer),
+            // and reports the unrecoverable remainder as `shortfall` rather
+            // than erroring the whole call. When nothing is actually short
+            // -- every case any test before this fix could ever reach --
+            // `paid`/`returned` are numerically identical to the nominal
+            // `amount`/`remainder` this call always produced before, so
+            // this is a strict superset of the previous behavior, not a
+            // change to it.
+            let (provider_amount, payer_amount, final_state, shortfall) = match outcome {
                 DisputeOutcome::PayProvider(amount) => {
-                    ensure!(amount <= escrow.max_charge, Error::<T>::PayoutExceedsCap);
-                    // Identical fee treatment to `complete_and_payout`
-                    // (ADR-030 Sec2): governance affirming delivery is the
-                    // same "value was actually delivered" condition as
-                    // on-chain verified completion, so the same split
-                    // applies to the adjudicated `amount`.
-                    let (paid_to_provider, fee_amount, treasury_account) = Self::split_fee(amount)?;
-                    if !paid_to_provider.is_zero() {
-                        let shortfall = T::Currency::repatriate_reserved(
+                    ensure!(amount <= max_charge, Error::<T>::PayoutExceedsCap);
+                    // AMBIGUOUS INTERACTION, RESOLVED CONSERVATIVELY (see
+                    // the merge report): ADR-030's protocol fee and the
+                    // reserve-contamination write-off fail-safe were
+                    // developed independently and neither PR specifies how
+                    // they interact when both could apply to the same
+                    // dispute. This resolution takes the reading spelled
+                    // out in the merge instructions -- a write-off is a
+                    // degraded recovery of a contaminated escrow, not a
+                    // normal successful settlement, so it must never also
+                    // carry a protocol-fee deduction on funds that were
+                    // never actually fully available.
+                    //
+                    // Whether this escrow's reserved funds are still fully
+                    // intact is decided once, up front, via a read-only
+                    // balance check -- before any transfer below -- so the
+                    // fee-vs-write-off choice is deterministic rather than
+                    // inferred from a partial transfer's own shortfall.
+                    // This pallet has no per-escrow tag on the reserved
+                    // balance (that's the root cause of the contamination
+                    // bug itself, see the module doc comment), so an
+                    // account-level check against this escrow's own
+                    // `max_charge` is the finest precision actually
+                    // available on-chain -- consistent with, not an
+                    // approximation on top of, the shared-pool model this
+                    // pallet already lives with.
+                    if T::Currency::reserved_balance(&escrow.payer) < max_charge {
+                        // Fail-safe path: confirmed shortfall. No protocol
+                        // fee is taken; whatever is actually available is
+                        // paid to the provider first, exactly as this
+                        // fail-safe behaved before ADR-030 existed.
+                        let unmoved = T::Currency::repatriate_reserved(
                             &escrow.payer,
                             &escrow.provider,
+                            amount,
+                            BalanceStatus::Free,
+                        )
+                        .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                        let paid = amount.saturating_sub(unmoved);
+                        let remainder = max_charge.saturating_sub(amount);
+                        let mut returned = Zero::zero();
+                        if !remainder.is_zero() {
+                            let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
+                            returned = remainder.saturating_sub(unreleased);
+                        }
+                        let shortfall = max_charge.saturating_sub(paid.saturating_add(returned));
+                        (paid, returned, EscrowState::Completed, shortfall)
+                    } else {
+                        // Normal path: reserved funds are fully intact, so
+                        // apply the identical ADR-030 fee split
+                        // `complete_and_payout` uses, and fail closed on
+                        // any inconsistency exactly like that path does --
+                        // governance affirming delivery is the same "value
+                        // was actually delivered" condition as on-chain
+                        // verified completion, so the same split applies
+                        // to the adjudicated `amount`.
+                        let (paid_to_provider, fee_amount, treasury_account) =
+                            Self::split_fee(amount)?;
+                        if !paid_to_provider.is_zero() {
+                            let shortfall = T::Currency::repatriate_reserved(
+                                &escrow.payer,
+                                &escrow.provider,
+                                paid_to_provider,
+                                BalanceStatus::Free,
+                            )
+                            .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                            ensure!(
+                                shortfall.is_zero(),
+                                Error::<T>::ReserveAccountingInconsistent
+                            );
+                        }
+                        if !fee_amount.is_zero() {
+                            let treasury =
+                                treasury_account.ok_or(Error::<T>::TreasuryAccountNotConfigured)?;
+                            let shortfall = T::Currency::repatriate_reserved(
+                                &escrow.payer,
+                                &treasury,
+                                fee_amount,
+                                BalanceStatus::Free,
+                            )
+                            .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                            ensure!(
+                                shortfall.is_zero(),
+                                Error::<T>::ReserveAccountingInconsistent
+                            );
+                            Self::deposit_event(Event::ProtocolFeeCollected {
+                                lease_id,
+                                fee_amount,
+                                treasury_account: treasury,
+                            });
+                        }
+                        let remainder = max_charge.saturating_sub(amount);
+                        if !remainder.is_zero() {
+                            let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
+                            ensure!(
+                                unreleased.is_zero(),
+                                Error::<T>::ReserveAccountingInconsistent
+                            );
+                        }
+                        // `provider_amount` in `DisputeResolved` below
+                        // reports what the provider actually received, net
+                        // of the fee -- not the full adjudicated `amount`
+                        // -- so the event stays truthful about the real
+                        // on-chain transfer (ADR-030's fee is a split of
+                        // `amount`, not an add-on, so `paid_to_provider` is
+                        // the correct value here, matching `EscrowSettled`
+                        // reporting `charged_amount` as the payer's total
+                        // charge rather than the provider's net receipt).
+                        (
                             paid_to_provider,
-                            BalanceStatus::Free,
+                            remainder,
+                            EscrowState::Completed,
+                            Zero::zero(),
                         )
-                        .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
-                        ensure!(
-                            shortfall.is_zero(),
-                            Error::<T>::ReserveAccountingInconsistent
-                        );
                     }
-                    if !fee_amount.is_zero() {
-                        let treasury =
-                            treasury_account.ok_or(Error::<T>::TreasuryAccountNotConfigured)?;
-                        let shortfall = T::Currency::repatriate_reserved(
-                            &escrow.payer,
-                            &treasury,
-                            fee_amount,
-                            BalanceStatus::Free,
-                        )
-                        .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
-                        ensure!(
-                            shortfall.is_zero(),
-                            Error::<T>::ReserveAccountingInconsistent
-                        );
-                        Self::deposit_event(Event::ProtocolFeeCollected {
-                            lease_id,
-                            fee_amount,
-                            treasury_account: treasury,
-                        });
-                    }
-                    let remainder = escrow.max_charge.saturating_sub(amount);
-                    if !remainder.is_zero() {
-                        let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
-                        ensure!(
-                            unreleased.is_zero(),
-                            Error::<T>::ReserveAccountingInconsistent
-                        );
-                    }
-                    // `provider_amount` in `DisputeResolved` below reports
-                    // what the provider actually received, net of the fee
-                    // -- not the full adjudicated `amount` -- so the event
-                    // stays truthful about the real on-chain transfer
-                    // (ADR-030's fee is a split of `amount`, not an
-                    // add-on, so `paid_to_provider` is the correct value
-                    // here, matching `EscrowSettled` reporting
-                    // `charged_amount` as the payer's total charge rather
-                    // than the provider's net receipt).
-                    (paid_to_provider, remainder, EscrowState::Completed)
                 }
                 DisputeOutcome::RefundPayer => {
-                    let unreleased = T::Currency::unreserve(&escrow.payer, escrow.max_charge);
-                    ensure!(
-                        unreleased.is_zero(),
-                        Error::<T>::ReserveAccountingInconsistent
-                    );
+                    let unreleased = T::Currency::unreserve(&escrow.payer, max_charge);
+                    let returned = max_charge.saturating_sub(unreleased);
                     // ADR-029 Sec5: the provider was found in the wrong --
                     // apply the bounded reliability penalty. A rejected
                     // dispute (`PayProvider`) applies no penalty to either
                     // side.
                     T::ReputationPenalty::apply(&escrow.provider, T::ReliabilityPenaltyBps::get())?;
-                    (Zero::zero(), escrow.max_charge, EscrowState::Refunded)
+                    (Zero::zero(), returned, EscrowState::Refunded, unreleased)
                 }
             };
 
             escrow.state = final_state;
             let now = frame_system::Pallet::<T>::block_number();
             escrow.settled_at = Some(now);
+            if funds_still_reserved {
+                Self::decrement_payer_open_count(&escrow.payer);
+            }
+            let payer = escrow.payer.clone();
+            let provider = escrow.provider.clone();
             Escrows::<T>::insert(lease_id, escrow);
 
             Self::deposit_event(Event::DisputeResolved {
@@ -890,6 +1093,17 @@ pub mod pallet {
                 provider_amount,
                 payer_amount,
             });
+            if !shortfall.is_zero() {
+                Self::deposit_event(Event::EscrowShortfallWrittenOff {
+                    lease_id,
+                    payer,
+                    provider,
+                    expected_total: max_charge,
+                    provider_amount,
+                    payer_amount,
+                    shortfall,
+                });
+            }
             Ok(())
         }
 
@@ -1009,6 +1223,17 @@ pub mod pallet {
                 .and_then(|value| value.checked_add(network))
                 .ok_or(Error::<T>::ArithmeticOverflow)?;
             BalanceOf::<T>::try_from(total).map_err(|_| Error::<T>::ArithmeticOverflow.into())
+        }
+
+        /// Decrement [`PayerOpenEscrowCount`] for `payer` by one,
+        /// saturating at zero. Called exactly once per escrow, at the
+        /// point its reserved funds are actually released --
+        /// `complete_and_payout`, `refund_escrow`, or `resolve_dispute`
+        /// (guarded there by `funds_still_reserved` so a `Completed`/
+        /// `Refunded` escrow re-disputed and resolved again within
+        /// `DisputeWindow` is not double-decremented).
+        fn decrement_payer_open_count(payer: &T::AccountId) {
+            PayerOpenEscrowCount::<T>::mutate(payer, |count| *count = count.saturating_sub(1));
         }
 
         /// Splits a settled amount into `(provider_amount, fee_amount,
