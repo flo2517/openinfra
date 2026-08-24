@@ -27,7 +27,8 @@ make test-agent       # cd provider-agent && cargo test --workspace
 make test-control-plane   # cd control-plane && go test ./...
 make test-blockchain  # cd blockchain && cargo test --workspace
 make proto            # buf lint + buf generate, then gofmt/vet/test the generated Go
-make e2e              # tests/e2e/run.sh (not run in CI — see Known gaps below)
+make e2e              # tests/e2e/run.sh: all suites in tests/e2e/suites/ (not run in CI — see Known gaps below)
+make e2e-happy-path   # tests/e2e/run.sh 00-happy-path (single suite; see tests/e2e/AGENTS.md for the rest)
 ```
 
 A command only counts as passing if it was actually executed — do not report a Rust/Go build or
@@ -136,9 +137,12 @@ ReputationVector, WorkloadDefinition, Lease, EventEnvelope; `agent.proto` define
 `ProviderAgentService`; `control_plane.proto` defines `ControlPlaneService`), plus `buf` config for
 lint/breaking-change checks and generation.
 
-**`tests/`**: a single `tests/e2e/run.sh` entrypoint (own `AGENTS.md` inside). Not currently wired
-into CI — CI only gates the four per-component jobs, so e2e regressions won't be caught
-automatically.
+**`tests/`**: `tests/e2e/` is a matrix of independent suites (`tests/e2e/suites/*.sh`, shared
+fixtures/cleanup in `tests/e2e/lib/common.sh`, own `AGENTS.md`), dispatched by `tests/e2e/run.sh`
+(`make e2e`). Not currently wired into CI — CI only gates the four per-component jobs, so e2e
+regressions won't be caught automatically (see `tests/e2e/AGENTS.md` for why: the full Compose
+stack, a from-source Substrate node build, and real container/network chaos don't fit a shared,
+time-boxed CI runner without a larger investment).
 
 **`docs/adr/`**: numbered ADRs are the record of accepted architecture decisions (language choices,
 Postgres/Redis split, on-chain/off-chain boundary, WireGuard, the local testnet, etc.). Any
@@ -150,6 +154,11 @@ implementation, per `AGENTS.md`.
 - `agent-cli status` is unimplemented (logs an error, does nothing).
 - `control-plane/internal/scheduler` is a minimal scorer, not the full reputation-vector scheduler
   the architecture docs describe.
-- `tests/e2e/run.sh` exists and is invoked via `make e2e`, but is not part of the CI workflow.
+- `tests/e2e/` (dispatched by `tests/e2e/run.sh`, invoked via `make e2e`) is not part of the CI
+  workflow.
+- `internal/orchestrator/worker.go`'s retry path has no maximum-attempt cutoff: a workload whose
+  Agent has permanently died retries the same `DEPLOYING` state against the same dead provider
+  forever rather than eventually failing or rescheduling elsewhere (found while writing
+  `tests/e2e/suites/20-chaos-injection.sh`'s Agent-timeout scenario).
 - Treat `architecture.md` / `architecture_review.md` as the aspirational/vision layer, not proof of
   what's implemented — verify against the code above before relying on a claim from those files.

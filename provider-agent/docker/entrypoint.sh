@@ -33,6 +33,7 @@ executor:
   max_cpu_cores: ${OPENINFRA_AGENT_MAX_CPU_CORES:-8.0}
   max_memory_mb: ${OPENINFRA_AGENT_MAX_MEMORY_MB:-16384}
   pids_limit: ${OPENINFRA_AGENT_PIDS_LIMIT:-128}
+  max_egress_mbps: ${OPENINFRA_AGENT_MAX_EGRESS_MBPS:-10000}
 EOF
   chmod 600 "$temporary_config"
   mv "$temporary_config" "$config_file"
