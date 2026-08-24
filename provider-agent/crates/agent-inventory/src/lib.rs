@@ -2,6 +2,9 @@ use anyhow::Result;
 use std::path::Path;
 use sysinfo::{Disks, System};
 
+pub mod kvm;
+pub use kvm::{virtualization_capable, KvmProbe, KvmProbeError, SystemKvmProbe};
+
 pub struct InventoryManager;
 
 impl Default for InventoryManager {
@@ -51,6 +54,10 @@ impl InventoryManager {
             available_memory_mb: available_memory as i64,
             total_storage_gb,
             available_storage_gb,
+            // ADR-033 §7: real KVM_GET_API_VERSION ioctl probe, not just
+            // a /dev/kvm existence check -- see kvm.rs's module doc
+            // comment for the fail-closed contract this relies on.
+            virtualization_capable: virtualization_capable(&SystemKvmProbe),
         })
     }
 }
@@ -73,6 +80,11 @@ pub struct SystemResources {
     pub available_memory_mb: i64,
     pub total_storage_gb: i64,
     pub available_storage_gb: i64,
+    /// ADR-033 §7: whether this host passed the fail-closed
+    /// `KVM_GET_API_VERSION` probe (see `kvm.rs`). `false` is the safe
+    /// default for anything that can't prove otherwise -- no VM workload
+    /// may ever be offered/accepted on a provider reporting `false` here.
+    pub virtualization_capable: bool,
 }
 
 #[cfg(test)]
