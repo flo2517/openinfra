@@ -22,6 +22,16 @@ service ControlPlaneService {
   // must increase monotonically per provider identity.
   rpc ReportHeartbeat(ReportHeartbeatRequest) returns (ReportHeartbeatResponse);
 
+  // RenewCertificate (ADR-027 §3) issues a fresh short-lived leaf
+  // certificate for a provider that already holds one, callable only over
+  // a connection currently authenticated with a still-valid,
+  // previously-issued leaf certificate -- never over the bootstrap
+  // self-signed path CompleteJoin uses for first enrollment. The Agent
+  // triggers this once 50% of its current certificate's lifetime has
+  // elapsed, giving a 12h overlap window before the old certificate
+  // actually expires.
+  rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
+
   // SubmitWorkload durably accepts an idempotent workload request. Acceptance
   // does not imply that scheduling, a lease, or deployment has succeeded.
   rpc SubmitWorkload(SubmitWorkloadRequest) returns (SubmitWorkloadResponse);
@@ -56,6 +66,17 @@ message CompleteJoinRequest {
   // challenge_nonce returned by BeginJoin.
   bytes challenge_signature = 3;
   openinfra.shared.v1.ResourceCapability capabilities = 4;
+  // ADR-027 §2: raw 32-byte Ed25519 public key of a freshly generated
+  // mTLS leaf keypair, distinct from the provider's long-term identity
+  // key above (challenge_signature's key) -- deliberately never reused as
+  // TLS session key material, see the ADR for reasoning. The Control
+  // Plane's CA certifies this key, binding the issued certificate to
+  // provider_id, only after challenge_signature verifies. Tamper
+  // protection for this field rests on TLS channel integrity, the same
+  // pre-existing property capabilities above already relies on --
+  // challenge_signature covers only the nonce, not the rest of this
+  // message.
+  bytes tls_public_key = 5;
 }
 
 message CompleteJoinResponse {
@@ -64,6 +85,48 @@ message CompleteJoinResponse {
   openinfra.shared.v1.NodeStatus status = 2;
   google.protobuf.Timestamp registered_at = 3;
   uint32 heartbeat_interval_seconds = 4;
+  // ADR-027 §2: the CA-issued leaf certificate (PEM), CN/SAN bound to
+  // provider_id, certifying tls_public_key above. 24h validity. Empty iff
+  // tls_public_key was empty (a caller that doesn't ask for enrollment
+  // isn't issued one) -- callers that need mTLS must set tls_public_key.
+  string certificate_pem = 5;
+  google.protobuf.Timestamp certificate_expires_at = 6;
+}
+
+message RenewCertificateRequest {
+  // UUID generated once for idempotent retries of this operation.
+  string request_id = 1;
+  string provider_id = 2;
+  // Raw 32-byte Ed25519 public key of a freshly generated mTLS leaf
+  // keypair -- leaf keys are never reused across renewal periods either,
+  // matching ADR-027 §3's "short-lived all the way down" design.
+  bytes new_tls_public_key = 3;
+  // Serial number (decimal string) of the certificate presented on the
+  // mTLS connection this request arrives on -- must match, so a renewal
+  // can only ever extend the specific certificate the connection is
+  // already authenticated with.
+  string current_certificate_serial = 4;
+  // Wall-clock time the Agent signed this request, checked against the
+  // Control Plane's own clock within a bounded skew tolerance (ADR-027
+  // §3's replay-protection shape, mirroring ReportHeartbeat's
+  // observed_at/maxHeartbeatClockSkew convention).
+  google.protobuf.Timestamp timestamp = 5;
+  // Durably persisted, strictly increasing per-provider counter (the
+  // renewal-specific sibling of HeartbeatSigningPayload.sequence).
+  uint64 nonce = 6;
+  // Ed25519 signature by the provider's long-term identity key (the same
+  // key challenge_signature above uses, never the TLS key itself) over
+  // "openinfra-cert-renew-v1\0" followed by new_tls_public_key,
+  // current_certificate_serial, the deterministic encoding of timestamp,
+  // and nonce -- see internal/pki's renewal signing payload for the exact
+  // byte layout.
+  bytes signature = 7;
+}
+
+message RenewCertificateResponse {
+  string certificate_pem = 1;
+  google.protobuf.Timestamp certificate_expires_at = 2;
+  string certificate_serial = 3;
 }
 
 message ReportHeartbeatRequest {
