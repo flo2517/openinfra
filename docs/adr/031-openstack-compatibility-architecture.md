@@ -2,15 +2,15 @@
 
 ## Status
 
-**Proposed.** Written by Claude Code, autonomously, in response to issue #22. This repository's
-established convention (ADR-016/018/025/026/027/028/029/030): an ADR of this weight becomes
-Accepted only after the repository owner reviews a full summary of its decisions and reasoning and
-confirms acceptance, explicitly, in an interactive session. Nothing here is implemented; no code
-changes accompany this ADR. This is also, by a wide margin, the largest-surface proposal in
-`docs/adr/` to date — it touches identity, compute, networking, and storage simultaneously, and one
-of its live questions (§4) is whether it requires lifting the frozen Docker-only runtime decision
-(ADR-006). It should be read and accepted (or rejected, or accepted-with-changes) with that in mind,
-not skimmed.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #22, and held as Proposed per
+the convention established by ADR-016/018/025/026/027/028/029/030. This ADR deliberately does not
+decide whether a VM execution backend is added — that would lift the frozen Docker-only runtime
+decision (ADR-006) and needs its own ADR. The repository owner has separately requested that
+follow-up ADR be drafted now, so groundwork for VM support can begin once it is itself accepted;
+see the VM-backend ADR filed as a companion to this acceptance.
 
 ## Context
 
