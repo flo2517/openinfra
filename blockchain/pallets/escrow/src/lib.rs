@@ -150,6 +150,8 @@ pub trait WeightInfo {
     fn dispute_escrow() -> Weight;
     fn resolve_dispute() -> Weight;
     fn set_paused() -> Weight;
+    fn set_fee_basis_points() -> Weight;
+    fn set_treasury_account() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -171,6 +173,12 @@ impl WeightInfo for () {
     fn set_paused() -> Weight {
         Weight::from_parts(10_000, 0)
     }
+    fn set_fee_basis_points() -> Weight {
+        Weight::from_parts(10_000, 0)
+    }
+    fn set_treasury_account() -> Weight {
+        Weight::from_parts(10_000, 0)
+    }
 }
 
 #[frame_support::pallet]
@@ -182,6 +190,15 @@ pub mod pallet {
 
     pub type BalanceOf<T> =
         <<T as Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
+
+    /// `(provider_amount, fee_amount, treasury_account)`, [`Pallet::split_fee`]'s
+    /// return shape (ADR-030 Sec2) -- named so clippy's `type_complexity`
+    /// lint doesn't need silencing.
+    type FeeSplit<T> = (
+        BalanceOf<T>,
+        BalanceOf<T>,
+        Option<<T as frame_system::Config>::AccountId>,
+    );
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -213,6 +230,12 @@ pub mod pallet {
         /// Governs the emergency pause (ADR-029 Sec10). `EnsureRoot` for
         /// the MVP.
         type PauseOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+        /// Governs `set_fee_basis_points`/`set_treasury_account` (ADR-030
+        /// Sec3). `EnsureRoot` for the MVP, the same choice already made
+        /// for `DisputeOrigin`/`PauseOrigin` above -- not a new governance
+        /// primitive, the same single sudo-key surface this runtime
+        /// already trusts for every other protocol parameter.
+        type FeeGovernanceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
         /// Blocks after `funded_at` before the payer may self-service
         /// refund an uncompleted escrow.
         #[pallet::constant]
@@ -236,6 +259,12 @@ pub mod pallet {
         /// (ADR-029 Sec5), basis points (0..=10_000).
         #[pallet::constant]
         type ReliabilityPenaltyBps: Get<u16>;
+        /// Compile-time hard cap on `FeeBasisPoints` (ADR-030 Sec4): only a
+        /// runtime upgrade can raise it, so a single `set_fee_basis_points`
+        /// call can never reach anything close to confiscatory without a
+        /// materially higher-friction, more visible second action.
+        #[pallet::constant]
+        type MaxFeeBasisPoints: Get<u16>;
         type WeightInfo: WeightInfo;
     }
 
@@ -398,6 +427,34 @@ pub mod pallet {
     pub type PayerOpenEscrowCount<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
 
+    /// ADR-030 Sec4: 100 bps (1%), a deliberately conservative MVP
+    /// default -- easy to justify as negligible against a payer's total
+    /// cost, a starting point for governance to raise deliberately as the
+    /// network matures.
+    #[pallet::type_value]
+    pub fn DefaultFeeBasisPoints<T: Config>() -> u16 {
+        100
+    }
+
+    /// Governed protocol usage fee rate, in basis points (0..=10_000,
+    /// further bounded by `MaxFeeBasisPoints`). Deducted from the settled
+    /// amount only at `complete_and_payout` / `resolve_dispute`'s
+    /// `PayProvider` outcome (ADR-030 Sec2) -- never at `fund_escrow`,
+    /// `refund_escrow`, or `resolve_dispute`'s `RefundPayer` outcome, all
+    /// of which move zero fee regardless of this value.
+    #[pallet::storage]
+    #[pallet::getter(fn fee_basis_points)]
+    pub type FeeBasisPoints<T: Config> = StorageValue<_, u16, ValueQuery, DefaultFeeBasisPoints<T>>;
+
+    /// Governed destination for the protocol usage fee (ADR-030 Sec3).
+    /// Starts unset (`OptionQuery`, no default) so a payout with a
+    /// nonzero `FeeBasisPoints` and no configured treasury fails closed
+    /// (`Error::TreasuryAccountNotConfigured`) rather than silently
+    /// skipping the fee or crediting it nowhere.
+    #[pallet::storage]
+    #[pallet::getter(fn treasury_account)]
+    pub type TreasuryAccount<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -451,7 +508,9 @@ pub mod pallet {
         /// whatever remains to the payer); `shortfall` is the portion of
         /// `expected_total` (`max_charge`) that could not be recovered at
         /// all, e.g. because it was already moved or burned elsewhere
-        /// against the same shared reserved balance.
+        /// against the same shared reserved balance. No protocol fee
+        /// (ADR-030) is ever taken on a write-off -- see
+        /// [`Pallet::resolve_dispute`]'s doc comment.
         EscrowShortfallWrittenOff {
             lease_id: LeaseId,
             payer: T::AccountId,
@@ -460,6 +519,33 @@ pub mod pallet {
             provider_amount: BalanceOf<T>,
             payer_amount: BalanceOf<T>,
             shortfall: BalanceOf<T>,
+        },
+        /// Emitted by `set_fee_basis_points` on every change, carrying both
+        /// the old and new rate so a rate change is always visible in the
+        /// on-chain event log (ADR-030 Sec4).
+        FeeBasisPointsUpdated {
+            old: u16,
+            new: u16,
+        },
+        /// Emitted by `set_treasury_account` on every change.
+        TreasuryAccountUpdated {
+            old: Option<T::AccountId>,
+            new: T::AccountId,
+        },
+        /// The protocol usage fee portion actually transferred to
+        /// `treasury_account`, alongside `EscrowSettled` /
+        /// `DisputeResolved`'s `PayProvider` outcome -- a dedicated event,
+        /// not a silently-added field on either of those, so the fee
+        /// split is visible without needing to know to look for it.
+        /// Never emitted for a zero fee (ADR-030 Sec2/Sec4): a `$0`
+        /// "fee collected" event carries no information, matching this
+        /// pallet's existing skip-the-zero-value-transfer behavior. Also
+        /// never emitted alongside [`Event::EscrowShortfallWrittenOff`] --
+        /// see [`Pallet::resolve_dispute`]'s doc comment.
+        ProtocolFeeCollected {
+            lease_id: LeaseId,
+            fee_amount: BalanceOf<T>,
+            treasury_account: T::AccountId,
         },
     }
 
@@ -534,6 +620,12 @@ pub mod pallet {
         /// roles risks an unrelated slash consuming this escrow's reserved
         /// `max_charge`. See [`ValidatorRegistrationInspector`].
         PayerIsRegisteredValidator,
+        /// `set_fee_basis_points`'s `new_bps` exceeds `MaxFeeBasisPoints`.
+        FeeExceedsCap,
+        /// A payout with `FeeBasisPoints > 0` was attempted with no
+        /// `TreasuryAccount` configured. Fails closed rather than silently
+        /// skipping the fee or crediting it nowhere (ADR-030 Sec3).
+        TreasuryAccountNotConfigured,
     }
 
     #[pallet::call]
@@ -664,17 +756,42 @@ pub mod pallet {
                 Error::<T>::ChargedAmountExceedsCap
             );
 
-            let shortfall = T::Currency::repatriate_reserved(
-                &escrow.payer,
-                &escrow.provider,
-                charged_amount,
-                BalanceStatus::Free,
-            )
-            .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
-            ensure!(
-                shortfall.is_zero(),
-                Error::<T>::ReserveAccountingInconsistent
-            );
+            let (provider_amount, fee_amount, treasury_account) = Self::split_fee(charged_amount)?;
+            if !provider_amount.is_zero() {
+                let shortfall = T::Currency::repatriate_reserved(
+                    &escrow.payer,
+                    &escrow.provider,
+                    provider_amount,
+                    BalanceStatus::Free,
+                )
+                .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                ensure!(
+                    shortfall.is_zero(),
+                    Error::<T>::ReserveAccountingInconsistent
+                );
+            }
+            if !fee_amount.is_zero() {
+                // `split_fee` only ever returns a nonzero `fee_amount`
+                // alongside `Some(treasury_account)` -- see its own
+                // doc comment.
+                let treasury = treasury_account.ok_or(Error::<T>::TreasuryAccountNotConfigured)?;
+                let shortfall = T::Currency::repatriate_reserved(
+                    &escrow.payer,
+                    &treasury,
+                    fee_amount,
+                    BalanceStatus::Free,
+                )
+                .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                ensure!(
+                    shortfall.is_zero(),
+                    Error::<T>::ReserveAccountingInconsistent
+                );
+                Self::deposit_event(Event::ProtocolFeeCollected {
+                    lease_id,
+                    fee_amount,
+                    treasury_account: treasury,
+                });
+            }
             let remainder = escrow.max_charge.saturating_sub(charged_amount);
             if !remainder.is_zero() {
                 let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
@@ -833,22 +950,120 @@ pub mod pallet {
             let (provider_amount, payer_amount, final_state, shortfall) = match outcome {
                 DisputeOutcome::PayProvider(amount) => {
                     ensure!(amount <= max_charge, Error::<T>::PayoutExceedsCap);
-                    let unmoved = T::Currency::repatriate_reserved(
-                        &escrow.payer,
-                        &escrow.provider,
-                        amount,
-                        BalanceStatus::Free,
-                    )
-                    .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
-                    let paid = amount.saturating_sub(unmoved);
-                    let remainder = max_charge.saturating_sub(amount);
-                    let mut returned = Zero::zero();
-                    if !remainder.is_zero() {
-                        let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
-                        returned = remainder.saturating_sub(unreleased);
+                    // AMBIGUOUS INTERACTION, RESOLVED CONSERVATIVELY (see
+                    // the merge report): ADR-030's protocol fee and the
+                    // reserve-contamination write-off fail-safe were
+                    // developed independently and neither PR specifies how
+                    // they interact when both could apply to the same
+                    // dispute. This resolution takes the reading spelled
+                    // out in the merge instructions -- a write-off is a
+                    // degraded recovery of a contaminated escrow, not a
+                    // normal successful settlement, so it must never also
+                    // carry a protocol-fee deduction on funds that were
+                    // never actually fully available.
+                    //
+                    // Whether this escrow's reserved funds are still fully
+                    // intact is decided once, up front, via a read-only
+                    // balance check -- before any transfer below -- so the
+                    // fee-vs-write-off choice is deterministic rather than
+                    // inferred from a partial transfer's own shortfall.
+                    // This pallet has no per-escrow tag on the reserved
+                    // balance (that's the root cause of the contamination
+                    // bug itself, see the module doc comment), so an
+                    // account-level check against this escrow's own
+                    // `max_charge` is the finest precision actually
+                    // available on-chain -- consistent with, not an
+                    // approximation on top of, the shared-pool model this
+                    // pallet already lives with.
+                    if T::Currency::reserved_balance(&escrow.payer) < max_charge {
+                        // Fail-safe path: confirmed shortfall. No protocol
+                        // fee is taken; whatever is actually available is
+                        // paid to the provider first, exactly as this
+                        // fail-safe behaved before ADR-030 existed.
+                        let unmoved = T::Currency::repatriate_reserved(
+                            &escrow.payer,
+                            &escrow.provider,
+                            amount,
+                            BalanceStatus::Free,
+                        )
+                        .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                        let paid = amount.saturating_sub(unmoved);
+                        let remainder = max_charge.saturating_sub(amount);
+                        let mut returned = Zero::zero();
+                        if !remainder.is_zero() {
+                            let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
+                            returned = remainder.saturating_sub(unreleased);
+                        }
+                        let shortfall = max_charge.saturating_sub(paid.saturating_add(returned));
+                        (paid, returned, EscrowState::Completed, shortfall)
+                    } else {
+                        // Normal path: reserved funds are fully intact, so
+                        // apply the identical ADR-030 fee split
+                        // `complete_and_payout` uses, and fail closed on
+                        // any inconsistency exactly like that path does --
+                        // governance affirming delivery is the same "value
+                        // was actually delivered" condition as on-chain
+                        // verified completion, so the same split applies
+                        // to the adjudicated `amount`.
+                        let (paid_to_provider, fee_amount, treasury_account) =
+                            Self::split_fee(amount)?;
+                        if !paid_to_provider.is_zero() {
+                            let shortfall = T::Currency::repatriate_reserved(
+                                &escrow.payer,
+                                &escrow.provider,
+                                paid_to_provider,
+                                BalanceStatus::Free,
+                            )
+                            .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                            ensure!(
+                                shortfall.is_zero(),
+                                Error::<T>::ReserveAccountingInconsistent
+                            );
+                        }
+                        if !fee_amount.is_zero() {
+                            let treasury =
+                                treasury_account.ok_or(Error::<T>::TreasuryAccountNotConfigured)?;
+                            let shortfall = T::Currency::repatriate_reserved(
+                                &escrow.payer,
+                                &treasury,
+                                fee_amount,
+                                BalanceStatus::Free,
+                            )
+                            .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                            ensure!(
+                                shortfall.is_zero(),
+                                Error::<T>::ReserveAccountingInconsistent
+                            );
+                            Self::deposit_event(Event::ProtocolFeeCollected {
+                                lease_id,
+                                fee_amount,
+                                treasury_account: treasury,
+                            });
+                        }
+                        let remainder = max_charge.saturating_sub(amount);
+                        if !remainder.is_zero() {
+                            let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
+                            ensure!(
+                                unreleased.is_zero(),
+                                Error::<T>::ReserveAccountingInconsistent
+                            );
+                        }
+                        // `provider_amount` in `DisputeResolved` below
+                        // reports what the provider actually received, net
+                        // of the fee -- not the full adjudicated `amount`
+                        // -- so the event stays truthful about the real
+                        // on-chain transfer (ADR-030's fee is a split of
+                        // `amount`, not an add-on, so `paid_to_provider` is
+                        // the correct value here, matching `EscrowSettled`
+                        // reporting `charged_amount` as the payer's total
+                        // charge rather than the provider's net receipt).
+                        (
+                            paid_to_provider,
+                            remainder,
+                            EscrowState::Completed,
+                            Zero::zero(),
+                        )
                     }
-                    let shortfall = max_charge.saturating_sub(paid.saturating_add(returned));
-                    (paid, returned, EscrowState::Completed, shortfall)
                 }
                 DisputeOutcome::RefundPayer => {
                     let unreleased = T::Currency::unreserve(&escrow.payer, max_charge);
@@ -902,6 +1117,44 @@ pub mod pallet {
             T::PauseOrigin::ensure_origin(origin)?;
             EscrowPaused::<T>::put(paused);
             Self::deposit_event(Event::EscrowPausedSet { paused });
+            Ok(())
+        }
+
+        /// Set the governed protocol usage fee rate (ADR-030 Sec4).
+        /// `FeeGovernanceOrigin`-gated. Rejects anything above
+        /// `MaxFeeBasisPoints`, leaving storage unchanged.
+        #[pallet::call_index(6)]
+        #[pallet::weight(T::WeightInfo::set_fee_basis_points())]
+        pub fn set_fee_basis_points(origin: OriginFor<T>, new_bps: u16) -> DispatchResult {
+            T::FeeGovernanceOrigin::ensure_origin(origin)?;
+            ensure!(
+                new_bps <= T::MaxFeeBasisPoints::get(),
+                Error::<T>::FeeExceedsCap
+            );
+            let old = FeeBasisPoints::<T>::get();
+            FeeBasisPoints::<T>::put(new_bps);
+            Self::deposit_event(Event::FeeBasisPointsUpdated { old, new: new_bps });
+            Ok(())
+        }
+
+        /// Set the governed protocol treasury account (ADR-030 Sec3).
+        /// `FeeGovernanceOrigin`-gated. This is the sole way a nonzero
+        /// `FeeBasisPoints` becomes actionable -- with no configured
+        /// treasury, `complete_and_payout` / `resolve_dispute` fail
+        /// closed instead (`Error::TreasuryAccountNotConfigured`).
+        #[pallet::call_index(7)]
+        #[pallet::weight(T::WeightInfo::set_treasury_account())]
+        pub fn set_treasury_account(
+            origin: OriginFor<T>,
+            new_account: T::AccountId,
+        ) -> DispatchResult {
+            T::FeeGovernanceOrigin::ensure_origin(origin)?;
+            let old = TreasuryAccount::<T>::get();
+            TreasuryAccount::<T>::put(&new_account);
+            Self::deposit_event(Event::TreasuryAccountUpdated {
+                old,
+                new: new_account,
+            });
             Ok(())
         }
     }
@@ -981,6 +1234,53 @@ pub mod pallet {
         /// `DisputeWindow` is not double-decremented).
         fn decrement_payer_open_count(payer: &T::AccountId) {
             PayerOpenEscrowCount::<T>::mutate(payer, |count| *count = count.saturating_sub(1));
+        }
+
+        /// Splits a settled amount into `(provider_amount, fee_amount,
+        /// treasury_account)` per ADR-030 Sec2/Sec4 -- the one shared
+        /// helper both `complete_and_payout` and `resolve_dispute`'s
+        /// `PayProvider` outcome call, so they apply identical fee logic
+        /// rather than two independent copies that could drift.
+        ///
+        /// `fee_amount = charged_amount * fee_bps / 10_000`, entirely
+        /// `checked_*` over `BalanceOf<T>`; integer division truncates,
+        /// so the fee rounds **down** and the provider receives the
+        /// remainder -- rounding in the provider's favor, matching this
+        /// workspace's only other basis-points-of-a-value precedent
+        /// (`pallet-reputation`'s `value * bps / 10_000`, also
+        /// truncating).
+        ///
+        /// When `FeeBasisPoints` is `0`, returns `(charged_amount, 0,
+        /// None)` without touching `TreasuryAccount` at all -- a
+        /// zero-rate network need not have a treasury configured.
+        /// Otherwise, fails closed with `TreasuryAccountNotConfigured`
+        /// whenever no treasury account is set, regardless of whether
+        /// the computed fee itself would round down to zero for a given
+        /// call: a governance-set nonzero rate must always resolve to a
+        /// real destination, not depend on a per-call rounding outcome.
+        fn split_fee(charged_amount: BalanceOf<T>) -> Result<FeeSplit<T>, DispatchError> {
+            let fee_bps = FeeBasisPoints::<T>::get();
+            if fee_bps.is_zero() {
+                return Ok((charged_amount, Zero::zero(), None));
+            }
+            let treasury =
+                TreasuryAccount::<T>::get().ok_or(Error::<T>::TreasuryAccountNotConfigured)?;
+            let fee_amount = charged_amount
+                .checked_mul(&BalanceOf::<T>::from(fee_bps))
+                .ok_or(Error::<T>::ArithmeticOverflow)?
+                .checked_div(&BalanceOf::<T>::from(10_000u32))
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            // `fee_bps <= MaxFeeBasisPoints` is enforced at
+            // `set_fee_basis_points` time; as long as that cap is itself
+            // configured to <= 10_000 (ADR-030 Sec4's 2,000 default), the
+            // division above guarantees `fee_amount <= charged_amount`.
+            // `checked_sub` (rather than `saturating_sub`) still fails
+            // closed instead of silently clamping if that invariant is
+            // ever violated by a misconfigured runtime.
+            let provider_amount = charged_amount
+                .checked_sub(&fee_amount)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            Ok((provider_amount, fee_amount, Some(treasury)))
         }
     }
 }

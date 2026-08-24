@@ -123,6 +123,8 @@ parameter_types! {
     pub const MaxMeteringPeriodSeconds: u64 = 100;
     pub const MinEscrowAmount: u64 = 10;
     pub const ReliabilityPenaltyBps: u16 = 500;
+    // ADR-030 Sec4: 2,000 bps (20%), matching the runtime's own default.
+    pub const MaxFeeBasisPoints: u16 = 2_000;
 }
 
 impl crate::Config for Test {
@@ -133,13 +135,17 @@ impl crate::Config for Test {
     type ValidatorInspector = TestValidatorInspector;
     type DisputeOrigin = frame_system::EnsureRoot<u64>;
     type PauseOrigin = frame_system::EnsureRoot<u64>;
+    type FeeGovernanceOrigin = frame_system::EnsureRoot<u64>;
     type RefundWindow = RefundWindow;
     type DisputeWindow = DisputeWindow;
     type MaxMeteringPeriodSeconds = MaxMeteringPeriodSeconds;
     type MinEscrowAmount = MinEscrowAmount;
     type ReliabilityPenaltyBps = ReliabilityPenaltyBps;
+    type MaxFeeBasisPoints = MaxFeeBasisPoints;
     type WeightInfo = ();
 }
+
+const TREASURY: u64 = 5;
 
 fn new_test_ext() -> sp_io::TestExternalities {
     reset_fixtures();
@@ -152,13 +158,30 @@ fn new_test_ext() -> sp_io::TestExternalities {
             (PROVIDER, 1_000_000),
             (OTHER, 1_000_000),
             (UNFUNDED, MinEscrowAmount::get() - 1),
+            // `repatriate_reserved` (pallet_balances::do_transfer_reserved)
+            // rejects a beneficiary that does not already exist on-chain
+            // (`Error::DeadAccount`) -- mirrors this ADR's own
+            // "Genesis/dev-chain concern" note that a real chain needs a
+            // pre-existing `TreasuryAccount` for the fee path to work at
+            // all. Funded at exactly `ExistentialDeposit` so fee tests can
+            // assert on the exact delta the fee transfer adds.
+            (TREASURY, 1),
         ],
         ..Default::default()
     }
     .assimilate_storage(&mut storage)
     .unwrap();
     let mut ext: sp_io::TestExternalities = storage.into();
-    ext.execute_with(|| System::set_block_number(1));
+    ext.execute_with(|| {
+        System::set_block_number(1);
+        // ADR-030's own default is 100 bps, but every pre-existing test
+        // in this file predates ADR-030 and asserts on fee-less balances
+        // -- explicitly disable the fee here so those assertions stay
+        // correct, and let the dedicated fee tests in the "ADR-030"
+        // section below opt back in per-test via
+        // `set_fee_basis_points`/`set_treasury_account`.
+        crate::FeeBasisPoints::<Test>::put(0);
+    });
     ext
 }
 
@@ -1483,4 +1506,447 @@ fn resolve_dispute_without_shortfall_never_emits_writeoff_event() {
             "EscrowShortfallWrittenOff must not fire when nothing is actually short"
         );
     });
+}
+
+// ---------------------------------------------------------------------
+// ADR-030: protocol usage fee
+//
+// Every pre-existing test above runs with the fee disabled
+// (`new_test_ext` explicitly zeroes `FeeBasisPoints`); these tests
+// exercise the fee path itself, opting fee/treasury state back in per
+// test via `set_fee_basis_points`/`set_treasury_account`.
+// ---------------------------------------------------------------------
+
+/// Evidence that charges exactly `cpu * price().cpu_core_second` --
+/// every other usage dimension is zero, so the charge is trivial to
+/// predict by hand.
+fn fee_evidence(lease_id: LeaseId, sequence: u64, cpu: u64) -> MeteringSummary<u64> {
+    signed_evidence(
+        &provider_pair(),
+        lease_id,
+        sequence,
+        0,
+        10,
+        cpu,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+    )
+}
+
+#[test]
+fn default_fee_basis_points_is_100_bps_per_adr030() {
+    // Deliberately not `new_test_ext()`, which explicitly zeroes the fee
+    // for every other test in this file -- this checks the pallet's own
+    // un-overridden `ValueQuery` default.
+    sp_io::TestExternalities::default().execute_with(|| {
+        assert_eq!(Escrow::fee_basis_points(), 100);
+    });
+}
+
+#[test]
+fn complete_and_payout_applies_default_fee_to_treasury_and_provider() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 100));
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        assert_ok!(fund(20_000));
+        // charged_amount = 5_000 * 2 = 10_000; fee = 10_000 * 100 / 10_000 = 100.
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            fee_evidence(LEASE, 1, 5_000)
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_000 + 9_900);
+        assert_eq!(Balances::free_balance(TREASURY), 1 + 100);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        // max_charge (20_000) - charged_amount (10_000) = 10_000 refunded.
+        assert_eq!(Balances::free_balance(PAYER), 1_000_000 - 20_000 + 10_000);
+
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::ProtocolFeeCollected {
+                    lease_id: LEASE,
+                    fee_amount: 100,
+                    treasury_account: TREASURY,
+                })
+            )
+        });
+        assert!(found, "ProtocolFeeCollected was not emitted");
+    });
+}
+
+#[test]
+fn fee_at_hard_cap_computes_correctly() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 2_000));
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        assert_ok!(fund(20_000));
+        // charged_amount = 10_000; fee = 10_000 * 2_000 / 10_000 = 2_000.
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            fee_evidence(LEASE, 1, 5_000)
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_000 + 8_000);
+        assert_eq!(Balances::free_balance(TREASURY), 1 + 2_000);
+    });
+}
+
+#[test]
+fn set_fee_basis_points_rejects_above_hard_cap_and_leaves_storage_unchanged() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 500));
+        assert_noop!(
+            Escrow::set_fee_basis_points(RuntimeOrigin::root(), 2_001),
+            crate::Error::<Test>::FeeExceedsCap
+        );
+        assert_eq!(Escrow::fee_basis_points(), 500);
+    });
+}
+
+#[test]
+fn set_fee_basis_points_at_exactly_the_cap_is_accepted() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 2_000));
+        assert_eq!(Escrow::fee_basis_points(), 2_000);
+    });
+}
+
+#[test]
+fn zero_fee_sends_full_amount_to_provider_and_emits_no_fee_event() {
+    new_test_ext().execute_with(|| {
+        // FeeBasisPoints is already 0 by default (new_test_ext);
+        // TreasuryAccount is deliberately left unset, to prove a zero
+        // rate needs no configured treasury at all.
+        assert_ok!(fund(200));
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            normal_evidence()
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_080);
+        assert_eq!(Balances::free_balance(TREASURY), 1);
+        let fee_event_found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::ProtocolFeeCollected { .. })
+            )
+        });
+        assert!(
+            !fee_event_found,
+            "a zero fee must not emit ProtocolFeeCollected"
+        );
+    });
+}
+
+#[test]
+fn fund_escrow_never_touches_the_fee_path() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 2_000));
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        assert_ok!(fund(20_000));
+        assert_eq!(Balances::free_balance(TREASURY), 1);
+        let fee_event_found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::ProtocolFeeCollected { .. })
+            )
+        });
+        assert!(
+            !fee_event_found,
+            "fund_escrow must never emit ProtocolFeeCollected"
+        );
+    });
+}
+
+#[test]
+fn refund_escrow_never_touches_the_fee_path() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 2_000));
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        assert_ok!(fund(20_000));
+        System::set_block_number(1 + RefundWindow::get());
+        assert_ok!(Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE));
+        assert_eq!(Balances::free_balance(PAYER), 1_000_000);
+        assert_eq!(Balances::free_balance(TREASURY), 1);
+        let fee_event_found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::ProtocolFeeCollected { .. })
+            )
+        });
+        assert!(
+            !fee_event_found,
+            "refund_escrow must never emit ProtocolFeeCollected"
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_refund_payer_never_touches_the_fee_path() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 2_000));
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        assert_ok!(fund(20_000));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+        assert_eq!(Balances::free_balance(PAYER), 1_000_000);
+        assert_eq!(Balances::free_balance(TREASURY), 1);
+        let fee_event_found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::ProtocolFeeCollected { .. })
+            )
+        });
+        assert!(
+            !fee_event_found,
+            "resolve_dispute's RefundPayer outcome must never emit ProtocolFeeCollected"
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_pay_provider_applies_identical_fee_logic_as_complete_and_payout() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 100));
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        assert_ok!(fund(20_000));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(10_000)
+        ));
+        // Identical split to complete_and_payout's own 10_000-at-100bps
+        // case: fee = 100, provider = 9_900.
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_000 + 9_900);
+        assert_eq!(Balances::free_balance(TREASURY), 1 + 100);
+
+        let settled_event_found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::DisputeResolved {
+                    lease_id: LEASE,
+                    provider_amount: 9_900,
+                    ..
+                })
+            )
+        });
+        assert!(
+            settled_event_found,
+            "DisputeResolved.provider_amount must report the post-fee amount actually paid"
+        );
+        let fee_event_found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::ProtocolFeeCollected {
+                    lease_id: LEASE,
+                    fee_amount: 100,
+                    treasury_account: TREASURY,
+                })
+            )
+        });
+        assert!(fee_event_found, "ProtocolFeeCollected was not emitted");
+    });
+}
+
+#[test]
+fn payout_with_treasury_unset_and_nonzero_fee_fails_closed() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 100));
+        // TreasuryAccount is deliberately left unset.
+        assert_ok!(fund(20_000));
+        assert_noop!(
+            Escrow::complete_and_payout(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                fee_evidence(LEASE, 1, 5_000)
+            ),
+            crate::Error::<Test>::TreasuryAccountNotConfigured
+        );
+        // No funds moved: the reservation is untouched and the escrow is
+        // still Funded.
+        assert_eq!(Balances::reserved_balance(PAYER), 20_000);
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_000);
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Funded);
+    });
+}
+
+#[test]
+fn dispute_pay_provider_with_treasury_unset_and_nonzero_fee_fails_closed() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 100));
+        assert_ok!(fund(20_000));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_noop!(
+            Escrow::resolve_dispute(
+                RuntimeOrigin::root(),
+                LEASE,
+                DisputeOutcome::PayProvider(10_000)
+            ),
+            crate::Error::<Test>::TreasuryAccountNotConfigured
+        );
+        assert_eq!(Balances::reserved_balance(PAYER), 20_000);
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_000);
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Disputed);
+    });
+}
+
+#[test]
+fn set_fee_basis_points_rejects_non_root_origin() {
+    new_test_ext().execute_with(|| {
+        assert_noop!(
+            Escrow::set_fee_basis_points(RuntimeOrigin::signed(OTHER), 100),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn set_treasury_account_rejects_non_root_origin() {
+    new_test_ext().execute_with(|| {
+        assert_noop!(
+            Escrow::set_treasury_account(RuntimeOrigin::signed(OTHER), TREASURY),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn set_fee_basis_points_emits_update_event_with_old_and_new() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 250));
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::FeeBasisPointsUpdated { old: 0, new: 250 })
+            )
+        });
+        assert!(
+            found,
+            "FeeBasisPointsUpdated{{old: 0, new: 250}} not emitted"
+        );
+    });
+}
+
+#[test]
+fn set_treasury_account_emits_update_event_with_old_and_new() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::TreasuryAccountUpdated {
+                    old: None,
+                    new: TREASURY,
+                })
+            )
+        });
+        assert!(
+            found,
+            "TreasuryAccountUpdated{{old: None, new: TREASURY}} not emitted"
+        );
+    });
+}
+
+#[test]
+fn invariant_provider_amount_plus_fee_amount_equals_charged_amount_across_fee_bps() {
+    // Sweeps the boundary and mid-range fee rates (0, 1, 100 [default],
+    // 2_000 [hard cap]) against a fixed charged_amount of 10_000, and
+    // checks both (1) the conservation invariant the task requires
+    // exactly, and (2) that the total balance across payer + provider +
+    // treasury is conserved (nothing minted or burned by the split).
+    let fee_bps_cases: [u16; 4] = [0, 1, 100, 2_000];
+
+    for (idx, fee_bps) in fee_bps_cases.into_iter().enumerate() {
+        new_test_ext().execute_with(|| {
+            assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), fee_bps));
+            assert_ok!(Escrow::set_treasury_account(
+                RuntimeOrigin::root(),
+                TREASURY
+            ));
+
+            let lease_id: LeaseId = 2_000 + idx as LeaseId;
+            let total_before = Balances::free_balance(PAYER)
+                + Balances::reserved_balance(PAYER)
+                + Balances::free_balance(PROVIDER)
+                + Balances::free_balance(TREASURY);
+
+            assert_ok!(Escrow::fund_escrow(
+                RuntimeOrigin::signed(PAYER),
+                lease_id,
+                PROVIDER,
+                20_000,
+                price(),
+                1
+            ));
+            let evidence = fee_evidence(lease_id, 1, 5_000); // charged_amount = 10_000
+            assert_ok!(Escrow::complete_and_payout(
+                RuntimeOrigin::signed(OTHER),
+                lease_id,
+                evidence
+            ));
+
+            let provider_amount = Balances::free_balance(PROVIDER) - 1_000_000;
+            // TREASURY starts genesis-funded at 1 (ExistentialDeposit) so
+            // `repatriate_reserved` accepts it as a beneficiary; subtract
+            // that base amount to isolate the fee actually collected.
+            let fee_amount = Balances::free_balance(TREASURY) - 1;
+            assert_eq!(
+                provider_amount + fee_amount,
+                10_000,
+                "fee_bps {fee_bps}: provider_amount + fee_amount must equal charged_amount exactly"
+            );
+
+            let total_after = Balances::free_balance(PAYER)
+                + Balances::reserved_balance(PAYER)
+                + Balances::free_balance(PROVIDER)
+                + Balances::free_balance(TREASURY);
+            assert_eq!(
+                total_before, total_after,
+                "fee_bps {fee_bps}: total balance across payer+provider+treasury must be conserved"
+            );
+        });
+    }
 }
