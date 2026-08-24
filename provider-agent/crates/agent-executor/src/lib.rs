@@ -13,14 +13,16 @@ pub use bandwidth::WorkloadBandwidth;
 use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
 };
+use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
 use bollard::Docker;
+use futures_util::StreamExt;
 pub use rate_limit::{CommandRunner, RateLimiter, SystemCommandRunner};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -111,6 +113,41 @@ impl BollardEngine {
         })
     }
 
+    /// Issue #154: pulls `image` (any reference bollard's `from_image`
+    /// accepts -- `repo`, `repo:tag`, or `repo@sha256:digest`) into the
+    /// local Docker daemon, bounded by `IMAGE_PULL_TIMEOUT` so a large
+    /// image or an unreachable/slow registry cannot hang `deploy()`
+    /// indefinitely (a distinct, inner bound from the orchestrator's own
+    /// bounded-retry budget, #138 -- that one paces retries across
+    /// separate `Deploy` attempts; this one bounds a single attempt).
+    /// Consumes bollard's progress stream to completion (or to its first
+    /// error) rather than dropping it -- dropping the stream early would
+    /// cancel the pull (`create_image`'s own doc comment: "The pull is
+    /// cancelled if the HTTP connection is closed").
+    async fn pull_image(&self, image: &str) -> Result<(), ExecutorError> {
+        const IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(180);
+        let options = CreateImageOptions {
+            from_image: image.to_string(),
+            ..Default::default()
+        };
+        let mut stream = self.docker.create_image(Some(options), None, None);
+        let pull = async {
+            while let Some(event) = stream.next().await {
+                event.map_err(|error| {
+                    ExecutorError::Engine(format!("pulling image {image}: {error}"))
+                })?;
+            }
+            Ok(())
+        };
+        tokio::time::timeout(IMAGE_PULL_TIMEOUT, pull)
+            .await
+            .map_err(|_| {
+                ExecutorError::Engine(format!(
+                    "timed out after {IMAGE_PULL_TIMEOUT:?} pulling image {image}"
+                ))
+            })?
+    }
+
     /// Resolves `container_id`'s host-visible PID via Docker inspect --
     /// the same lookup `bandwidth()` needs (for `read_bandwidth`) and
     /// `rate_limit()` needs (for `RateLimiter::apply`), factored out so
@@ -155,11 +192,38 @@ impl ContainerEngine for BollardEngine {
             name: spec.name.clone(),
             platform: None,
         };
-        self.docker
-            .create_container(Some(options), config)
+        match self
+            .docker
+            .create_container(Some(options.clone()), config.clone())
             .await
-            .map(|response| response.id)
-            .map_err(|error| ExecutorError::Engine(error.to_string()))
+        {
+            Ok(response) => Ok(response.id),
+            // Issue #154: confirmed live -- a workload with a valid, correctly
+            // pinned image reference stuck retrying forever because the
+            // Agent never pulls an image it doesn't already have cached.
+            // `status_code == 404` (not a message-substring match) is
+            // bollard's own structured signal for exactly this case
+            // (bollard::errors::Error::DockerResponseServerError). Pull once,
+            // bounded, then retry create() exactly once -- a second 404
+            // after a successful pull, or a pull failure/timeout, is
+            // surfaced as-is and not retried again here: distinguishing
+            // "wasn't cached yet" (this fixes it) from "genuinely doesn't
+            // exist" or "registry unreachable" (must still fail loudly, not
+            // loop). The orchestrator's own bounded-retry budget (#138) is
+            // the outer safety net for a reference that's really bad, not
+            // this.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                self.pull_image(&spec.image).await?;
+                self.docker
+                    .create_container(Some(options), config)
+                    .await
+                    .map(|response| response.id)
+                    .map_err(|error| ExecutorError::Engine(error.to_string()))
+            }
+            Err(error) => Err(ExecutorError::Engine(error.to_string())),
+        }
     }
 
     async fn start(&self, container_id: &str) -> Result<(), ExecutorError> {
@@ -1817,5 +1881,44 @@ mod tests {
             removed.is_err(),
             "container {container_id} should have been removed by stop(), but inspect still found it"
         );
+    }
+
+    // Issue #154: confirmed live -- a workload with a valid, correctly
+    // pinned image reference got stuck retrying forever because create()
+    // never pulled an image it didn't already have cached, and 404'd every
+    // time. Opt-in like docker_integration_applies_mandatory_controls
+    // above (needs a real Docker daemon and, unlike that test, real
+    // network access to actually pull) -- skipped by default so
+    // `cargo test --workspace` never depends on either.
+    #[tokio::test]
+    async fn docker_integration_pulls_a_missing_image_before_create() {
+        let image = match std::env::var("OPENINFRA_TEST_DOCKER_PULL_IMAGE") {
+            Ok(image) => image,
+            Err(_) => return,
+        };
+        let docker = Docker::connect_with_local_defaults().expect("Docker client");
+        // Precondition this test actually proves something: remove the
+        // image first (ignoring "wasn't there anyway"), so create()'s
+        // success below can only come from the pull-on-404 path, not a
+        // pre-existing local copy.
+        let _ = docker.remove_image(&image, None, None).await;
+        let engine = BollardEngine::connect().expect("connect Docker");
+        let spec = ContainerSpec {
+            name: format!("openinfra-test-{}", Uuid::new_v4()),
+            image: image.clone(),
+            labels: HashMap::new(),
+            memory_bytes: 64 * MIB,
+            nano_cpus: 500_000_000,
+            pids_limit: 32,
+            egress_mbps: 0,
+        };
+        let container_id = engine
+            .create(&spec)
+            .await
+            .expect("create() should transparently pull the missing image and succeed");
+        docker
+            .remove_container(&container_id, None)
+            .await
+            .expect("clean up the container this test created");
     }
 }
