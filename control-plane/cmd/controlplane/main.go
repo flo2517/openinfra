@@ -20,8 +20,10 @@ import (
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/dashboard"
+	"github.com/openinfra/network/internal/openstackapi"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/pki"
+	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/providerjoin"
 	"github.com/openinfra/network/internal/ratelimit"
 	"github.com/openinfra/network/internal/resourcemarket"
@@ -264,7 +266,34 @@ func run() error {
 		MaxHeaderBytes:    16 << 10,
 	}
 
-	serveError := make(chan error, 2)
+	// ADR-031 §2: a third HTTP surface, OpenStack-shaped REST/JSON, on
+	// its own listener -- issue #23's Keystone token bridge today,
+	// #24/#25/#26's Nova/Neutron/Glance/Cinder route groups extending the
+	// same internal/openstackapi.Server.Handler() in their own PRs.
+	// A separate listener (not merged into httpServer above), because
+	// the ADR is explicit this is its own wire surface and a JSON-only
+	// API has no business sharing internal/dashboard's HTML-serving
+	// CSP/asset routes.
+	openstackAPIAddress := envOrDefault("OPENSTACK_API_HTTP_ADDR", "127.0.0.1:8087")
+	openstackAPIListener, err := loopbackHTTPListener(openstackAPIAddress, "OPENINFRA_DEV_OPENSTACK_API_INSECURE",
+		"OpenStack API surface must bind to loopback; local Compose may explicitly set OPENINFRA_DEV_OPENSTACK_API_INSECURE=true")
+	if err != nil {
+		return err
+	}
+	defer openstackAPIListener.Close()
+	openstackAPIBaseURL := envOrDefault("OPENSTACK_API_BASE_URL", "http://"+openstackAPIAddress)
+	openstackTokenRateLimit := envIntOrDefault("OPENSTACK_TOKEN_RATE_LIMIT_PER_MINUTE", 30)
+	openstackTokenLimiter := ratelimit.NewRedisLimiter(redisClient, openstackTokenRateLimit, 60)
+	openstackAPIServer := &http.Server{
+		Handler:           openstackapi.New(pool, userRepository, projects.NewPostgresRepository(pool), openstackAPIBaseURL, openstackTokenLimiter).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+
+	serveError := make(chan error, 3)
 	go func() {
 		slog.Info("Control Plane gRPC listening", "address", address)
 		serveError <- server.Serve(listener)
@@ -272,6 +301,10 @@ func run() error {
 	go func() {
 		slog.Info("Control Plane dashboard listening", "address", httpAddress)
 		serveError <- httpServer.Serve(httpListener)
+	}()
+	go func() {
+		slog.Info("Control Plane OpenStack API listening", "address", openstackAPIAddress)
+		serveError <- openstackAPIServer.Serve(openstackAPIListener)
 	}()
 
 	select {
@@ -284,6 +317,9 @@ func run() error {
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutdown dashboard: %w", err)
 		}
+		if err := openstackAPIServer.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shutdown OpenStack API: %w", err)
+		}
 		return nil
 	case err := <-serveError:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -294,17 +330,29 @@ func run() error {
 }
 
 func safeHTTPListener(address string) (net.Listener, error) {
+	return loopbackHTTPListener(address, "OPENINFRA_DEV_DASHBOARD_INSECURE",
+		"dashboard without authentication must bind to loopback; local Compose may explicitly set OPENINFRA_DEV_DASHBOARD_INSECURE=true")
+}
+
+// loopbackHTTPListener is safeHTTPListener's general form, reused by
+// internal/openstackapi's listener (below) so a second unauthenticated-
+// by-default HTTP surface gets the exact same loopback-by-default
+// posture with its own dedicated escape-hatch env var, rather than
+// silently reusing the dashboard's flag (which would let one insecure
+// flag quietly widen two different surfaces at once) or duplicating this
+// function's logic a second time.
+func loopbackHTTPListener(address, insecureEnvVar, insecureMessage string) (net.Listener, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, fmt.Errorf("parse dashboard address: %w", err)
+		return nil, fmt.Errorf("parse listen address: %w", err)
 	}
 	ip := net.ParseIP(host)
-	if (ip == nil || !ip.IsLoopback()) && !strings.EqualFold(os.Getenv("OPENINFRA_DEV_DASHBOARD_INSECURE"), "true") {
-		return nil, errors.New("dashboard without authentication must bind to loopback; local Compose may explicitly set OPENINFRA_DEV_DASHBOARD_INSECURE=true")
+	if (ip == nil || !ip.IsLoopback()) && !strings.EqualFold(os.Getenv(insecureEnvVar), "true") {
+		return nil, errors.New(insecureMessage)
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		return nil, fmt.Errorf("listen dashboard on %s: %w", address, err)
+		return nil, fmt.Errorf("listen on %s: %w", address, err)
 	}
 	return listener, nil
 }
