@@ -138,6 +138,16 @@ type Candidate struct {
 	// given a neutral default when a workload requires one -- see
 	// scoreOne's zone check for why the two cases differ.
 	Zone string
+
+	// VirtualizationCapable mirrors ResourceCapability.virtualization_capable
+	// exactly (ADR-033 §7, issue #166): true only after the Agent's own
+	// fail-closed KVM_GET_API_VERSION probe succeeded. Like Zone, this is
+	// never given a neutral default when a workload requires it --
+	// absent/false is "cannot run VM workloads", never "unknown, try
+	// anyway" (see scoreOne's requires_vm check), matching ADR-025's
+	// existing "unset bandwidth means zero capacity" fail-closed
+	// convention this ADR explicitly follows.
+	VirtualizationCapable bool
 }
 
 // Score is one candidate's fully-computed, auditable result.
@@ -255,6 +265,14 @@ func (r *Ranker) Rank(
 // nothing would tie the two literals together.
 const ReasonZoneMismatch = "zone mismatch"
 
+// ReasonVmIncapable is scoreOne's exclusion reason for ADR-033 §7's VM
+// hard-exclusion (below) -- exported for the same reason ReasonZoneMismatch
+// is: a future caller that wants to distinguish "no capacity" from "not
+// virtualization-capable" in a user-facing message has a stable string to
+// match against instead of a hand-duplicated literal that could silently
+// drift.
+const ReasonVmIncapable = "provider is not virtualization-capable"
+
 func (r *Ranker) scoreOne(
 	weights ProfileWeights,
 	requirements *sharedv1.ResourceRequirements,
@@ -333,6 +351,17 @@ func (r *Ranker) scoreOne(
 	// as "matches anything".
 	if constraints != nil && constraints.RequiredZone != "" && candidate.Zone != constraints.RequiredZone {
 		return Score{}, true, ReasonZoneMismatch
+	}
+	// ADR-033 §7 / issue #166: the fail-closed VM-capability gate. Same
+	// shape as the zone check immediately above -- a hard exclusion, no
+	// neutral default for a candidate that simply never reported
+	// virtualization_capable = true (proto3's default for an unset bool
+	// is false, and an Agent binary that predates this field or whose
+	// KVM probe failed never sets it either way -- "unset" and
+	// "explicitly false" are indistinguishable on the wire on purpose,
+	// see ResourceCapability.virtualization_capable's own doc comment).
+	if constraints != nil && constraints.RequiresVm && !candidate.VirtualizationCapable {
+		return Score{}, true, ReasonVmIncapable
 	}
 	if constraints != nil && constraints.MinReputation > 0 {
 		// Documented convention: min_reputation is on the same

@@ -95,6 +95,32 @@ func TestRankableCandidatesWiresZoneThrough(t *testing.T) {
 	}
 }
 
+// TestRankableCandidatesWiresVirtualizationCapableThrough covers ADR-033
+// §7 / issue #166: rankableCandidates must carry
+// ResourceCapability.virtualization_capable through to
+// scheduler.Candidate exactly as it arrived on the wire -- no
+// transformation, no default substitution -- so scoreOne's fail-closed
+// requires_vm check (rank.go) has real data to act on.
+func TestRankableCandidatesWiresVirtualizationCapableThrough(t *testing.T) {
+	providers := []agentmanager.SchedulableProvider{
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "kvm-capable", AgentEndpoint: "https://a:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuTotal: 4, CpuAvailable: 4, RamTotalMb: 4096, RamAvailableMb: 4096, VirtualizationCapable: true}},
+		{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "kvm-incapable", AgentEndpoint: "https://b:50052"}, Capabilities: &sharedv1.ResourceCapability{CpuTotal: 4, CpuAvailable: 4, RamTotalMb: 4096, RamAvailableMb: 4096}},
+	}
+	worker := NewWorker(nil, nil, nil, nil, testRanker())
+	candidates, _ := worker.rankableCandidates(context.Background(), providers)
+
+	capable := map[string]bool{}
+	for _, c := range candidates {
+		capable[c.ProviderID] = c.VirtualizationCapable
+	}
+	if !capable["kvm-capable"] {
+		t.Fatalf("expected kvm-capable candidate's VirtualizationCapable to be true, got %v", capable)
+	}
+	if capable["kvm-incapable"] {
+		t.Fatalf("expected kvm-incapable candidate's VirtualizationCapable to be false, got %v", capable)
+	}
+}
+
 // TestRankableCandidatesAppliesWireGuardOverheadToCapacityLedgerOnlyWhenOverlayActive
 // covers issue #115: AssignLease's persistent, atomic capacity ledger
 // (workloadapi.ProviderCapacity) must reflect the same post-overhead
@@ -394,6 +420,90 @@ func TestDeployingCarriesLeaseEndIntoTheDeployRequest(t *testing.T) {
 	leaseEnd := dispatcher.request.LeaseEnd.AsTime()
 	if leaseEnd.Before(before.Add(durationSeconds*time.Second)) || leaseEnd.After(after.Add(durationSeconds*time.Second)) {
 		t.Fatalf("LeaseEnd = %s, want within [%s, %s]", leaseEnd, before.Add(durationSeconds*time.Second), after.Add(durationSeconds*time.Second))
+	}
+}
+
+// TestDeployingBuildsAVmFlavoredDeployRequestWhenRequiresVmIsSet covers
+// ADR-033 §9 / issues #166/#168's orchestrator-side dispatch: a workload
+// whose definition.constraints.requires_vm is true must reach the Agent
+// as RUNTIME_VM with its qcow2 URL/digest on the sibling VmSpec message,
+// never as an ordinary Docker DeployRequest that would misinterpret the
+// qcow2 URL as an OCI image reference.
+func TestDeployingBuildsAVmFlavoredDeployRequestWhenRequiresVmIsSet(t *testing.T) {
+	definition, err := proto.Marshal(&sharedv1.WorkloadDefinition{
+		Requirements: &sharedv1.ResourceRequirements{Cpu: 2, RamMb: 1024},
+		Constraints:  &sharedv1.WorkloadConstraints{RequiresVm: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := workloadapi.Workload{
+		WorkloadID:    "workload",
+		State:         "DEPLOYING",
+		Definition:    definition,
+		Image:         "https://example.com/image.qcow2",
+		VmImageSha256: strings.Repeat("a", 64),
+		ProviderID:    "provider",
+		LeaseID:       "42",
+		Version:       1,
+	}
+	store := &recordingStore{item: item}
+	provider := agentmanager.SchedulableProvider{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "provider", AgentEndpoint: "https://agent:50052"}}
+	dispatcher := &capturingDispatcher{}
+	worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, dispatcher, testRanker())
+	if err := worker.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if dispatcher.request == nil {
+		t.Fatal("no DeployRequest captured")
+	}
+	if dispatcher.request.Runtime != agentv1.Runtime_RUNTIME_VM {
+		t.Fatalf("Runtime = %v, want RUNTIME_VM", dispatcher.request.Runtime)
+	}
+	if dispatcher.request.Image != "" {
+		t.Fatalf("Image = %q, want empty for a VM-flavored request", dispatcher.request.Image)
+	}
+	if dispatcher.request.Vm == nil {
+		t.Fatal("Vm is nil, want a populated VmSpec")
+	}
+	if dispatcher.request.Vm.VmImageUrl != "https://example.com/image.qcow2" {
+		t.Fatalf("VmImageUrl = %q, want the workload's Image", dispatcher.request.Vm.VmImageUrl)
+	}
+	if dispatcher.request.Vm.VmImageSha256 != strings.Repeat("a", 64) {
+		t.Fatalf("VmImageSha256 = %q, want the workload's VmImageSha256", dispatcher.request.Vm.VmImageSha256)
+	}
+}
+
+// TestDeployingBuildsAnOrdinaryContainerDeployRequestWhenRequiresVmIsUnset
+// is the regression guard for the above: a container workload (the
+// overwhelming majority) must keep getting exactly the DeployRequest
+// shape it got before ADR-033's routing field existed.
+func TestDeployingBuildsAnOrdinaryContainerDeployRequestWhenRequiresVmIsUnset(t *testing.T) {
+	definition, err := proto.Marshal(&sharedv1.WorkloadDefinition{
+		Requirements: &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 256},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := workloadapi.Workload{WorkloadID: "workload", State: "DEPLOYING", Definition: definition, Image: "busybox@sha256:" + strings.Repeat("b", 64), ProviderID: "provider", LeaseID: "42", Version: 1}
+	store := &recordingStore{item: item}
+	provider := agentmanager.SchedulableProvider{RegisteredProvider: agentmanager.RegisteredProvider{ProviderID: "provider", AgentEndpoint: "https://agent:50052"}}
+	dispatcher := &capturingDispatcher{}
+	worker := NewWorker(store, staticDirectory{provider}, successfulLeases{}, dispatcher, testRanker())
+	if err := worker.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if dispatcher.request == nil {
+		t.Fatal("no DeployRequest captured")
+	}
+	if dispatcher.request.Runtime != agentv1.Runtime_RUNTIME_UNSPECIFIED {
+		t.Fatalf("Runtime = %v, want RUNTIME_UNSPECIFIED for an ordinary container workload", dispatcher.request.Runtime)
+	}
+	if dispatcher.request.Image != item.Image {
+		t.Fatalf("Image = %q, want %q", dispatcher.request.Image, item.Image)
+	}
+	if dispatcher.request.Vm != nil {
+		t.Fatalf("Vm = %+v, want nil for an ordinary container workload", dispatcher.request.Vm)
 	}
 }
 

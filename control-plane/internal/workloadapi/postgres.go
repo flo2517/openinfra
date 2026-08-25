@@ -18,7 +18,7 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 }
 
 func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload) (Workload, error) {
-	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, reserved_ingress_mbps, reserved_egress_mbps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.OwnerID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB, candidate.ReservedIngressMbps, candidate.ReservedEgressMbps)
+	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, vm_image_sha256, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, reserved_ingress_mbps, reserved_egress_mbps) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.OwnerID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.VmImageSha256, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB, candidate.ReservedIngressMbps, candidate.ReservedEgressMbps)
 	if err != nil {
 		return Workload{}, err
 	}
@@ -37,7 +37,7 @@ func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload
 	// happens to reuse (or guess) another tenant's request_id would be
 	// handed back that tenant's workload_id/definition/image as if it were
 	// an idempotent replay of their own call.
-	if stored.RequestHash != candidate.RequestHash || stored.WorkloadID != candidate.WorkloadID || stored.OwnerID != candidate.OwnerID || !bytes.Equal(stored.Definition, candidate.Definition) || stored.Image != candidate.Image {
+	if stored.RequestHash != candidate.RequestHash || stored.WorkloadID != candidate.WorkloadID || stored.OwnerID != candidate.OwnerID || !bytes.Equal(stored.Definition, candidate.Definition) || stored.Image != candidate.Image || stored.VmImageSha256 != candidate.VmImageSha256 {
 		return Workload{}, ErrConflict
 	}
 	return stored, nil
@@ -330,9 +330,9 @@ func (r *PostgresRepository) MarkFailed(ctx context.Context, item Workload, code
 	return nil
 }
 
-const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps`
+const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, COALESCE(vm_image_sha256,''), state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps`
 const selectWorkload = `SELECT ` + workloadColumns + ` FROM workloads`
-const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps`
+const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, COALESCE(w.vm_image_sha256,''), w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps`
 
 type scanner interface{ Scan(...any) error }
 
@@ -340,7 +340,7 @@ func scanWorkload(row scanner) (Workload, error) {
 	var w Workload
 	var hash, resourceHash []byte
 	var workerLeaseUntil *time.Time
-	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID, &w.ReservedIngressMbps, &w.ReservedEgressMbps)
+	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.VmImageSha256, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID, &w.ReservedIngressMbps, &w.ReservedEgressMbps)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Workload{}, ErrNotFound
 	}

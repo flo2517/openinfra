@@ -1071,8 +1071,19 @@ type SubmitWorkloadRequest struct {
 	// UUID reused for safe retries of the exact same submission.
 	RequestId  string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	Definition *v1.WorkloadDefinition `protobuf:"bytes,2,opt,name=definition,proto3" json:"definition,omitempty"`
-	// Immutable OCI reference including an explicit sha256 digest.
-	Image         string `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
+	// For an ordinary container workload (definition.constraints.requires_vm
+	// unset/false): an immutable OCI reference including an explicit sha256
+	// digest. For a VM workload (requires_vm = true, ADR-033 §4/§9, issue
+	// #166/#168): an HTTPS URL to a qcow2 image, paired with the required
+	// vm_image_sha256 below -- reusing this field rather than adding a
+	// parallel one, since exactly one of the two image conventions ever
+	// applies to a given submission.
+	Image string `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
+	// Required, and only meaningful, when definition.constraints.requires_vm
+	// is true: the pinned SHA-256 digest (lowercase hex) of the qcow2 blob
+	// at `image`, verified by the Agent before the image is ever booted
+	// (ADR-033 §4). Ignored for a container workload.
+	VmImageSha256 string `protobuf:"bytes,4,opt,name=vm_image_sha256,json=vmImageSha256,proto3" json:"vm_image_sha256,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1124,6 +1135,13 @@ func (x *SubmitWorkloadRequest) GetDefinition() *v1.WorkloadDefinition {
 func (x *SubmitWorkloadRequest) GetImage() string {
 	if x != nil {
 		return x.Image
+	}
+	return ""
+}
+
+func (x *SubmitWorkloadRequest) GetVmImageSha256() string {
+	if x != nil {
+		return x.VmImageSha256
 	}
 	return ""
 }
@@ -1522,14 +1540,15 @@ const file_openinfra_controlplane_v1_control_plane_proto_rawDesc = "" +
 	"\vaccepted_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"acceptedAt\x124\n" +
 	"\x16next_heartbeat_seconds\x18\x03 \x01(\rR\x14nextHeartbeatSeconds\x12+\n" +
-	"\x11active_validators\x18\x04 \x03(\fR\x10activeValidators\"\x95\x01\n" +
+	"\x11active_validators\x18\x04 \x03(\fR\x10activeValidators\"\xbd\x01\n" +
 	"\x15SubmitWorkloadRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12G\n" +
 	"\n" +
 	"definition\x18\x02 \x01(\v2'.openinfra.shared.v1.WorkloadDefinitionR\n" +
 	"definition\x12\x14\n" +
-	"\x05image\x18\x03 \x01(\tR\x05image\"\xb4\x01\n" +
+	"\x05image\x18\x03 \x01(\tR\x05image\x12&\n" +
+	"\x0fvm_image_sha256\x18\x04 \x01(\tR\rvmImageSha256\"\xb4\x01\n" +
 	"\x16SubmitWorkloadResponse\x12\x1f\n" +
 	"\vworkload_id\x18\x01 \x01(\tR\n" +
 	"workloadId\x12>\n" +

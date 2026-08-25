@@ -83,6 +83,39 @@ message DeployRequest {
   // added, not that it is mandatory; treated as mandatory here as the more
   // conservative interpretation.
   google.protobuf.Timestamp lease_end = 5;
+  // ADR-033 §8/§9 / issue #168: which execution backend runs this
+  // workload. RUNTIME_UNSPECIFIED (the proto3 default, and the value
+  // every DeployRequest built before this field existed implicitly
+  // carries) is treated identically to RUNTIME_CONTAINER by the Agent's
+  // gRPC server -- additive, backward-compatible: a Control Plane/Agent
+  // pair that predates this field keeps deploying Docker workloads
+  // exactly as before.
+  Runtime runtime = 6;
+  // Required, and only meaningful, when runtime == RUNTIME_VM. `image`
+  // above is ignored for a VM-flavored request -- vm.vm_image_url is the
+  // qcow2 reference instead, matching ADR-033 §4's "no OCI registry
+  // concept for a raw/qcow2 disk image" reasoning. vcpu/memory sizing
+  // deliberately reuses `limits.cpu_cores`/`limits.memory_mb` rather than
+  // duplicating them on VmSpec -- cpu_cores must be a whole number for a
+  // VM's vcpu count (agent-executor rejects a fractional value).
+  VmSpec vm = 7;
+}
+
+enum Runtime {
+  RUNTIME_UNSPECIFIED = 0;
+  RUNTIME_CONTAINER = 1;
+  RUNTIME_VM = 2;
+}
+
+// ADR-033 §4: digest-pinned, fetched over HTTPS, verified before first
+// boot -- the VM analog of `image`'s OCI `name@sha256:digest` convention,
+// necessarily shaped differently since there is no OCI registry concept
+// for a raw/qcow2 disk image. Both fields are required (agent-executor's
+// vm::VmExecutor::validate rejects a missing/malformed value); see
+// docs/adr/033-vm-execution-backend.md §4.
+message VmSpec {
+  string vm_image_url = 1;
+  string vm_image_sha256 = 2;
 }
 
 message ResourceLimits {

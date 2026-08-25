@@ -112,6 +112,36 @@ pub struct ExecutorSettings {
     /// socket -- one file per VM, named after its workload_id.
     #[serde(default = "default_vm_sockets_dir")]
     pub vm_sockets_dir: PathBuf,
+    /// ADR-033 §7 / issue #168 point 4: the operator's explicit opt-in to
+    /// running the VM execution backend at all, distinct from
+    /// `max_vm_workloads`. The ADR is explicit that hardware capability
+    /// (`agent-inventory`'s KVM probe) and operator consent are two
+    /// separate gates: a KVM-capable host must not run VM workloads
+    /// merely because the hardware happens to support it -- running a
+    /// second execution model has real operational cost (VMM process
+    /// management, qcow2 image storage, additional attack surface) an
+    /// operator should consciously accept. Defaults to `false`; even a
+    /// nonzero `max_vm_workloads` configured while this is `false` must
+    /// not enable VM deploys (see agent-cli's wiring, which only
+    /// constructs a `VmExecutor` at all when this is `true`).
+    #[serde(default)]
+    pub vm_enabled: bool,
+    /// ADR-033 §6: resolves via `PATH`, matching `cloud_hypervisor_binary`
+    /// and `SystemCommandRunner`'s own convention. See
+    /// `agent_executor::vm::cloud_hypervisor::VmmSecurityPolicy`.
+    #[serde(default = "default_setpriv_binary")]
+    pub setpriv_binary: PathBuf,
+    /// Dedicated unprivileged user/group the VMM process runs as -- never
+    /// root, never the Agent's own uid (ADR-033 §6). The operator
+    /// provisions this account; the Agent does not create it.
+    #[serde(default = "default_vmm_account")]
+    pub vmm_user: String,
+    #[serde(default = "default_vmm_account")]
+    pub vmm_group: String,
+    /// The supplementary group granting `/dev/kvm` access (conventionally
+    /// `kvm` on most distributions' udev rules).
+    #[serde(default = "default_vmm_kvm_group")]
+    pub vmm_kvm_group: String,
 }
 
 fn default_max_vm_vcpus() -> u32 {
@@ -134,6 +164,18 @@ fn default_vm_sockets_dir() -> PathBuf {
     PathBuf::from(".openinfra-state/vm-sockets")
 }
 
+fn default_setpriv_binary() -> PathBuf {
+    PathBuf::from("setpriv")
+}
+
+fn default_vmm_account() -> String {
+    "openinfra-vmm".to_string()
+}
+
+fn default_vmm_kvm_group() -> String {
+    "kvm".to_string()
+}
+
 impl Default for ExecutorSettings {
     fn default() -> Self {
         Self {
@@ -151,6 +193,13 @@ impl Default for ExecutorSettings {
             vm_image_cache_dir: default_vm_image_cache_dir(),
             cloud_hypervisor_binary: default_cloud_hypervisor_binary(),
             vm_sockets_dir: default_vm_sockets_dir(),
+            // ADR-033 §7: off by default even on KVM-capable hardware --
+            // see this field's own doc comment.
+            vm_enabled: false,
+            setpriv_binary: default_setpriv_binary(),
+            vmm_user: default_vmm_account(),
+            vmm_group: default_vmm_account(),
+            vmm_kvm_group: default_vmm_kvm_group(),
         }
     }
 }
