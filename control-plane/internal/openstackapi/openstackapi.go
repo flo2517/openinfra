@@ -25,6 +25,15 @@
 // Handler below, and add its catalog entry in
 // keystone/response.go's serviceCatalog. That's the whole diff --
 // keystone's own routes and handlers are untouched by it.
+//
+// internal/openstackapi/glance (issue #26's Glance subset) is the first
+// subpackage to follow that shape: a project-scoped image-registry
+// surface with its own migration-000018-backed table, wired in below the
+// same way. It owns its own Repository (glance.NewPostgresRepository),
+// constructed here from the pool this package already has, rather than
+// threaded through New's signature -- no other component needs to
+// construct a glance.Repository, unlike users/projectsRepo above, which
+// internal/dashboard and the gRPC server also need.
 package openstackapi
 
 import (
@@ -36,6 +45,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/openstackapi/keystone"
 	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/userauth"
@@ -55,6 +65,7 @@ type RateLimiter interface {
 type Server struct {
 	pool     *pgxpool.Pool
 	keystone *keystone.Server
+	glance   *glance.Server
 	limiter  RateLimiter
 }
 
@@ -67,9 +78,11 @@ type Server struct {
 // internal/dashboard's authChallenge/authLogin rate limiting already
 // follows.
 func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, baseURL string, limiter RateLimiter) *Server {
+	audit := newAuditRecorder(pool)
 	return &Server{
 		pool:     pool,
-		keystone: keystone.New(users, projectsRepo, baseURL, newAuditRecorder(pool)),
+		keystone: keystone.New(users, projectsRepo, baseURL, audit),
+		glance:   glance.New(users, glance.NewPostgresRepository(pool), glance.AuditRecorder(audit)),
 		limiter:  limiter,
 	}
 }
@@ -84,6 +97,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
 	s.keystone.Register(mux)
+	s.glance.Register(mux)
 	return rateLimitTokenIssuance(s.limiter, securityHeaders(mux))
 }
 

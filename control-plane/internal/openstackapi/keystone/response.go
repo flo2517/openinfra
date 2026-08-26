@@ -98,12 +98,13 @@ func tokenResponseBody(baseURL string, user userauth.User, method string, issued
 
 // serviceCatalog is ADR-031 §3's static, Control-Plane-config-driven
 // catalog: one entry per implemented service, pointing at this Control
-// Plane's own internal/openstackapi base URL. Today that is exactly one
-// service -- identity -- since #24 (compute), #25 (networking), and #26
-// (storage) have not landed; a future PR adds its own entry here (or,
-// more likely, this function grows a small registry future packages
-// append to) rather than this package guessing at endpoints that don't
-// exist yet.
+// Plane's own internal/openstackapi base URL. #24 (compute) and #25
+// (networking) have not landed; #26's Glance subset (image registry
+// only -- Cinder's block-volume half is issue #171, gated behind
+// ADR-034) has, so "image" joins "identity" below. A future PR adds its
+// own entry here (or, more likely, this function grows a small registry
+// future packages append to) rather than this package guessing at
+// endpoints that don't exist yet.
 func serviceCatalog(baseURL string) []catalogEntryBody {
 	return []catalogEntryBody{
 		{
@@ -112,6 +113,14 @@ func serviceCatalog(baseURL string) []catalogEntryBody {
 			Name: "keystone",
 			Endpoints: []endpointBody{
 				{ID: "identity-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v3"},
+			},
+		},
+		{
+			ID:   "image",
+			Type: "image",
+			Name: "glance",
+			Endpoints: []endpointBody{
+				{ID: "image-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v2"},
 			},
 		},
 	}
