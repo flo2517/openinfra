@@ -261,8 +261,19 @@ message SubmitWorkloadRequest {
   // UUID reused for safe retries of the exact same submission.
   string request_id = 1;
   openinfra.shared.v1.WorkloadDefinition definition = 2;
-  // Immutable OCI reference including an explicit sha256 digest.
+  // For an ordinary container workload (definition.constraints.requires_vm
+  // unset/false): an immutable OCI reference including an explicit sha256
+  // digest. For a VM workload (requires_vm = true, ADR-033 §4/§9, issue
+  // #166/#168): an HTTPS URL to a qcow2 image, paired with the required
+  // vm_image_sha256 below -- reusing this field rather than adding a
+  // parallel one, since exactly one of the two image conventions ever
+  // applies to a given submission.
   string image = 3;
+  // Required, and only meaningful, when definition.constraints.requires_vm
+  // is true: the pinned SHA-256 digest (lowercase hex) of the qcow2 blob
+  // at `image`, verified by the Agent before the image is ever booted
+  // (ADR-033 §4). Ignored for a container workload.
+  string vm_image_sha256 = 4;
 }
 
 message SubmitWorkloadResponse {

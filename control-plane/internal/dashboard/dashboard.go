@@ -70,11 +70,16 @@ type Provider struct {
 	// already decoded off every heartbeat (ResourceCapability carries
 	// them) but never surfaced -- part of #14's "hardware/resource
 	// inventory" provider view.
-	StorageAvailableGB int64  `json:"storage_available_gb"`
-	StorageTotalGB     int64  `json:"storage_total_gb"`
-	IngressMbps        int32  `json:"bandwidth_ingress_mbps,omitempty"`
-	EgressMbps         int32  `json:"bandwidth_egress_mbps,omitempty"`
-	ChainState         string `json:"chain_state"`
+	StorageAvailableGB int64 `json:"storage_available_gb"`
+	StorageTotalGB     int64 `json:"storage_total_gb"`
+	IngressMbps        int32 `json:"bandwidth_ingress_mbps,omitempty"`
+	EgressMbps         int32 `json:"bandwidth_egress_mbps,omitempty"`
+	// ADR-033 §7 / issue #166: whether this provider passed the Agent's
+	// fail-closed KVM probe and can be offered a VM workload. Surfaced
+	// for operator visibility the same way IngressMbps/EgressMbps above
+	// already are -- decoded off every heartbeat, previously unused here.
+	VirtualizationCapable bool   `json:"virtualization_capable"`
+	ChainState            string `json:"chain_state"`
 	// Reputation/Offer are nil when not yet read (chain unavailable) --
 	// see ReputationSummary/OfferSummary for the "no record yet" vs
 	// "read failed" distinction within each.
@@ -390,6 +395,7 @@ func (s *Server) loadOverview(ctx context.Context, pagination overviewPagination
 				result.Providers[index].IngressMbps = bandwidth.IngressMbps
 				result.Providers[index].EgressMbps = bandwidth.EgressMbps
 			}
+			result.Providers[index].VirtualizationCapable = payload.Capabilities.VirtualizationCapable
 		}
 		result.ProvidersFresh++
 	}

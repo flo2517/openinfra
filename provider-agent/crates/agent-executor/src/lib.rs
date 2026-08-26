@@ -5,7 +5,7 @@ pub mod vm;
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
 use agent_api::{Executor, UsageSample, WorkloadStatus};
 use agent_core::local_state::{
-    LocalState, LocalStateError, Reservation, WorkloadPhase, WorkloadRecord,
+    LocalState, LocalStateError, Reservation, WorkloadPhase, WorkloadRecord, WorkloadRuntime,
 };
 use agent_core::ExecutorSettings;
 use anyhow::Result;
@@ -1037,6 +1037,103 @@ impl Executor for DockerExecutor {
     }
 }
 
+/// ADR-033 §9 / issue #168 point 3: routes a `DeployRequest` to
+/// `DockerExecutor` or `VmExecutor` based on its `runtime` field, and
+/// routes `stop`/`get_status`/`usage_summary` (which carry only a
+/// `workload_id`, not a runtime selector) by looking up the persisted
+/// `WorkloadRecord.runtime` in the `LocalState` both executors share --
+/// the same shared-storage design ADR-033 §3 already established
+/// (`VmExecutor::connect` takes the identical `Arc<LocalState>`
+/// `DockerExecutor::connect` does). This is the single place agent-cli's
+/// gRPC server needs to depend on to reach both execution backends
+/// through one `Arc<dyn Executor>` -- `agent_api::AgentGrpcServer` itself
+/// needs no changes.
+///
+/// `vm` is `None` when this Agent has VM support disabled
+/// (`ExecutorSettings::vm_enabled == false`, ADR-033 §7's separate
+/// operator opt-in) -- a VM-flavored deploy is then rejected explicitly
+/// with `ExecutorError::VmDisabled`, never silently routed to Docker
+/// (which would misinterpret `vm_image_url` as a Docker image reference)
+/// and never panicking.
+pub struct RoutingExecutor {
+    docker: Arc<dyn Executor>,
+    vm: Option<Arc<dyn Executor>>,
+    state: Arc<LocalState>,
+}
+
+impl RoutingExecutor {
+    pub fn new(
+        docker: Arc<dyn Executor>,
+        vm: Option<Arc<dyn Executor>>,
+        state: Arc<LocalState>,
+    ) -> Self {
+        Self { docker, vm, state }
+    }
+
+    /// The runtime a previously-persisted workload_id was deployed under,
+    /// or `None` for a workload_id this Agent has never heard of.
+    fn runtime_of(&self, workload_id: &str) -> Option<WorkloadRuntime> {
+        self.state.workload(workload_id).ok().map(|r| r.runtime)
+    }
+
+    /// `stop`/`get_status`/`usage_summary` all fall back to the Docker
+    /// executor for an unknown workload_id (`runtime_of` returned `None`)
+    /// -- matching every one of those three methods' own existing
+    /// behavior for an unknown id already (Docker's `stop` is an
+    /// idempotent no-op for one; `get_status`/`usage_summary` surface the
+    /// identical `WorkloadNotFound` from either executor), so which one
+    /// answers does not change the outcome.
+    fn executor_for(&self, runtime: Option<WorkloadRuntime>) -> Result<&Arc<dyn Executor>> {
+        match runtime {
+            Some(WorkloadRuntime::Vm) => self
+                .vm
+                .as_ref()
+                .ok_or_else(|| ExecutorError::VmDisabled.into()),
+            _ => Ok(&self.docker),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for RoutingExecutor {
+    async fn deploy(&self, req: DeployRequest) -> Result<String> {
+        // RUNTIME_UNSPECIFIED (proto3 default -- every DeployRequest built
+        // before this field existed) and an unrecognized future enum
+        // value both fall through to the `_` arm below, deliberately: the
+        // safe default is always the already-heavily-tested Docker path,
+        // never an unverified guess that a request meant VM.
+        match agent_api::proto::Runtime::try_from(req.runtime) {
+            Ok(agent_api::proto::Runtime::Vm) => match &self.vm {
+                Some(vm) => vm.deploy(req).await,
+                None => Err(ExecutorError::VmDisabled.into()),
+            },
+            _ => self.docker.deploy(req).await,
+        }
+    }
+
+    async fn stop(&self, workload_id: &str) -> Result<()> {
+        let runtime = self.runtime_of(workload_id);
+        self.executor_for(runtime)?.stop(workload_id).await
+    }
+
+    async fn get_status(&self, workload_id: &str) -> Result<WorkloadStatus> {
+        let runtime = self.runtime_of(workload_id);
+        self.executor_for(runtime)?.get_status(workload_id).await
+    }
+
+    async fn usage_summary(
+        &self,
+        workload_id: &str,
+        now: u64,
+        max_period_seconds: u64,
+    ) -> Result<UsageSample> {
+        let runtime = self.runtime_of(workload_id);
+        self.executor_for(runtime)?
+            .usage_summary(workload_id, now, max_period_seconds)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,6 +1288,7 @@ mod tests {
                 egress_mbps: 0,
             }),
             lease_end: Some(future_lease_end()),
+            ..Default::default()
         }
     }
 
@@ -1954,6 +2052,7 @@ mod tests {
                 egress_mbps: 0,
             }),
             lease_end: Some(future_lease_end()),
+            ..Default::default()
         };
         let container_id = executor.deploy(request.clone()).await.expect("deploy");
         let docker = Docker::connect_with_local_defaults().expect("Docker client");
@@ -2249,6 +2348,7 @@ mod tests {
                 egress_mbps: 0,
             }),
             lease_end: Some(future_lease_end()),
+            ..Default::default()
         };
         let container_id = executor.deploy(request.clone()).await.expect("deploy");
 
@@ -2413,5 +2513,286 @@ mod tests {
             .remove_container(&container_id, None)
             .await
             .expect("clean up the container this test created");
+    }
+}
+
+/// ADR-033 §9 / issue #168 point 3: regression tests proving
+/// `RoutingExecutor` actually dispatches by runtime -- a VM-flavored
+/// request reaches the VM executor, a container-flavored request (or one
+/// predating the `runtime` field entirely) still reaches the Docker
+/// executor unchanged, and `stop`/`get_status`/`usage_summary` route by
+/// the persisted `WorkloadRecord.runtime`, not by guessing.
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct FakeExecutor {
+        deployed: StdMutex<Vec<DeployRequest>>,
+        stopped: StdMutex<Vec<String>>,
+        status_calls: StdMutex<Vec<String>>,
+        usage_calls: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Executor for FakeExecutor {
+        async fn deploy(&self, req: DeployRequest) -> Result<String> {
+            let handle = format!("handle-{}", req.workload_id);
+            self.deployed.lock().expect("deployed lock").push(req);
+            Ok(handle)
+        }
+
+        async fn stop(&self, workload_id: &str) -> Result<()> {
+            self.stopped
+                .lock()
+                .expect("stopped lock")
+                .push(workload_id.to_string());
+            Ok(())
+        }
+
+        async fn get_status(&self, workload_id: &str) -> Result<WorkloadStatus> {
+            self.status_calls
+                .lock()
+                .expect("status lock")
+                .push(workload_id.to_string());
+            Ok(WorkloadStatus {
+                state: State::Running as i32,
+                details: "fake".to_string(),
+            })
+        }
+
+        async fn usage_summary(
+            &self,
+            workload_id: &str,
+            _now: u64,
+            _max_period_seconds: u64,
+        ) -> Result<UsageSample> {
+            self.usage_calls
+                .lock()
+                .expect("usage lock")
+                .push(workload_id.to_string());
+            Ok(UsageSample {
+                lease_id: "lease".to_string(),
+                sequence: 0,
+                period_start: 0,
+                period_end: 0,
+                cpu_core_seconds: 0,
+                ram_mb_seconds: 0,
+                storage_gb_seconds: 0,
+                network_egress_mb: 0,
+                network_ingress_mb: 0,
+                gpu_seconds: 0,
+            })
+        }
+    }
+
+    fn container_request(workload_id: &str, runtime: i32) -> DeployRequest {
+        DeployRequest {
+            workload_id: workload_id.to_string(),
+            lease_id: Uuid::new_v4().to_string(),
+            image: "busybox:1.36".to_string(),
+            limits: Some(agent_api::proto::ResourceLimits {
+                cpu_cores: 1.0,
+                memory_mb: 256,
+                egress_mbps: 0,
+            }),
+            lease_end: Some(prost_types::Timestamp {
+                seconds: 4_102_444_800,
+                nanos: 0,
+            }),
+            runtime,
+            vm: None,
+        }
+    }
+
+    fn vm_request(workload_id: &str) -> DeployRequest {
+        DeployRequest {
+            workload_id: workload_id.to_string(),
+            lease_id: Uuid::new_v4().to_string(),
+            image: String::new(),
+            limits: Some(agent_api::proto::ResourceLimits {
+                cpu_cores: 2.0,
+                memory_mb: 1024,
+                egress_mbps: 0,
+            }),
+            lease_end: Some(prost_types::Timestamp {
+                seconds: 4_102_444_800,
+                nanos: 0,
+            }),
+            runtime: agent_api::proto::Runtime::Vm as i32,
+            vm: Some(agent_api::proto::VmSpec {
+                vm_image_url: "https://example.com/image.qcow2".to_string(),
+                vm_image_sha256: "a".repeat(64),
+            }),
+        }
+    }
+
+    fn record(workload_id: &str, runtime: WorkloadRuntime) -> WorkloadRecord {
+        WorkloadRecord {
+            workload_id: workload_id.to_string(),
+            lease_id: Uuid::new_v4().to_string(),
+            image: "irrelevant".to_string(),
+            spec_hash: [0u8; 32],
+            container_id: (runtime == WorkloadRuntime::Container).then(|| "c-1".to_string()),
+            vm_handle: (runtime == WorkloadRuntime::Vm).then(|| "/tmp/v-1.sock".to_string()),
+            runtime,
+            phase: WorkloadPhase::Running,
+            egress_mbps: 0,
+            rate_limited: false,
+            lease_end: Some(4_102_444_800),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vm_flavored_deploy_reaches_the_vm_executor_and_never_touches_docker() {
+        let directory = tempfile::tempdir().expect("dir");
+        let state = Arc::new(LocalState::open(directory.path()).expect("state"));
+        let docker = Arc::new(FakeExecutor::default());
+        let vm = Arc::new(FakeExecutor::default());
+        let router = RoutingExecutor::new(docker.clone(), Some(vm.clone()), state);
+
+        let workload_id = Uuid::new_v4().to_string();
+        let handle = router
+            .deploy(vm_request(&workload_id))
+            .await
+            .expect("VM deploy must succeed");
+
+        assert_eq!(handle, format!("handle-{workload_id}"));
+        assert_eq!(vm.deployed.lock().expect("lock").len(), 1);
+        assert!(
+            docker.deployed.lock().expect("lock").is_empty(),
+            "a VM-flavored DeployRequest must never reach the Docker executor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_container_flavored_deploy_still_reaches_docker_unchanged() {
+        let directory = tempfile::tempdir().expect("dir");
+        let state = Arc::new(LocalState::open(directory.path()).expect("state"));
+        let docker = Arc::new(FakeExecutor::default());
+        let vm = Arc::new(FakeExecutor::default());
+        let router = RoutingExecutor::new(docker.clone(), Some(vm.clone()), state);
+
+        // Both RUNTIME_UNSPECIFIED (0 -- what every pre-ADR-033
+        // DeployRequest carries) and an explicit RUNTIME_CONTAINER must
+        // land on Docker, unchanged from before this routing layer
+        // existed.
+        for (label, runtime) in [
+            ("unspecified", 0),
+            (
+                "explicit container",
+                agent_api::proto::Runtime::Container as i32,
+            ),
+        ] {
+            let workload_id = Uuid::new_v4().to_string();
+            let handle = router
+                .deploy(container_request(&workload_id, runtime))
+                .await
+                .unwrap_or_else(|error| panic!("{label} deploy must succeed: {error}"));
+            assert_eq!(handle, format!("handle-{workload_id}"), "{label}");
+        }
+        assert_eq!(docker.deployed.lock().expect("lock").len(), 2);
+        assert!(vm.deployed.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_vm_flavored_deploy_is_rejected_explicitly_when_vm_support_is_disabled() {
+        let directory = tempfile::tempdir().expect("dir");
+        let state = Arc::new(LocalState::open(directory.path()).expect("state"));
+        let docker = Arc::new(FakeExecutor::default());
+        // No VM executor configured -- ADR-033 §7's separate operator
+        // opt-in was never granted.
+        let router = RoutingExecutor::new(docker.clone(), None, state);
+
+        let result = router.deploy(vm_request(&Uuid::new_v4().to_string())).await;
+        let error = result.expect_err("a VM deploy with no VM executor configured must fail");
+        assert!(
+            matches!(
+                error.downcast_ref::<ExecutorError>(),
+                Some(ExecutorError::VmDisabled)
+            ),
+            "expected ExecutorError::VmDisabled, got: {error:?}"
+        );
+        assert!(docker.deployed.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_and_status_and_usage_route_by_the_persisted_workload_runtime() {
+        let directory = tempfile::tempdir().expect("dir");
+        let state = Arc::new(LocalState::open(directory.path()).expect("state"));
+        let container_workload = Uuid::new_v4().to_string();
+        let vm_workload = Uuid::new_v4().to_string();
+        state
+            .reserve_workload(&record(&container_workload, WorkloadRuntime::Container), 8)
+            .expect("reserve container workload");
+        state
+            .reserve_workload(&record(&vm_workload, WorkloadRuntime::Vm), 8)
+            .expect("reserve VM workload");
+
+        let docker = Arc::new(FakeExecutor::default());
+        let vm = Arc::new(FakeExecutor::default());
+        let router = RoutingExecutor::new(docker.clone(), Some(vm.clone()), state);
+
+        router
+            .stop(&container_workload)
+            .await
+            .expect("stop container");
+        router.stop(&vm_workload).await.expect("stop vm");
+        router
+            .get_status(&container_workload)
+            .await
+            .expect("status container");
+        router.get_status(&vm_workload).await.expect("status vm");
+        router
+            .usage_summary(&container_workload, 1_700_000_000, 3600)
+            .await
+            .expect("usage container");
+        router
+            .usage_summary(&vm_workload, 1_700_000_000, 3600)
+            .await
+            .expect("usage vm");
+
+        assert_eq!(
+            docker.stopped.lock().expect("lock").as_slice(),
+            std::slice::from_ref(&container_workload)
+        );
+        assert_eq!(
+            vm.stopped.lock().expect("lock").as_slice(),
+            std::slice::from_ref(&vm_workload)
+        );
+        assert_eq!(
+            docker.status_calls.lock().expect("lock").as_slice(),
+            std::slice::from_ref(&container_workload)
+        );
+        assert_eq!(
+            vm.status_calls.lock().expect("lock").as_slice(),
+            std::slice::from_ref(&vm_workload)
+        );
+        assert_eq!(
+            docker.usage_calls.lock().expect("lock").as_slice(),
+            &[container_workload]
+        );
+        assert_eq!(
+            vm.usage_calls.lock().expect("lock").as_slice(),
+            &[vm_workload]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_and_status_for_an_unknown_workload_default_to_docker() {
+        let directory = tempfile::tempdir().expect("dir");
+        let state = Arc::new(LocalState::open(directory.path()).expect("state"));
+        let docker = Arc::new(FakeExecutor::default());
+        let vm = Arc::new(FakeExecutor::default());
+        let router = RoutingExecutor::new(docker.clone(), Some(vm.clone()), state);
+
+        router
+            .stop("never-heard-of-this-workload")
+            .await
+            .expect("stop of an unknown id");
+
+        assert_eq!(docker.stopped.lock().expect("lock").len(), 1);
+        assert!(vm.stopped.lock().expect("lock").is_empty());
     }
 }
