@@ -36,9 +36,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/openstackapi/keystone"
+	"github.com/openinfra/network/internal/openstackapi/nova"
 	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/userauth"
+	"github.com/openinfra/network/internal/workloadapi"
 )
 
 // RateLimiter is satisfied by internal/ratelimit.RedisLimiter -- named
@@ -55,6 +58,7 @@ type RateLimiter interface {
 type Server struct {
 	pool     *pgxpool.Pool
 	keystone *keystone.Server
+	nova     *nova.Server
 	limiter  RateLimiter
 }
 
@@ -66,10 +70,20 @@ type Server struct {
 // real-work-per-request route on this surface, the same shape
 // internal/dashboard's authChallenge/authLogin rate limiting already
 // follows.
-func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, baseURL string, limiter RateLimiter) *Server {
+//
+// workloads/workloadStore/directory are #24's addition (internal/
+// openstackapi/nova): the exact *workloadapi.Service, *workloadapi.
+// PostgresRepository, and *agentmanager.Directory instances
+// cmd/controlplane/main.go already constructs and shares with the gRPC
+// ControlPlaneService, internal/dashboard, and internal/orchestrator --
+// so a Nova-created server runs through the identical
+// validation/scheduling/deploy path any other workload does, per
+// ADR-031 §4's "no parallel execution model."
+func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, workloads *workloadapi.Service, workloadStore *workloadapi.PostgresRepository, directory *agentmanager.Directory, baseURL string, limiter RateLimiter) *Server {
 	return &Server{
 		pool:     pool,
 		keystone: keystone.New(users, projectsRepo, baseURL, newAuditRecorder(pool)),
+		nova:     nova.New(pool, users, projectsRepo, workloads, workloadStore, directory, nova.DefaultFlavors),
 		limiter:  limiter,
 	}
 }
@@ -84,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
 	s.keystone.Register(mux)
+	s.nova.Register(mux)
 	return rateLimitTokenIssuance(s.limiter, securityHeaders(mux))
 }
 

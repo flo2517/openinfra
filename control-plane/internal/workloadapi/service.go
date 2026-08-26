@@ -37,7 +37,17 @@ type Workload struct {
 	// 000009 -- those are permanently unreachable through the
 	// authenticated user API by design, not a bug; see that migration's
 	// comment.
-	OwnerID                                     string
+	OwnerID string
+	// ProjectID is the Keystone-compatible project (ADR-031 §3,
+	// internal/projects) this workload is scoped to, when it was created
+	// through internal/openstackapi/nova. Empty for every workload created
+	// through the gRPC ControlPlaneService or the dashboard's tenant-tier
+	// submit path directly (neither sets WithProjectID on the context) --
+	// the same "extended, not replaced" relationship ADR-031 §3 describes
+	// between this column and OwnerID: a workload always has an OwnerID,
+	// and additionally has a ProjectID only when created via the OpenStack
+	// surface.
+	ProjectID                                   string
 	StopRequestID                               string
 	RequestHash                                 [32]byte
 	ResourceHash                                [32]byte
@@ -132,6 +142,13 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 	if err != nil {
 		return nil, err
 	}
+	// projectID is optional: only internal/openstackapi/nova's server-create
+	// handler ever calls WithProjectID before reaching here (see that
+	// function's doc comment); every other caller of SubmitWorkload
+	// (gRPC ControlPlaneService, the dashboard's tenant-tier submit) leaves
+	// it unset, producing the same ProjectID-less Workload row this method
+	// has always created.
+	projectID, _ := projectIDFromContext(ctx)
 	definitionBytes, requestHash, err := validateSubmission(request)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -147,6 +164,7 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 		WorkloadID:            request.Definition.WorkloadId,
 		RequestID:             request.RequestId,
 		OwnerID:               ownerID,
+		ProjectID:             projectID,
 		RequestHash:           requestHash,
 		Definition:            definitionBytes,
 		Image:                 request.Image,
@@ -285,6 +303,25 @@ func requireOwner(ctx context.Context) (string, error) {
 		return "", status.Error(codes.Unauthenticated, "an authenticated caller is required")
 	}
 	return ownerID, nil
+}
+
+type projectIDContextKey struct{}
+
+// WithProjectID attaches a Keystone-compatible project scope (ADR-031 §3)
+// to ctx, for SubmitWorkload to record on the created Workload row --
+// mirrors userauth.WithUserID's exact shape. Called only by
+// internal/openstackapi/nova's server-create handler, alongside
+// userauth.WithUserID(ctx, callerUserID): the two are independent (a
+// caller always has a user ID; a project ID is only present when the
+// request came in on a project-scoped token), matching how OwnerID and
+// ProjectID coexist on Workload itself.
+func WithProjectID(ctx context.Context, projectID string) context.Context {
+	return context.WithValue(ctx, projectIDContextKey{}, projectID)
+}
+
+func projectIDFromContext(ctx context.Context) (string, bool) {
+	projectID, ok := ctx.Value(projectIDContextKey{}).(string)
+	return projectID, ok && projectID != ""
 }
 
 func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, [32]byte, error) {

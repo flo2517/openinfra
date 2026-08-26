@@ -91,21 +91,25 @@ func tokenResponseBody(baseURL string, user userauth.User, method string, issued
 		if role != "" {
 			body.Roles = []roleBody{{ID: role, Name: keystoneRoleName(role)}}
 		}
-		body.Catalog = serviceCatalog(baseURL)
+		body.Catalog = serviceCatalog(baseURL, project.ProjectID)
 	}
 	return tokenResponse{Token: body}
 }
 
 // serviceCatalog is ADR-031 §3's static, Control-Plane-config-driven
 // catalog: one entry per implemented service, pointing at this Control
-// Plane's own internal/openstackapi base URL. Today that is exactly one
-// service -- identity -- since #24 (compute), #25 (networking), and #26
-// (storage) have not landed; a future PR adds its own entry here (or,
-// more likely, this function grows a small registry future packages
-// append to) rather than this package guessing at endpoints that don't
-// exist yet.
-func serviceCatalog(baseURL string) []catalogEntryBody {
-	return []catalogEntryBody{
+// Plane's own internal/openstackapi base URL. identity is always
+// present; compute (#24's internal/openstackapi/nova) and placement (#24,
+// same package) are added once a project is actually scoped (projectID
+// non-empty -- serviceCatalog is only ever called from that branch, see
+// tokenResponseBody above), since Nova's own 2.1-baseline URL shape is
+// itself project-prefixed (/v2.1/{project_id}/...) and there is no
+// meaningful compute endpoint to advertise for an unscoped token. #25
+// (networking) and #26 (storage) have not landed; a future PR adds its
+// own entries here rather than this package guessing at endpoints that
+// don't exist yet.
+func serviceCatalog(baseURL, projectID string) []catalogEntryBody {
+	entries := []catalogEntryBody{
 		{
 			ID:   "identity",
 			Type: "identity",
@@ -115,4 +119,31 @@ func serviceCatalog(baseURL string) []catalogEntryBody {
 			},
 		},
 	}
+	if projectID != "" {
+		entries = append(entries,
+			catalogEntryBody{
+				ID:   "compute",
+				Type: "compute",
+				Name: "nova",
+				Endpoints: []endpointBody{
+					{ID: "compute-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v2.1/" + projectID},
+				},
+			},
+			catalogEntryBody{
+				ID:   "placement",
+				Type: "placement",
+				Name: "placement",
+				Endpoints: []endpointBody{
+					// Real Placement's own URL shape is flat, not
+					// project-prefixed (its resources -- resource
+					// providers, allocations -- are not themselves
+					// project-scoped objects the way a Nova server is;
+					// see internal/openstackapi/nova/placement.go's own
+					// doc comments on this).
+					{ID: "placement-public", Interface: "public", Region: "RegionOne", URL: baseURL},
+				},
+			},
+		)
+	}
+	return entries
 }
