@@ -34,4 +34,36 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 OPENINFRA_TEST_DOCKER_IMAGE=<local-image> cargo test -p agent-executor docker_integration_applies_mandatory_controls
 OPENINFRA_TEST_DOCKER_PULL_IMAGE=<not-yet-pulled-image> cargo test -p agent-executor docker_integration_pulls_a_missing_image_before_create
+OPENINFRA_TEST_DOCKER_NETWORK_TOOLS_IMAGE=busybox:1.36 cargo test -p agent-executor docker_integration_isolates_workload_containers_from_each_other
+OPENINFRA_TEST_DOCKER_IMAGE=<local-image> cargo test -p agent-executor docker_integration_veth_resolution_survives_the_isolated_network
 ```
+
+## Workload Network Isolation
+
+Every workload container is created with `HostConfig.NetworkMode` set to a dedicated
+`openinfra-workloads` bridge network instead of joining Docker's implicit default bridge --
+`BollardEngine::create` ensures this network exists (idempotently, creating it with
+`com.docker.network.bridge.enable_icc=false` on first use) before every genuinely new container.
+Two workload containers on this network -- which may belong to two unrelated tenants -- can each
+still reach the outside world (an ordinary NAT'd bridge, not `internal: true`), but Docker refuses
+to forward traffic *between* them, closing the cross-tenant reachability gap the default bridge
+otherwise leaves open (issue #174).
+
+This is orthogonal to ADR-010's WireGuard-attach path: that backend resolves a workload's veth by
+matching its container PID's `eth0` `iflink` against a host-side interface (`bandwidth.rs`'s own
+`resolve_veth_name`, also used by ADR-025's `tc` rate-limit enforcement) -- a mechanism that
+operates on the container's network *namespace* directly and has no dependency on which Docker
+bridge that namespace's `eth0` happens to be attached to.
+
+`docker-socket-proxy` (`deployments/docker-compose.yml`) needs its `NETWORKS` allow-flag set for
+the Agent to create/inspect this network through the proxy; `CONTAINERS`/`POST` alone are not
+enough (each resource category is an independent allow-list in tecnativa's proxy).
+
+For `OPENINFRA_TEST_DOCKER_IMAGE` above: use an image whose *own default command* keeps running
+(e.g. `registry.k8s.io/pause`) for `docker_integration_applies_mandatory_controls` and
+`docker_integration_veth_resolution_survives_the_isolated_network`, which go through the real
+`deploy()` path and therefore never override it. `docker_integration_isolates_workload_containers_
+from_each_other` is different: it sets an explicit `Cmd` on two disposable probe containers via raw
+bollard (not through `deploy()`), so it instead needs an image with BusyBox's `nc` applet, via its
+own `OPENINFRA_TEST_DOCKER_NETWORK_TOOLS_IMAGE` var -- one image cannot satisfy both requirements at
+once.
