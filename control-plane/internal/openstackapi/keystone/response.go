@@ -98,12 +98,14 @@ func tokenResponseBody(baseURL string, user userauth.User, method string, issued
 
 // serviceCatalog is ADR-031 §3's static, Control-Plane-config-driven
 // catalog: one entry per implemented service, pointing at this Control
-// Plane's own internal/openstackapi base URL. "network" was added by
-// ADR-031 §5/§8's QoS/AZ mapping slice (internal/openstackapi/neutron) --
-// #24 (compute) and #26 (storage) have not landed yet; a future PR adds
-// its own entry here (or, more likely, this function grows a small
-// registry future packages append to) rather than this package guessing
-// at endpoints that don't exist yet.
+// Plane's own internal/openstackapi base URL. #24 (compute) has not
+// landed; "network" was added by ADR-031 §5/§8's QoS/AZ mapping slice
+// (internal/openstackapi/neutron), and #26's Glance subset (image
+// registry only -- Cinder's block-volume half is issue #171, gated
+// behind ADR-034) added "image", so both join "identity" below. A
+// future PR adds its own entry here (or, more likely, this function
+// grows a small registry future packages append to) rather than this
+// package guessing at endpoints that don't exist yet.
 func serviceCatalog(baseURL string) []catalogEntryBody {
 	return []catalogEntryBody{
 		{
@@ -120,6 +122,14 @@ func serviceCatalog(baseURL string) []catalogEntryBody {
 			Name: "neutron",
 			Endpoints: []endpointBody{
 				{ID: "network-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v2.0"},
+			},
+		},
+		{
+			ID:   "image",
+			Type: "image",
+			Name: "glance",
+			Endpoints: []endpointBody{
+				{ID: "image-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v2"},
 			},
 		},
 	}
