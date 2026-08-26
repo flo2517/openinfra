@@ -33,6 +33,24 @@ the order below, top to bottom.
 ALTER TABLE workloads DROP COLUMN IF EXISTS vm_image_sha256;
 ```
 
+## 000017_projects_and_quotas.sql
+Precondition: no `api_keys` or `workloads` row currently has `project_id` set
+to a project this rollback is about to delete transitively via `DROP TABLE
+projects` failing on the FK -- in practice this means rolling back 000017
+only makes sense against an empty/fresh scratch database (suite 30's case),
+the same caveat 000009's section below already states for `users`/
+`workloads.owner_id`.
+```sql
+DROP INDEX IF EXISTS api_keys_project_idx;
+ALTER TABLE api_keys DROP COLUMN IF EXISTS project_id;
+DROP INDEX IF EXISTS workloads_project_idx;
+ALTER TABLE workloads DROP COLUMN IF EXISTS project_id;
+DROP TABLE IF EXISTS project_quotas;
+DROP TABLE IF EXISTS project_memberships;
+DROP INDEX IF EXISTS projects_name_idx;
+DROP TABLE IF EXISTS projects;
+```
+
 ## 000016_metering_evidence_and_invoices.sql
 Drop order matters here (no `CASCADE`): `metering_disputes` references
 `invoice_lines`, which references `metering_evidence`; the other two new

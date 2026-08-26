@@ -25,17 +25,25 @@ func (r fakeRepository) CreateAPIKey(context.Context, string) (userauth.APIKey, 
 func (r fakeRepository) CreateAPIKeyWithExpiry(context.Context, string, *time.Time) (userauth.APIKey, error) {
 	panic("unused")
 }
-func (r fakeRepository) RevokeAPIKey(context.Context, string) error    { panic("unused") }
-func (r fakeRepository) SetRole(context.Context, string, string) error { panic("unused") }
-func (r fakeRepository) Authenticate(_ context.Context, hash [32]byte) (userauth.User, error) {
+func (r fakeRepository) CreateAPIKeyForProject(context.Context, string, string, *time.Time) (userauth.APIKey, error) {
+	panic("unused")
+}
+func (r fakeRepository) RevokeAPIKey(context.Context, string) error         { panic("unused") }
+func (r fakeRepository) RevokeAPIKeyByHash(context.Context, [32]byte) error { panic("unused") }
+func (r fakeRepository) SetRole(context.Context, string, string) error      { panic("unused") }
+func (r fakeRepository) Authenticate(ctx context.Context, hash [32]byte) (userauth.User, error) {
+	user, _, err := r.AuthenticateScoped(ctx, hash)
+	return user, err
+}
+func (r fakeRepository) AuthenticateScoped(_ context.Context, hash [32]byte) (userauth.User, *string, error) {
 	if r.err != nil {
-		return userauth.User{}, r.err
+		return userauth.User{}, nil, r.err
 	}
 	user, ok := r.users[hash]
 	if !ok {
-		return userauth.User{}, userauth.ErrInvalidKey
+		return userauth.User{}, nil, userauth.ErrInvalidKey
 	}
-	return user, nil
+	return user, nil, nil
 }
 
 type fakeLimiter struct {
