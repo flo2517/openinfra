@@ -874,6 +874,7 @@ mod tests {
             image: "busybox:1.36".to_string(),
             limits: None,
             lease_end: None,
+            ..Default::default()
         });
         let deploy_server = server.clone();
         let handle = tokio::spawn(async move { deploy_server.deploy(request).await });
@@ -911,6 +912,7 @@ mod tests {
             image: "busybox:1.36".to_string(),
             limits: None,
             lease_end: None,
+            ..Default::default()
         });
         let status = server
             .deploy(request)

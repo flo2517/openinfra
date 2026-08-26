@@ -1,0 +1,18 @@
+-- ADR-033 §4/§9, issues #166/#168: a VM workload (definition.constraints.
+-- requires_vm = true) reuses the existing `image` column for its qcow2
+-- HTTPS URL (there is no OCI registry concept for a raw disk image, so
+-- the OCI-digest shape `workloadapi.digestImage` enforces for a container
+-- workload does not apply) and needs a place to persist the paired
+-- SHA-256 digest the Agent verifies before ever booting the image
+-- (ADR-033 §4's "verified before the image is ever booted" discipline,
+-- mirroring issue #154/PR #155's Docker-side digest-pinning precedent).
+--
+-- Nullable, not NOT NULL: the overwhelming majority of workloads are
+-- ordinary container workloads that never populate this column at all --
+-- validateSubmission (internal/workloadapi/service.go) is what actually
+-- enforces "required when requires_vm is true", not a database
+-- constraint, matching how this schema already leaves ordinary
+-- container-only columns unconstrained at the SQL level and validates in
+-- Go instead (see e.g. resource_hash's own NULL-until-scheduled
+-- convention).
+ALTER TABLE workloads ADD COLUMN IF NOT EXISTS vm_image_sha256 text;

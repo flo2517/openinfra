@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,10 +29,20 @@ var (
 	// provider rather than treating it as a stale-read bug.
 	ErrCapacityExceeded = errors.New("provider capacity exceeded")
 	digestImage         = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9._-]+)?@sha256:[a-f0-9]{64}$`)
+	// ADR-033 §4: exactly 64 lowercase hex characters, matching
+	// agent-executor's own `image::validate_sha256_hex` shape on the
+	// Agent side of this same digest.
+	vmImageDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
 type Workload struct {
 	WorkloadID, RequestID, Image, State string
+	// VmImageSha256 is set only for a VM workload
+	// (Definition.Constraints.RequiresVm = true, ADR-033 §4/§9, issues
+	// #166/#168): the pinned SHA-256 digest of the qcow2 blob at Image,
+	// verified by the Agent before it is ever booted. Empty for an
+	// ordinary container workload.
+	VmImageSha256 string
 	// OwnerID is the authenticated tenant this workload belongs to (see
 	// internal/userauth). Empty for workloads created before migration
 	// 000009 -- those are permanently unreachable through the
@@ -150,6 +161,7 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 		RequestHash:           requestHash,
 		Definition:            definitionBytes,
 		Image:                 request.Image,
+		VmImageSha256:         request.VmImageSha256,
 		State:                 "REQUESTED",
 		CreatedAt:             now,
 		UpdatedAt:             now,
@@ -297,10 +309,29 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 	if _, err := uuid.Parse(request.Definition.WorkloadId); err != nil {
 		return nil, [32]byte{}, errors.New("workload_id must be a UUID")
 	}
-	if !digestImage.MatchString(request.Image) {
-		return nil, [32]byte{}, errors.New("image must be an OCI reference pinned by a lowercase sha256 digest")
-	}
 	definition := request.Definition
+	// ADR-033 §4/§9, issues #166/#168: a VM workload has no OCI registry
+	// concept to pin a digest against -- `image` is instead an HTTPS URL
+	// to a qcow2 blob, paired with the required vm_image_sha256 the Agent
+	// verifies before ever booting it (mirroring issue #154/PR #155's
+	// "never run before the artifact matches what was promised"
+	// discipline for the container path). An ordinary container workload
+	// is unaffected and keeps the existing OCI-digest requirement.
+	if definition.GetConstraints().GetRequiresVm() {
+		if !strings.HasPrefix(request.Image, "https://") {
+			return nil, [32]byte{}, errors.New("a VM workload's image must be an https:// URL")
+		}
+		if !vmImageDigest.MatchString(request.VmImageSha256) {
+			return nil, [32]byte{}, errors.New("vm_image_sha256 must be exactly 64 lowercase hex characters")
+		}
+	} else {
+		if !digestImage.MatchString(request.Image) {
+			return nil, [32]byte{}, errors.New("image must be an OCI reference pinned by a lowercase sha256 digest")
+		}
+		if request.VmImageSha256 != "" {
+			return nil, [32]byte{}, errors.New("vm_image_sha256 must not be set for a container workload")
+		}
+	}
 	if definition.Profile == sharedv1.WorkloadProfile_WORKLOAD_PROFILE_UNSPECIFIED {
 		return nil, [32]byte{}, errors.New("workload profile is required")
 	}
@@ -331,6 +362,8 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 	hash.Write(definitionBytes)
 	hash.Write([]byte{0})
 	hash.Write([]byte(request.Image))
+	hash.Write([]byte{0})
+	hash.Write([]byte(request.VmImageSha256))
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))
 	return definitionBytes, result, nil

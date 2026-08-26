@@ -22,15 +22,35 @@
 //! `CloudHypervisorEngine`'s request-building/response-interpretation
 //! logic against a `FakeTransport` double -- see this module's tests.
 //!
-//! **Security baseline not yet wired here** (ADR-033 §6, named as a
-//! follow-up in the implementing PR's own report, not silently dropped):
-//! the mandatory seccomp policy, the dedicated unprivileged VMM user, and
-//! the capability drop to exactly `CAP_NET_ADMIN` + `/dev/kvm` access are
-//! real `cloud-hypervisor` command-line/process-launch concerns
-//! (`--seccomp`, running under a different uid/gid, Linux capability
-//! sets) that need to be exercised against a real binary to get right --
-//! `SystemVmmProcessSpawner::spawn` is the single, clearly marked call
-//! site to extend for this.
+//! **Security baseline (ADR-033 §6, issue #168 point 1)**: every
+//! `cloud-hypervisor` process this engine spawns is wrapped with
+//! `setpriv` (util-linux -- present on every mainstream Linux
+//! distribution this Agent targets, the same "reuse a narrowly-scoped,
+//! widely available mechanism" precedent `CommandRunner`'s `tc`
+//! invocation and `KvmProbe`'s raw ioctl already set, rather than a
+//! bespoke jailer binary or a new large dependency) that drops to a
+//! dedicated unprivileged user/group, clears every supplementary group
+//! except the one granting `/dev/kvm` access, narrows both the
+//! inheritable and bounding Linux capability sets to exactly
+//! `CAP_NET_ADMIN`, and sets `no_new_privs` -- see `VmmSecurityPolicy`.
+//! `cloud-hypervisor`'s own mandatory seccomp filter (`--seccomp true`)
+//! is passed explicitly rather than relied upon as a default, so a future
+//! upstream default change can't silently disable it here.
+//!
+//! **Honest limit on what this proves in this sandbox**: there is no
+//! `openinfra-vmm` user, no real `cloud-hypervisor` binary, and no
+//! working `/dev/kvm` access here (see `agent-inventory::kvm`'s own doc
+//! comment) -- an actual `setpriv`-wrapped `cloud-hypervisor` process has
+//! never been spawned and observed to have the reduced capability set on
+//! a real KVM host as part of this change. What *is* real and tested:
+//! `setpriv` itself is present in this build environment (verified with
+//! `which setpriv`) and `VmmSecurityPolicy::wrap`'s argv-building logic is
+//! exercised directly (`security_baseline` tests below) -- the exact
+//! flags a real invocation would receive, not a description of intent.
+//! Verifying the *effect* (that a spawned process genuinely ends up
+//! non-root with only `CAP_NET_ADMIN`) needs a real Linux host with a
+//! `setpriv`-capable root Agent process and is tracked as a follow-up
+//! (see this PR's description).
 
 use crate::ExecutorError;
 use async_trait::async_trait;
@@ -115,6 +135,87 @@ impl VmmTransport for UnixSocketTransport {
     }
 }
 
+/// ADR-033 §6: the mandatory VMM security baseline, applied to every
+/// spawned `cloud-hypervisor` process -- never optional, never a lighter
+/// posture than Docker's own `cap_drop: ["ALL"]` + `no-new-privileges:
+/// true` + dedicated-quota baseline. See this module's top doc comment
+/// for the mechanism (`setpriv`) and why it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmmSecurityPolicy {
+    /// Resolves via `PATH`, matching `cloud_hypervisor_binary`'s and
+    /// `SystemCommandRunner`'s own convention of not hardcoding an
+    /// absolute path.
+    pub setpriv_binary: PathBuf,
+    /// Dedicated unprivileged user the VMM process runs as -- never root,
+    /// never the Agent's own uid (ADR-033 §6's `no-new-privileges`
+    /// equivalent). The operator is responsible for provisioning this
+    /// account and its membership in `kvm_group` (deployment/operational
+    /// setup, not something this Agent process can create for itself
+    /// without already running as root).
+    pub user: String,
+    pub group: String,
+    /// The supplementary group granting `/dev/kvm` access (conventionally
+    /// `kvm` on most distributions' udev rules). `wrap` clears every other
+    /// supplementary group and adds back only this one -- `/dev/kvm`
+    /// access has no Linux-capability equivalent (it's a device-file
+    /// permission), so group membership is the actual mechanism, not an
+    /// approximation of one.
+    pub kvm_group: String,
+    /// Explicit, not left to `cloud-hypervisor`'s own default, so a
+    /// future upstream default change cannot silently disable it here.
+    pub seccomp: bool,
+}
+
+impl Default for VmmSecurityPolicy {
+    fn default() -> Self {
+        Self {
+            setpriv_binary: PathBuf::from("setpriv"),
+            user: "openinfra-vmm".to_string(),
+            group: "openinfra-vmm".to_string(),
+            kvm_group: "kvm".to_string(),
+            seccomp: true,
+        }
+    }
+}
+
+impl VmmSecurityPolicy {
+    /// Builds the full `setpriv`-wrapped command line for `binary
+    /// --api-socket api_socket`. Order matters and mirrors `setpriv(1)`'s
+    /// own documented precedent for this exact combination:
+    /// `--reuid`/`--regid` drop the real/effective/saved uid & gid first;
+    /// `--clear-groups` + `--groups` replaces the supplementary group list
+    /// with exactly `kvm_group` (nothing else survives); `--inh-caps`
+    /// *and* `--bounding-set` both narrow to `CAP_NET_ADMIN` (a capability
+    /// absent from either set cannot be used, so both must be narrowed,
+    /// not just one); `--no-new-privs` matches Docker's own
+    /// `no-new-privileges:true` `security_opt` exactly, so a compromised
+    /// VMM process can never regain privilege through a setuid binary.
+    /// `--seccomp` is passed explicitly (never left to
+    /// `cloud-hypervisor`'s own default) per this struct's own doc
+    /// comment.
+    fn build(&self, binary: &Path, api_socket: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.setpriv_binary);
+        command
+            .arg("--reuid")
+            .arg(&self.user)
+            .arg("--regid")
+            .arg(&self.group)
+            .arg("--clear-groups")
+            .arg("--groups")
+            .arg(&self.kvm_group)
+            .arg("--inh-caps=-all,+net_admin")
+            .arg("--bounding-set=-all,+net_admin")
+            .arg("--no-new-privs")
+            .arg("--")
+            .arg(binary)
+            .arg("--seccomp")
+            .arg(if self.seccomp { "true" } else { "false" })
+            .arg("--api-socket")
+            .arg(api_socket);
+        command
+    }
+}
+
 /// Spawns (and can kill) the `cloud-hypervisor` subprocess for one VM --
 /// abstracted the same way `CommandRunner` abstracts `tc`, so
 /// `CloudHypervisorEngine`'s lifecycle logic is testable without actually
@@ -133,15 +234,32 @@ pub trait VmmProcessHandle: Send + Sync {
     async fn kill(&mut self) -> Result<(), ExecutorError>;
 }
 
-/// The real spawner: `cloud-hypervisor --api-socket <path>` (no VM
-/// config on the command line -- the config is `PUT /vm.create`'d over
-/// the socket once it's up, matching Cloud Hypervisor's own documented
-/// integration path), then polls for the socket file to actually appear
-/// before returning, bounded by `SOCKET_READY_TIMEOUT` so a
-/// binary-not-found or slow-starting process can't hang `create()`
-/// indefinitely (the same bounded-wait discipline
+/// The real spawner: `setpriv`-wrapped `cloud-hypervisor --seccomp true
+/// --api-socket <path>` (no VM config on the command line -- the config
+/// is `PUT /vm.create`'d over the socket once it's up, matching Cloud
+/// Hypervisor's own documented integration path), then polls for the
+/// socket file to actually appear before returning, bounded by
+/// `SOCKET_READY_TIMEOUT` so a binary-not-found or slow-starting process
+/// can't hang `create()` indefinitely (the same bounded-wait discipline
 /// `BollardEngine::pull_image` already applies to a slow image pull).
-pub struct SystemVmmProcessSpawner;
+/// `policy` is ADR-033 §6's mandatory security baseline (see
+/// `VmmSecurityPolicy` and this module's top doc comment) -- never
+/// skippable, only its concrete user/group/binary path are configurable.
+pub struct SystemVmmProcessSpawner {
+    policy: VmmSecurityPolicy,
+}
+
+impl SystemVmmProcessSpawner {
+    pub fn new(policy: VmmSecurityPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for SystemVmmProcessSpawner {
+    fn default() -> Self {
+        Self::new(VmmSecurityPolicy::default())
+    }
+}
 
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -163,18 +281,18 @@ impl VmmProcessSpawner for SystemVmmProcessSpawner {
         // make this spawn's own readiness poll below observe a
         // pre-existing (but dead) file and return prematurely.
         let _ = tokio::fs::remove_file(api_socket).await;
-        // ADR-033 §6: the mandatory seccomp policy / dedicated
-        // unprivileged VMM user / capability drop belong on this exact
-        // command line -- not yet wired here, see this module's top doc
-        // comment.
-        let child = tokio::process::Command::new(binary)
-            .arg("--api-socket")
-            .arg(api_socket)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                ExecutorError::Engine(format!("spawning {}: {error}", binary.display()))
-            })?;
+        // ADR-033 §6: every cloud-hypervisor process is wrapped by
+        // VmmSecurityPolicy::build -- see this module's top doc comment
+        // and VmmSecurityPolicy's own doc comment for exactly what this
+        // command line drops/narrows.
+        let mut command: tokio::process::Command = self.policy.build(binary, api_socket).into();
+        let child = command.kill_on_drop(true).spawn().map_err(|error| {
+            ExecutorError::Engine(format!(
+                "spawning {} (via {}): {error}",
+                binary.display(),
+                self.policy.setpriv_binary.display()
+            ))
+        })?;
         let deadline = tokio::time::Instant::now() + SOCKET_READY_TIMEOUT;
         while !api_socket.exists() {
             if tokio::time::Instant::now() >= deadline {
@@ -221,12 +339,22 @@ pub struct CloudHypervisorEngine {
 }
 
 impl CloudHypervisorEngine {
-    pub fn connect(binary: PathBuf, sockets_dir: PathBuf, firmware_path: PathBuf) -> Self {
+    /// `security_policy` is ADR-033 §6's mandatory VMM security baseline
+    /// (see `VmmSecurityPolicy`) -- there is no variant of `connect` that
+    /// skips it; a caller who wants the defaults passes
+    /// `VmmSecurityPolicy::default()` explicitly, matching Docker's own
+    /// non-optional `cap_drop: ["ALL"]`/`no-new-privileges:true` baseline.
+    pub fn connect(
+        binary: PathBuf,
+        sockets_dir: PathBuf,
+        firmware_path: PathBuf,
+        security_policy: VmmSecurityPolicy,
+    ) -> Self {
         Self::with_parts(
             binary,
             sockets_dir,
             firmware_path,
-            Arc::new(SystemVmmProcessSpawner),
+            Arc::new(SystemVmmProcessSpawner::new(security_policy)),
             Arc::new(|socket_path: PathBuf| -> Arc<dyn VmmTransport> {
                 Arc::new(UnixSocketTransport::new(socket_path))
             }),
@@ -386,6 +514,107 @@ impl VmEngine for CloudHypervisorEngine {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    // --- ADR-033 §6 security baseline: VmmSecurityPolicy::build's argv,
+    // asserted field-by-field. This is the "real, not just documented"
+    // half named in this module's top doc comment -- what's NOT proven
+    // here is that a real setpriv + cloud-hypervisor process, run on a
+    // real Linux host with a real openinfra-vmm user, actually ends up
+    // with exactly CAP_NET_ADMIN and no more; that needs a real host (see
+    // this PR's own description for the follow-up).
+
+    fn args(command: &std::process::Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn security_baseline_wraps_the_vmm_with_setpriv_dropping_to_the_dedicated_user() {
+        let policy = VmmSecurityPolicy::default();
+        let command = policy.build(
+            Path::new("/usr/local/bin/cloud-hypervisor"),
+            Path::new("/tmp/wl-1.sock"),
+        );
+
+        assert_eq!(command.get_program().to_string_lossy(), "setpriv");
+        let argv = args(&command);
+        assert_eq!(
+            argv,
+            vec![
+                "--reuid",
+                "openinfra-vmm",
+                "--regid",
+                "openinfra-vmm",
+                "--clear-groups",
+                "--groups",
+                "kvm",
+                "--inh-caps=-all,+net_admin",
+                "--bounding-set=-all,+net_admin",
+                "--no-new-privs",
+                "--",
+                "/usr/local/bin/cloud-hypervisor",
+                "--seccomp",
+                "true",
+                "--api-socket",
+                "/tmp/wl-1.sock",
+            ]
+        );
+    }
+
+    #[test]
+    fn security_baseline_never_grants_more_than_net_admin_even_with_custom_accounts() {
+        // A deployment-configured user/group must still narrow to exactly
+        // CAP_NET_ADMIN -- the capability strings are not derived from
+        // user/group at all, so a custom account can never widen them.
+        let policy = VmmSecurityPolicy {
+            setpriv_binary: PathBuf::from("/usr/bin/setpriv"),
+            user: "vmm-provider-7".to_string(),
+            group: "vmm-provider-7".to_string(),
+            kvm_group: "kvm-restricted".to_string(),
+            seccomp: true,
+        };
+        let command = policy.build(Path::new("cloud-hypervisor"), Path::new("wl.sock"));
+        let argv = args(&command);
+        assert!(argv.contains(&"vmm-provider-7".to_string()));
+        assert!(argv.contains(&"kvm-restricted".to_string()));
+        assert!(argv.contains(&"--inh-caps=-all,+net_admin".to_string()));
+        assert!(argv.contains(&"--bounding-set=-all,+net_admin".to_string()));
+        assert!(argv.contains(&"--no-new-privs".to_string()));
+    }
+
+    #[test]
+    fn security_baseline_passes_seccomp_explicitly_never_relying_on_a_default() {
+        let enabled = VmmSecurityPolicy::default();
+        assert!(
+            args(&enabled.build(Path::new("cloud-hypervisor"), Path::new("wl.sock")))
+                .windows(2)
+                .any(|pair| pair == ["--seccomp", "true"])
+        );
+
+        let disabled = VmmSecurityPolicy {
+            seccomp: false,
+            ..VmmSecurityPolicy::default()
+        };
+        assert!(
+            args(&disabled.build(Path::new("cloud-hypervisor"), Path::new("wl.sock")))
+                .windows(2)
+                .any(|pair| pair == ["--seccomp", "false"])
+        );
+    }
+
+    #[test]
+    fn setpriv_binary_is_present_in_this_build_environment() {
+        // Not a claim that a real cloud-hypervisor process was ever
+        // wrapped and spawned with it (see this module's top doc
+        // comment) -- only that the mechanism this security baseline
+        // depends on is not itself missing/hypothetical here.
+        let found = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).any(|dir| dir.join("setpriv").is_file()))
+            .unwrap_or(false);
+        assert!(found, "setpriv (util-linux) not found on PATH");
+    }
 
     // --- CloudHypervisorEngine request-building / response-parsing
     // tests, against a FakeTransport (no real socket, no real process).
