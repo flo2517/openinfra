@@ -117,6 +117,12 @@ type APIKey struct {
 	Raw       string
 	CreatedAt time.Time
 	ExpiresAt *time.Time
+	// ProjectID is set only for a key minted by CreateAPIKeyForProject
+	// (ADR-031 §3's Keystone-token bridge) -- nil for every key created
+	// through the pre-existing CreateAPIKey/CreateAPIKeyWithExpiry paths,
+	// which describe an unscoped credential exactly as before this field
+	// was added.
+	ProjectID *string
 }
 
 // GenerateAPIKey mints a new random credential and its storable hash.
@@ -157,12 +163,37 @@ type Repository interface {
 	// stops authenticating, the same check every key already goes
 	// through in Authenticate.
 	CreateAPIKeyWithExpiry(ctx context.Context, userID string, expiresAt *time.Time) (APIKey, error)
+	// CreateAPIKeyForProject is CreateAPIKeyWithExpiry plus a recorded
+	// project scope (migration 000017's api_keys.project_id) -- ADR-031
+	// §3's Keystone-token bridge: a scoped Keystone token *is*, one more
+	// api_keys row, distinguished from an unscoped one only by this
+	// column. Callers (internal/openstackapi/keystone) are responsible
+	// for having already verified the user holds a project_memberships
+	// row for projectID before calling this -- it does not itself check
+	// membership, the same way CreateAPIKeyWithExpiry does not itself
+	// check that userID exists.
+	CreateAPIKeyForProject(ctx context.Context, userID, projectID string, expiresAt *time.Time) (APIKey, error)
 	// Authenticate resolves a raw key's hash to its owning user, or
 	// ErrInvalidKey if the key is unknown, revoked, or expired. On
 	// success it best-effort records last_used_at; a failure to do so
-	// must not fail authentication itself.
+	// must not fail authentication itself. Equivalent to AuthenticateScoped
+	// with the project scope discarded -- every existing caller (the gRPC
+	// interceptor, internal/dashboard) wants exactly this, unscoped,
+	// contract and is unaffected by AuthenticateScoped's addition.
 	Authenticate(ctx context.Context, hash [32]byte) (User, error)
+	// AuthenticateScoped is Authenticate plus the presented key's project
+	// scope (nil for an unscoped key) -- internal/openstackapi's
+	// token-validation middleware (ADR-031 §3) needs the scope to resolve
+	// which project a Keystone-bridged token grants access to; every
+	// other caller uses Authenticate instead and never sees this.
+	AuthenticateScoped(ctx context.Context, hash [32]byte) (User, *string, error)
 	RevokeAPIKey(ctx context.Context, keyID string) error
+	// RevokeAPIKeyByHash revokes a key identified by its hash rather than
+	// its key_id -- internal/openstackapi/keystone's DELETE
+	// /v3/auth/tokens (token revocation) only ever has the raw
+	// X-Subject-Token a client presents, never the internal key_id
+	// RevokeAPIKey expects.
+	RevokeAPIKeyByHash(ctx context.Context, hash [32]byte) error
 	// SetRole is ADR-016's grant path (cmd/controlplane-admin's
 	// grant-role): an operator-only, offline, break-glass action, the
 	// same trust boundary create-user/issue-key already require -- there

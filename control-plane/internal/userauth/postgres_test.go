@@ -250,6 +250,118 @@ func TestSetRoleReportsUserNotFoundForAnUnknownUserID(t *testing.T) {
 // deliberately does not duplicate ValidRole's check) -- an invalid value
 // must fail loudly, not silently write something the schema doesn't
 // allow.
+// TestCreateAPIKeyForProjectRoundTripsTheScope pins ADR-031 §3's
+// Keystone-token bridge at the storage layer: a project-scoped key
+// authenticates to the same user AuthenticateScoped resolved, and the
+// scope survives the round trip through Postgres, not just the returned
+// Go struct.
+func TestCreateAPIKeyForProjectRoundTripsTheScope(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	user, err := repository.CreateUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectID := uuid.NewString()
+	if _, err := pool.Exec(ctx, `INSERT INTO projects (project_id, name) VALUES ($1,$2)`, projectID, "alpha-"+projectID); err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := repository.CreateAPIKeyForProject(ctx, user.UserID, projectID, nil)
+	if err != nil {
+		t.Fatalf("CreateAPIKeyForProject(): %v", err)
+	}
+	if key.ProjectID == nil || *key.ProjectID != projectID {
+		t.Fatalf("CreateAPIKeyForProject().ProjectID = %v, want %q", key.ProjectID, projectID)
+	}
+
+	gotUser, gotProject, err := repository.AuthenticateScoped(ctx, userauth.HashAPIKey(key.Raw))
+	if err != nil {
+		t.Fatalf("AuthenticateScoped(): %v", err)
+	}
+	if gotUser.UserID != user.UserID {
+		t.Fatalf("AuthenticateScoped() resolved user %q, want %q", gotUser.UserID, user.UserID)
+	}
+	if gotProject == nil || *gotProject != projectID {
+		t.Fatalf("AuthenticateScoped() project = %v, want %q", gotProject, projectID)
+	}
+
+	// Authenticate (the unscoped entry point every other caller uses)
+	// still succeeds against the same key -- a scoped key is a strict
+	// superset of an unscoped one, not a different credential type.
+	plainUser, err := repository.Authenticate(ctx, userauth.HashAPIKey(key.Raw))
+	if err != nil || plainUser.UserID != user.UserID {
+		t.Fatalf("Authenticate() on a scoped key = %+v, %v, want user %q", plainUser, err, user.UserID)
+	}
+}
+
+// TestAuthenticateScopedReportsNoScopeForAnUnscopedKey proves the
+// pre-existing unscoped path (CreateAPIKey/CreateAPIKeyWithExpiry) is
+// unaffected by the new column: its keys resolve with a nil project.
+func TestAuthenticateScopedReportsNoScopeForAnUnscopedKey(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	user, err := repository.CreateUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := repository.CreateAPIKey(ctx, user.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, projectID, err := repository.AuthenticateScoped(ctx, userauth.HashAPIKey(key.Raw))
+	if err != nil {
+		t.Fatalf("AuthenticateScoped(): %v", err)
+	}
+	if projectID != nil {
+		t.Fatalf("AuthenticateScoped() project = %v, want nil (unscoped key)", projectID)
+	}
+}
+
+// TestRevokeAPIKeyByHashRevokesAndIsNotReplayable is the same
+// "revoke, then confirm rejected, then confirm double-revoke reports
+// ErrInvalidKey" shape TestAuthenticateRejectsARevokedKey already proves
+// for RevokeAPIKey(keyID) -- this is the hash-addressed variant
+// internal/openstackapi/keystone's token-delete bridge needs, since a
+// client presenting a token for revocation never knows its key_id.
+func TestRevokeAPIKeyByHashRevokesAndIsNotReplayable(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	user, err := repository.CreateUser(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := repository.CreateAPIKey(ctx, user.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := userauth.HashAPIKey(key.Raw)
+
+	if err := repository.RevokeAPIKeyByHash(ctx, hash); err != nil {
+		t.Fatalf("RevokeAPIKeyByHash(): %v", err)
+	}
+	if _, err := repository.Authenticate(ctx, hash); err != userauth.ErrInvalidKey {
+		t.Fatalf("Authenticate() after RevokeAPIKeyByHash = %v, want ErrInvalidKey", err)
+	}
+	if err := repository.RevokeAPIKeyByHash(ctx, hash); err != userauth.ErrInvalidKey {
+		t.Fatalf("RevokeAPIKeyByHash() on an already-revoked key = %v, want ErrInvalidKey (not silently succeed twice)", err)
+	}
+}
+
+func TestRevokeAPIKeyByHashRejectsAnUnknownHash(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repository := userauth.NewPostgresRepository(pool)
+
+	var neverIssued [32]byte
+	if err := repository.RevokeAPIKeyByHash(ctx, neverIssued); err != userauth.ErrInvalidKey {
+		t.Fatalf("RevokeAPIKeyByHash() for an unknown hash = %v, want ErrInvalidKey", err)
+	}
+}
+
 func TestSetRoleRejectsAnInvalidRoleAtTheDatabaseConstraint(t *testing.T) {
 	ctx, pool := newTestPool(t)
 	repository := userauth.NewPostgresRepository(pool)
