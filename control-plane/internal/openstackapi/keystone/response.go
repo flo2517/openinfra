@@ -98,12 +98,12 @@ func tokenResponseBody(baseURL string, user userauth.User, method string, issued
 
 // serviceCatalog is ADR-031 §3's static, Control-Plane-config-driven
 // catalog: one entry per implemented service, pointing at this Control
-// Plane's own internal/openstackapi base URL. Today that is exactly one
-// service -- identity -- since #24 (compute), #25 (networking), and #26
-// (storage) have not landed; a future PR adds its own entry here (or,
-// more likely, this function grows a small registry future packages
-// append to) rather than this package guessing at endpoints that don't
-// exist yet.
+// Plane's own internal/openstackapi base URL. "network" was added by
+// ADR-031 §5/§8's QoS/AZ mapping slice (internal/openstackapi/neutron) --
+// #24 (compute) and #26 (storage) have not landed yet; a future PR adds
+// its own entry here (or, more likely, this function grows a small
+// registry future packages append to) rather than this package guessing
+// at endpoints that don't exist yet.
 func serviceCatalog(baseURL string) []catalogEntryBody {
 	return []catalogEntryBody{
 		{
@@ -112,6 +112,14 @@ func serviceCatalog(baseURL string) []catalogEntryBody {
 			Name: "keystone",
 			Endpoints: []endpointBody{
 				{ID: "identity-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v3"},
+			},
+		},
+		{
+			ID:   "network",
+			Type: "network",
+			Name: "neutron",
+			Endpoints: []endpointBody{
+				{ID: "network-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v2.0"},
 			},
 		},
 	}

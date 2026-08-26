@@ -37,6 +37,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/openstackapi/keystone"
+	"github.com/openinfra/network/internal/openstackapi/neutron"
 	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/userauth"
 )
@@ -55,6 +56,7 @@ type RateLimiter interface {
 type Server struct {
 	pool     *pgxpool.Pool
 	keystone *keystone.Server
+	neutron  *neutron.Server
 	limiter  RateLimiter
 }
 
@@ -65,11 +67,16 @@ type Server struct {
 // nil (unlimited) -- issueToken is the one unauthenticated,
 // real-work-per-request route on this surface, the same shape
 // internal/dashboard's authChallenge/authLogin rate limiting already
-// follows.
-func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, baseURL string, limiter RateLimiter) *Server {
+// follows. zones backs internal/openstackapi/neutron's availability-zone
+// listing (ADR-026) -- the caller (cmd/controlplane) passes the same
+// agentmanager.Directory already constructed for scheduling, so there is
+// exactly one live view of "which zones are providers actually declaring
+// right now," not a second one this package maintains independently.
+func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, zones neutron.ZoneLister, baseURL string, limiter RateLimiter) *Server {
 	return &Server{
 		pool:     pool,
 		keystone: keystone.New(users, projectsRepo, baseURL, newAuditRecorder(pool)),
+		neutron:  neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), zones),
 		limiter:  limiter,
 	}
 }
@@ -84,6 +91,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
 	s.keystone.Register(mux)
+	s.neutron.Register(mux)
 	return rateLimitTokenIssuance(s.limiter, securityHeaders(mux))
 }
 
