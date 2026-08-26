@@ -33,12 +33,21 @@ func (r *PostgresRepository) CreateAPIKey(ctx context.Context, userID string) (A
 }
 
 func (r *PostgresRepository) CreateAPIKeyWithExpiry(ctx context.Context, userID string, expiresAt *time.Time) (APIKey, error) {
+	return r.createAPIKey(ctx, userID, nil, expiresAt)
+}
+
+func (r *PostgresRepository) CreateAPIKeyForProject(ctx context.Context, userID, projectID string, expiresAt *time.Time) (APIKey, error) {
+	return r.createAPIKey(ctx, userID, &projectID, expiresAt)
+}
+
+func (r *PostgresRepository) createAPIKey(ctx context.Context, userID string, projectID *string, expiresAt *time.Time) (APIKey, error) {
 	raw, hash, prefix, err := GenerateAPIKey()
 	if err != nil {
 		return APIKey{}, err
 	}
-	key := APIKey{KeyID: uuid.NewString(), UserID: userID, Prefix: prefix, Raw: raw, CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt}
-	if _, err := r.pool.Exec(ctx, `INSERT INTO api_keys (key_id, user_id, key_hash, prefix, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6)`, key.KeyID, key.UserID, hash[:], key.Prefix, key.CreatedAt, key.ExpiresAt); err != nil {
+	key := APIKey{KeyID: uuid.NewString(), UserID: userID, Prefix: prefix, Raw: raw, CreatedAt: time.Now().UTC(), ExpiresAt: expiresAt, ProjectID: projectID}
+	if _, err := r.pool.Exec(ctx, `INSERT INTO api_keys (key_id, user_id, key_hash, prefix, created_at, expires_at, project_id) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		key.KeyID, key.UserID, hash[:], key.Prefix, key.CreatedAt, key.ExpiresAt, key.ProjectID); err != nil {
 		return APIKey{}, err
 	}
 	return key, nil
@@ -50,7 +59,18 @@ func (r *PostgresRepository) CreateAPIKeyWithExpiry(ctx context.Context, userID 
 // second query, so a read-only replica or a busy pool can't make
 // authentication itself flaky.
 func (r *PostgresRepository) Authenticate(ctx context.Context, hash [32]byte) (User, error) {
+	user, _, err := r.AuthenticateScoped(ctx, hash)
+	return user, err
+}
+
+// AuthenticateScoped is Authenticate's real implementation, plus the
+// presented key's project_id (migration 000017) in the same round trip
+// -- one query, so a read-only replica or a busy pool can't make
+// authentication itself flaky, the same reasoning the original
+// single-query Authenticate already documented.
+func (r *PostgresRepository) AuthenticateScoped(ctx context.Context, hash [32]byte) (User, *string, error) {
 	var user User
+	var projectID *string
 	err := r.pool.QueryRow(ctx, `
 		UPDATE api_keys SET last_used_at = now()
 		FROM users
@@ -58,19 +78,30 @@ func (r *PostgresRepository) Authenticate(ctx context.Context, hash [32]byte) (U
 		  AND api_keys.revoked_at IS NULL
 		  AND (api_keys.expires_at IS NULL OR api_keys.expires_at > now())
 		  AND users.user_id = api_keys.user_id
-		RETURNING users.user_id, users.display_name, users.created_at, users.role
-	`, hash[:]).Scan(&user.UserID, &user.DisplayName, &user.CreatedAt, &user.Role)
+		RETURNING users.user_id, users.display_name, users.created_at, users.role, api_keys.project_id
+	`, hash[:]).Scan(&user.UserID, &user.DisplayName, &user.CreatedAt, &user.Role, &projectID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return User{}, ErrInvalidKey
+		return User{}, nil, ErrInvalidKey
 	}
 	if err != nil {
-		return User{}, err
+		return User{}, nil, err
 	}
-	return user, nil
+	return user, projectID, nil
 }
 
 func (r *PostgresRepository) RevokeAPIKey(ctx context.Context, keyID string) error {
 	command, err := r.pool.Exec(ctx, `UPDATE api_keys SET revoked_at = now() WHERE key_id = $1 AND revoked_at IS NULL`, keyID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvalidKey
+	}
+	return nil
+}
+
+func (r *PostgresRepository) RevokeAPIKeyByHash(ctx context.Context, hash [32]byte) error {
+	command, err := r.pool.Exec(ctx, `UPDATE api_keys SET revoked_at = now() WHERE key_hash = $1 AND revoked_at IS NULL`, hash[:])
 	if err != nil {
 		return err
 	}
