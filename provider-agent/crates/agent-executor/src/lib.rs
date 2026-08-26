@@ -2348,6 +2348,7 @@ mod tests {
                 egress_mbps: 0,
             }),
             lease_end: Some(future_lease_end()),
+            ..Default::default()
         };
         let container_id = executor.deploy(request.clone()).await.expect("deploy");
 
