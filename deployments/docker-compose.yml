@@ -221,6 +221,14 @@ services:
       CONTAINERS: "1"
       IMAGES: "1"
       INFO: "1"
+      # Issue #174: agent-executor now creates (and inspects) a dedicated,
+      # ICC-disabled bridge network for workload isolation via bollard's
+      # Network API (/networks/*). Without this flag the proxy 403s every
+      # /networks request regardless of POST below -- confirmed against
+      # tecnativa/docker-socket-proxy's own category-gate behavior, where
+      # each resource category (CONTAINERS/IMAGES/NETWORKS/...) is an
+      # independent allow-list, not implied by POST/GET alone.
+      NETWORKS: "1"
       PING: "1"
       POST: "1"
       VERSION: "1"

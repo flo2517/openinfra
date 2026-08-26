@@ -16,6 +16,7 @@ use bollard::container::{
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
+use bollard::network::CreateNetworkOptions;
 use bollard::Docker;
 use futures_util::StreamExt;
 pub use rate_limit::{CommandRunner, RateLimiter, SystemCommandRunner};
@@ -31,6 +32,28 @@ use uuid::Uuid;
 
 const MIB: i64 = 1024 * 1024;
 const NANOS_PER_CPU: f64 = 1_000_000_000.0;
+
+/// Issue #174: every workload container is attached to this dedicated
+/// bridge network instead of implicitly joining Docker's default bridge,
+/// with inter-container communication (ICC) disabled on it -- see
+/// `BollardEngine::ensure_workload_network`'s doc comment for the
+/// mechanism and `BollardEngine::create`'s call site for where it's
+/// applied. Two workload containers on this network can each still reach
+/// the outside world (this is an ordinary NAT'd bridge, not `internal:
+/// true`), but Docker refuses to forward traffic *between* them.
+///
+/// This is deliberately orthogonal to ADR-010's WireGuard-attach path
+/// (`control-plane/internal/wireguard`'s `AttachNamespace`): that backend
+/// resolves a workload's container PID and operates directly on its
+/// network *namespace* (the same technique this crate's own
+/// `bandwidth::resolve_veth_name` uses -- matching a host-side interface
+/// by the container `eth0`'s `iflink`), never through Docker's own
+/// network abstraction. Which bridge a container's `eth0` happens to be
+/// attached to has no bearing on that -- confirmed by inspection, and
+/// exercised by this crate's `docker_integration_isolates_workload_
+/// containers_from_each_other` test alongside the existing WireGuard/
+/// veth-resolution tests, which keep passing unmodified.
+const WORKLOAD_NETWORK_NAME: &str = "openinfra-workloads";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSpec {
@@ -168,11 +191,78 @@ impl BollardEngine {
             .filter(|pid| *pid > 0)
             .ok_or_else(|| ExecutorError::Engine("container has no pid".to_string()))
     }
+
+    /// Issue #174: idempotently ensures `WORKLOAD_NETWORK_NAME` exists,
+    /// creating it on first use. Called from `create()` rather than once
+    /// at Agent startup: unlike `pull_image`, this only needs to run
+    /// before an actual container creation (not before every heartbeat's
+    /// `BollardEngine::connect()` -- see agent-cli's `workload_bandwidth_
+    /// usage`, which reconnects fresh every ~15s purely to read existing
+    /// counters and never needs this network to exist), so tying it to
+    /// `create()` keeps that frequent, read-only path free of an extra
+    /// network round-trip and an extra `docker-socket-proxy` NETWORKS
+    /// dependency it never otherwise needed.
+    ///
+    /// Race-safe: in the local dev "multi-node" Compose profile, multiple
+    /// Agent processes share one Docker daemon through the same
+    /// `docker-socket-proxy` (see `deployments/docker-compose.yml`'s own
+    /// comment on `provider-agent-2`/`-3`), so more than one `create()`
+    /// can race to create this network the first time. `check_duplicate:
+    /// true` makes Docker itself reject a second create for the same name
+    /// -- confirmed against the Engine API, this surfaces as 403
+    /// Forbidden (some Docker versions instead 409) -- either is treated
+    /// as success here, not a failure, since the network exists either
+    /// way by the time this returns.
+    async fn ensure_workload_network(docker: &Docker) -> Result<(), ExecutorError> {
+        match docker
+            .inspect_network::<String>(WORKLOAD_NETWORK_NAME, None)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => return Err(ExecutorError::Engine(error.to_string())),
+        }
+        let options = CreateNetworkOptions {
+            name: WORKLOAD_NETWORK_NAME.to_string(),
+            check_duplicate: true,
+            driver: "bridge".to_string(),
+            // Docker's bridge-driver option to disable inter-container
+            // communication on this specific bridge -- the exact
+            // mechanism issue #174 asks for ("disable ICC ... on
+            // whatever bridge is actually in use"), scoped to this one
+            // dedicated bridge rather than the daemon-wide `--icc=false`
+            // startup flag (which this codebase has no way to set: the
+            // Agent only ever reaches Docker through docker-socket-
+            // proxy's HTTP API, never dockerd's own command line).
+            options: HashMap::from([(
+                "com.docker.network.bridge.enable_icc".to_string(),
+                "false".to_string(),
+            )]),
+            ..Default::default()
+        };
+        match docker.create_network(options).await {
+            Ok(_) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 403 | 409,
+                ..
+            }) => Ok(()),
+            Err(error) => Err(ExecutorError::Engine(error.to_string())),
+        }
+    }
 }
 
 #[async_trait]
 impl ContainerEngine for BollardEngine {
     async fn create(&self, spec: &ContainerSpec) -> Result<String, ExecutorError> {
+        // Issue #174: must exist before create_container below references
+        // it by name via HostConfig.network_mode -- Docker rejects
+        // creation against an unknown network name outright, so this is
+        // the one place that has to run before every genuinely new
+        // container (not the Reservation::Existing / idempotent-retry
+        // paths in DockerExecutor::deploy, which never reach here).
+        Self::ensure_workload_network(&self.docker).await?;
         let host_config = HostConfig {
             memory: Some(spec.memory_bytes),
             memory_swap: Some(spec.memory_bytes),
@@ -181,6 +271,11 @@ impl ContainerEngine for BollardEngine {
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             cap_drop: Some(vec!["ALL".to_string()]),
             init: Some(true),
+            // Issue #174: replaces implicit membership in Docker's
+            // default bridge (zero inter-container isolation) with the
+            // dedicated, ICC-disabled network -- see
+            // WORKLOAD_NETWORK_NAME's doc comment.
+            network_mode: Some(WORKLOAD_NETWORK_NAME.to_string()),
             ..Default::default()
         };
         let config = Config {
@@ -1043,6 +1138,7 @@ impl Executor for RoutingExecutor {
 mod tests {
     use super::*;
     use agent_api::proto::ResourceLimits;
+    use std::fs;
     use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
@@ -1991,6 +2087,392 @@ mod tests {
             removed.is_err(),
             "container {container_id} should have been removed by stop(), but inspect still found it"
         );
+    }
+
+    /// Issue #174: real reproduction-then-fix for the cross-tenant
+    /// network isolation gap -- confirmed via `grep` over this crate (no
+    /// `NetworkMode`, no ICC-disable equivalent anywhere in
+    /// `ContainerSpec`/`BollardEngine::create`) before this fix, per the
+    /// issue's own description.
+    ///
+    /// Opt-in like `docker_integration_applies_mandatory_controls` above
+    /// (needs a real Docker daemon), gated behind
+    /// `OPENINFRA_TEST_DOCKER_NETWORK_TOOLS_IMAGE` -- deliberately a
+    /// *different* env var from `OPENINFRA_TEST_DOCKER_IMAGE` (used by
+    /// `docker_integration_applies_mandatory_controls`/`docker_
+    /// integration_veth_resolution_survives_the_isolated_network`
+    /// above/below): those go through the real `deploy()` path and need
+    /// an image whose *own default command* keeps running (busybox's
+    /// default `sh` exits almost instantly with no tty attached --
+    /// confirmed live, flakes `deploy()`'s own running-confirmation check
+    /// regardless of this fix -- see `docs/provider-agent/docker-
+    /// executor.md`'s own recommendation of `registry.k8s.io/pause` for
+    /// that case), while this test sets an explicit `Cmd` on both probe
+    /// containers via raw bollard (see `probe_reachability` below) and
+    /// instead needs BusyBox's `nc` applet specifically (e.g.
+    /// `busybox:1.36`, the same image `request()`'s tests default to).
+    /// One shared var could not satisfy both requirements at once.
+    ///
+    /// The two probe containers are created directly via bollard (not
+    /// through `ContainerEngine`, which has no `Cmd` override -- needed
+    /// here to run a listener and a fetch probe instead of each image's
+    /// default command) but with the same mandatory `HostConfig` fields
+    /// `BollardEngine::create` applies, so the *only* variable between
+    /// the two groups below is which network they attach to:
+    ///   - `"bridge"` reproduces the exact pre-fix bug: Docker's own
+    ///     default bridge, where every workload container landed before
+    ///     this fix (control group -- proves the probe technique itself
+    ///     actually detects real connectivity, not just always failing).
+    ///   - `WORKLOAD_NETWORK_NAME` is the actual fix: the dedicated,
+    ///     ICC-disabled network `BollardEngine::create` now uses for
+    ///     every workload.
+    #[tokio::test]
+    async fn docker_integration_isolates_workload_containers_from_each_other() {
+        let image = match std::env::var("OPENINFRA_TEST_DOCKER_NETWORK_TOOLS_IMAGE") {
+            Ok(image) => image,
+            Err(_) => return,
+        };
+        let docker = Docker::connect_with_local_defaults().expect("Docker client");
+        BollardEngine::ensure_workload_network(&docker)
+            .await
+            .expect("ensure workload network");
+
+        assert!(
+            probe_reachability(&docker, &image, "bridge").await,
+            "control group: two containers on Docker's default bridge must be able to reach \
+             each other (this is the exact pre-fix vulnerability #174 reports -- if this \
+             assertion fails, the probe technique itself is broken, not the isolation fix)"
+        );
+
+        assert!(
+            !probe_reachability(&docker, &image, WORKLOAD_NETWORK_NAME).await,
+            "two workload containers on the isolated network must NOT be able to reach each \
+             other -- this is issue #174's regression"
+        );
+    }
+
+    /// Starts a BusyBox `nc` listener and a BusyBox `nc -z` prober, both
+    /// attached to `network`, and returns whether the prober reached the
+    /// listener's own network-scoped IP (exit code 0). A raw TCP connect
+    /// check is used deliberately over an HTTP fetch: it distinguishes
+    /// "reachable" from "unreachable" by connection outcome alone, with
+    /// no dependency on the listener actually answering a well-formed
+    /// response for whatever it's asked (confirmed live: BusyBox `httpd`
+    /// serving `/` with no index file returns 404, which BusyBox `wget`
+    /// treats as failure regardless of reachability -- the wrong signal
+    /// for this test). Both containers are always removed before
+    /// returning, success or failure, so a run against the isolated
+    /// network -- expected to hang until `nc`'s own `-w` timeout -- never
+    /// leaks containers.
+    async fn probe_reachability(docker: &Docker, image: &str, network: &str) -> bool {
+        let suffix = Uuid::new_v4();
+        let probe_host_config = |network: &str| HostConfig {
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            init: Some(true),
+            network_mode: Some(network.to_string()),
+            ..Default::default()
+        };
+
+        let listener_name = format!("openinfra-test-listener-{suffix}");
+        let listener_config = Config {
+            image: Some(image.to_string()),
+            cmd: Some(
+                ["nc", "-l", "-p", "8080"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            host_config: Some(probe_host_config(network)),
+            ..Default::default()
+        };
+        let listener = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: listener_name,
+                    platform: None,
+                }),
+                listener_config,
+            )
+            .await
+            .expect("create listener");
+        docker
+            .start_container::<String>(&listener.id, None)
+            .await
+            .expect("start listener");
+
+        // Give BusyBox nc a moment to bind before probing it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let inspected = docker
+            .inspect_container(&listener.id, None)
+            .await
+            .expect("inspect listener");
+        let listener_ip = inspected
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .and_then(|networks| networks.get(network).cloned())
+            .and_then(|endpoint| endpoint.ip_address)
+            .filter(|ip| !ip.is_empty())
+            .unwrap_or_else(|| panic!("listener has no IP address on network {network}"));
+
+        let prober_name = format!("openinfra-test-prober-{suffix}");
+        let prober_config = Config {
+            image: Some(image.to_string()),
+            cmd: Some(
+                ["nc", "-z", "-w", "2", &listener_ip, "8080"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            host_config: Some(probe_host_config(network)),
+            ..Default::default()
+        };
+        let prober = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: prober_name,
+                    platform: None,
+                }),
+                prober_config,
+            )
+            .await
+            .expect("create prober");
+        docker
+            .start_container::<String>(&prober.id, None)
+            .await
+            .expect("start prober");
+
+        // Poll until the prober exits, bounded so a hung `nc -z` (the
+        // expected outcome on the isolated network -- ICC-dropped
+        // packets get no RST, just silence until nc's own `-w` timeout)
+        // cannot hang this test indefinitely.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let exit_code = loop {
+            let inspected = docker
+                .inspect_container(&prober.id, None)
+                .await
+                .expect("inspect prober");
+            let state = inspected.state.expect("prober state");
+            if state.running == Some(false) {
+                break state.exit_code.unwrap_or(-1);
+            }
+            if std::time::Instant::now() > deadline {
+                break -1;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+
+        for id in [&listener.id, &prober.id] {
+            let _ = docker
+                .remove_container(
+                    id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+
+        exit_code == 0
+    }
+
+    /// Issue #174 regression: ADR-010's WireGuard `AttachNamespace`
+    /// backend and this crate's own ADR-025 §2/§3 bandwidth/rate-limit
+    /// paths all resolve a workload's veth by matching its container
+    /// PID's `eth0` `iflink` against a host-side interface (see
+    /// `bandwidth::resolve_veth_name`'s doc comment) -- a mechanism that
+    /// works purely off the container's network *namespace*, never off
+    /// which Docker network/bridge its `eth0` happens to be attached to.
+    /// This is the real-Docker proof that moving every workload off the
+    /// default bridge onto `WORKLOAD_NETWORK_NAME` did not break that.
+    ///
+    /// Gated behind `OPENINFRA_TEST_DOCKER_IMAGE`, set to an image whose
+    /// own default command keeps running (busybox's default `sh` exits
+    /// almost instantly with no tty attached -- confirmed live, flakes
+    /// `deploy()`'s own running-confirmation check regardless of this
+    /// fix; `docs/provider-agent/docker-executor.md` already recommends
+    /// `registry.k8s.io/pause` for exactly this reason).
+    ///
+    /// This deploys a real workload through the *actual* `DockerExecutor`
+    /// and confirms it landed on the isolated network (not still the
+    /// default bridge) -- the part that genuinely proves `deploy()`
+    /// itself changed. `resolve_veth_name`'s *matching algorithm* is
+    /// then exercised end-to-end against a second, disposable container
+    /// on the same network rather than by calling `engine.bandwidth()`
+    /// on the deployed workload directly: `bandwidth()`'s own
+    /// `/proc/<pid>/root/...` read requires the same privilege as
+    /// `ptrace(2)` over that pid (matching UID, or `CAP_SYS_PTRACE`),
+    /// which this test process does not have for a container process
+    /// running as root -- confirmed live, this permission wall is
+    /// unconditional and predates this fix (reproduces identically
+    /// against an unmodified `main`, for *any* container, isolated
+    /// network or not). It is exactly the same class of environment gap
+    /// `docker_integration_applies_mandatory_controls` already documents
+    /// for `tc`/`CAP_NET_ADMIN` -- a real Agent process (host-run, or the
+    /// containerized one with `cap_add: NET_ADMIN`) has what it needs;
+    /// this sandboxed test process does not. `docker exec` sidesteps it
+    /// by reading the iflink from *inside* the container's own mount
+    /// namespace (dockerd itself performs the privileged part), then
+    /// this test matches it against the host's `/sys/class/net` the same
+    /// way `resolve_veth_name` does -- the exact algorithm, a
+    /// permission-compatible source for its input.
+    #[tokio::test]
+    async fn docker_integration_veth_resolution_survives_the_isolated_network() {
+        let image = match std::env::var("OPENINFRA_TEST_DOCKER_IMAGE") {
+            Ok(image) => image,
+            Err(_) => return,
+        };
+        let directory = tempfile::tempdir().expect("directory");
+        let settings = ExecutorSettings {
+            max_workloads: 1,
+            max_cpu_cores: 1.0,
+            max_memory_mb: 128,
+            pids_limit: 32,
+            ..Default::default()
+        };
+        let executor = DockerExecutor::connect(
+            Arc::new(LocalState::open(directory.path()).expect("state")),
+            settings,
+        )
+        .await
+        .expect("connect Docker");
+        let request = DeployRequest {
+            workload_id: Uuid::new_v4().to_string(),
+            lease_id: Uuid::new_v4().to_string(),
+            image,
+            limits: Some(ResourceLimits {
+                cpu_cores: 0.5,
+                memory_mb: 64,
+                egress_mbps: 0,
+            }),
+            lease_end: Some(future_lease_end()),
+        };
+        let container_id = executor.deploy(request.clone()).await.expect("deploy");
+
+        let docker = Docker::connect_with_local_defaults().expect("Docker client");
+        let inspected = docker
+            .inspect_container(&container_id, None)
+            .await
+            .expect("inspect container");
+        let host = inspected.host_config.expect("host config");
+        assert_eq!(
+            host.network_mode.as_deref(),
+            Some(WORKLOAD_NETWORK_NAME),
+            "the workload container must be attached to the isolated network, not the default bridge"
+        );
+        executor.stop(&request.workload_id).await.expect("stop");
+
+        // Second half: the veth-matching algorithm itself, against a
+        // disposable BusyBox container on the same network (needs a
+        // shell/`cat` for `docker exec`, which `registry.k8s.io/pause`
+        // deliberately has neither of -- that's why this uses its own
+        // fixed image rather than reusing `image` above).
+        let suffix = Uuid::new_v4();
+        let veth_probe_name = format!("openinfra-test-veth-probe-{suffix}");
+        let veth_probe_config = Config {
+            image: Some("busybox:1.36".to_string()),
+            cmd: Some(vec!["sleep".to_string(), "30".to_string()]),
+            host_config: Some(HostConfig {
+                security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+                cap_drop: Some(vec!["ALL".to_string()]),
+                init: Some(true),
+                network_mode: Some(WORKLOAD_NETWORK_NAME.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let veth_probe = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: veth_probe_name,
+                    platform: None,
+                }),
+                veth_probe_config,
+            )
+            .await
+            .expect("create veth probe");
+        docker
+            .start_container::<String>(&veth_probe.id, None)
+            .await
+            .expect("start veth probe");
+
+        let iflink_output = exec_stdout(
+            &docker,
+            &veth_probe.id,
+            &["cat", "/sys/class/net/eth0/iflink"],
+        )
+        .await;
+        let iflink: u64 = iflink_output
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("eth0 iflink is not a number: {iflink_output:?}"));
+
+        let net_class_dir = std::path::Path::new("/sys/class/net");
+        let mut matched_veth = None;
+        for entry in fs::read_dir(net_class_dir).expect("read /sys/class/net") {
+            let entry = entry.expect("dir entry");
+            let Ok(contents) = fs::read_to_string(entry.path().join("ifindex")) else {
+                continue;
+            };
+            let Ok(ifindex) = contents.trim().parse::<u64>() else {
+                continue;
+            };
+            if ifindex == iflink {
+                matched_veth = Some(entry.file_name().into_string().expect("utf8 ifname"));
+                break;
+            }
+        }
+        let veth = matched_veth.unwrap_or_else(|| {
+            panic!(
+                "no host-side interface matches iflink {iflink} for the workload on {WORKLOAD_NETWORK_NAME} \
+                 -- the same failure mode that would break ADR-010's WireGuard AttachNamespace"
+            )
+        });
+        fs::read_to_string(net_class_dir.join(&veth).join("statistics/rx_bytes"))
+            .unwrap_or_else(|error| panic!("read {veth}'s rx_bytes counters: {error}"));
+
+        let _ = docker
+            .remove_container(
+                &veth_probe.id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
+    /// Runs `cmd` inside `container_id` via `docker exec` and returns its
+    /// combined stdout/stderr as a UTF-8 string. Used only by tests that
+    /// need to read a value from *inside* a container's own namespace
+    /// without needing this test process's own host-level permission
+    /// over that container's PID (see
+    /// `docker_integration_veth_resolution_survives_the_isolated_network`'s
+    /// doc comment).
+    async fn exec_stdout(docker: &Docker, container_id: &str, cmd: &[&str]) -> String {
+        let exec = docker
+            .create_exec(
+                container_id,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(cmd.iter().map(|value| value.to_string()).collect()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create exec");
+        let mut collected = String::new();
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } =
+            docker.start_exec(&exec.id, None).await.expect("start exec")
+        {
+            while let Some(chunk) = output.next().await {
+                collected.push_str(&chunk.expect("exec output chunk").to_string());
+            }
+        }
+        collected
     }
 
     // Issue #154: confirmed live -- a workload with a valid, correctly
