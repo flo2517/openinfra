@@ -28,6 +28,11 @@ Run manually (against a real database, never against `$POSTGRES_DB` in the
 Compose dev stack unless you mean it) with `psql -f`, applying each block in
 the order below, top to bottom.
 
+## 000018_workload_vm_image_digest.sql
+```sql
+ALTER TABLE workloads DROP COLUMN IF EXISTS vm_image_sha256;
+```
+
 ## 000016_metering_evidence_and_invoices.sql
 Drop order matters here (no `CASCADE`): `metering_disputes` references
 `invoice_lines`, which references `metering_evidence`; the other two new
