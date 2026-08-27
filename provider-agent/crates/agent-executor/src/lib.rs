@@ -5,7 +5,8 @@ pub mod vm;
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
 use agent_api::{Executor, UsageSample, WorkloadStatus};
 use agent_core::local_state::{
-    LocalState, LocalStateError, Reservation, WorkloadPhase, WorkloadRecord, WorkloadRuntime,
+    LocalState, LocalStateError, Reservation, VolumeMount, WorkloadPhase, WorkloadRecord,
+    WorkloadRuntime,
 };
 use agent_core::ExecutorSettings;
 use anyhow::Result;
@@ -67,6 +68,14 @@ pub struct ContainerSpec {
     /// "no bandwidth requirement declared" -- no `tc` rule is applied,
     /// matching `ResourceLimits.egress_mbps`'s own wire convention.
     pub egress_mbps: i32,
+    /// ADR-034 §1/§7: Cinder volumes to mount into this container at
+    /// create time, threaded into `HostConfig.mounts`
+    /// (`BollardEngine::create`) alongside the CPU/memory/pids quotas
+    /// and `no-new-privileges`/`cap_drop` already set there -- never a
+    /// host-path bind mount, only ever the specific named Docker volume
+    /// each entry's `volume_name` identifies (ADR-034 §6: "never a
+    /// wildcard/glob path").
+    pub volume_mounts: Vec<VolumeMount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +101,54 @@ pub trait ContainerEngine: Send + Sync {
     /// comment) -- `DockerExecutor::deploy` is the single call site and
     /// already guards on that.
     async fn rate_limit(&self, container_id: &str, egress_mbps: i32) -> Result<(), ExecutorError>;
+    /// ADR-034 §1/§2: creates the named Docker volume if it does not
+    /// already exist ("nothing is created on any provider host until
+    /// the volume is first attached" -- this is that creation point),
+    /// idempotent on a volume that already exists (`bollard`'s own
+    /// `create_volume` is itself idempotent by name, per its API
+    /// semantics). Default implementation errs unsupported, so a future
+    /// `ContainerEngine` implementor (e.g. a test double with no volume
+    /// needs) is not forced to implement volume support it never
+    /// exercises; `BollardEngine` overrides this with the real
+    /// implementation.
+    async fn ensure_volume(&self, _name: &str) -> Result<(), ExecutorError> {
+        Err(ExecutorError::Engine(
+            "this engine does not support Cinder volumes".to_string(),
+        ))
+    }
+    /// ADR-034 §6: securely deletes the named Docker volume -- overwrites
+    /// its backing directory's contents before removing it (see
+    /// `BollardEngine::remove_volume_securely`'s doc comment for the
+    /// exact mechanism and its stated guarantee). Treats "no such
+    /// volume" as success (idempotent at the Agent boundary, matching
+    /// `stop`'s own convention for an unknown container).
+    async fn remove_volume_securely(&self, _name: &str) -> Result<(), ExecutorError> {
+        Err(ExecutorError::Engine(
+            "this engine does not support Cinder volumes".to_string(),
+        ))
+    }
+    /// ADR-034 §3: used by `recover()` to detect drift between a
+    /// `WorkloadRecord`'s persisted `volume_mounts` and what actually
+    /// exists on this host after an Agent restart.
+    async fn volume_exists(&self, _name: &str) -> Result<bool, ExecutorError> {
+        Err(ExecutorError::Engine(
+            "this engine does not support Cinder volumes".to_string(),
+        ))
+    }
+}
+
+/// ADR-034 §1/§7: the Docker named volume backing a Cinder block volume
+/// is named deterministically from the Cinder `volume_id` (always a
+/// UUID -- validated in `DockerExecutor::deployment` before this is ever
+/// called), so repeated calls -- a retried `deploy()`, or a fresh
+/// `ensure_volume` on every deploy that references it -- always resolve
+/// to the exact same Docker volume name for the same Cinder volume,
+/// without a separate mapping table anywhere in this crate. Prefixed to
+/// make it obviously OpenInfra-managed among unrelated Docker volumes on
+/// the same host, the same convention `ContainerSpec::name`'s
+/// `openinfra-{workload_id}` already uses.
+pub fn docker_volume_name(volume_id: &str) -> String {
+    format!("openinfra-volume-{volume_id}")
 }
 
 // Issue #17: `Docker::connect_with_local_defaults()` on Unix is a thin
@@ -263,6 +320,30 @@ impl ContainerEngine for BollardEngine {
         // container (not the Reservation::Existing / idempotent-retry
         // paths in DockerExecutor::deploy, which never reach here).
         Self::ensure_workload_network(&self.docker).await?;
+        // ADR-034 §1/§2: `DockerExecutor::deploy` (the engine-agnostic
+        // orchestration layer, so this works for any `ContainerEngine`
+        // impl, not just this one) already calls `ensure_volume` for
+        // every attachment before ever reaching this method -- this is a
+        // second, defense-in-depth call for any other caller that
+        // constructs a `BollardEngine` and invokes `create` directly
+        // (this crate's own Docker-pull integration test does exactly
+        // that). `create_volume` is idempotent by name, so a second call
+        // here is a cheap no-op, not wasted work, when `deploy` already
+        // ran it.
+        for mount in &spec.volume_mounts {
+            self.ensure_volume(&mount.volume_name).await?;
+        }
+        let mounts: Vec<bollard::models::Mount> = spec
+            .volume_mounts
+            .iter()
+            .map(|mount| bollard::models::Mount {
+                target: Some(mount.mount_path.clone()),
+                source: Some(mount.volume_name.clone()),
+                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                read_only: Some(mount.read_only),
+                ..Default::default()
+            })
+            .collect();
         let host_config = HostConfig {
             memory: Some(spec.memory_bytes),
             memory_swap: Some(spec.memory_bytes),
@@ -276,6 +357,16 @@ impl ContainerEngine for BollardEngine {
             // dedicated, ICC-disabled network -- see
             // WORKLOAD_NETWORK_NAME's doc comment.
             network_mode: Some(WORKLOAD_NETWORK_NAME.to_string()),
+            // ADR-034 §6: only ever the specific named Docker volume
+            // each ContainerSpec.volume_mounts entry authorized, at the
+            // exact path requested -- never a host-path bind mount,
+            // never a wildcard/glob path, so this keeps the
+            // cap_drop/no-new-privileges boundary above intact.
+            mounts: if mounts.is_empty() {
+                None
+            } else {
+                Some(mounts)
+            },
             ..Default::default()
         };
         let config = Config {
@@ -390,6 +481,112 @@ impl ContainerEngine for BollardEngine {
         let pid = self.container_pid(container_id).await?;
         self.rate_limiter.apply(Path::new("/"), pid, egress_mbps)
     }
+
+    async fn ensure_volume(&self, name: &str) -> Result<(), ExecutorError> {
+        // bollard::volume::create_volume is itself idempotent by name --
+        // a `docker volume create` against an existing name simply
+        // returns that volume's existing details rather than erroring --
+        // so there is no need for a separate inspect-then-create check
+        // here; ADR-034 §2's reattachment case (a new deploy referencing
+        // an already-created volume) is exactly this idempotent path.
+        let labels = HashMap::from([("openinfra.managed".to_string(), "true".to_string())]);
+        self.docker
+            .create_volume(bollard::volume::CreateVolumeOptions {
+                name: name.to_string(),
+                driver: "local".to_string(),
+                labels,
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| ExecutorError::Engine(error.to_string()))
+    }
+
+    async fn volume_exists(&self, name: &str) -> Result<bool, ExecutorError> {
+        match self.docker.inspect_volume(name).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(error) => Err(ExecutorError::Engine(error.to_string())),
+        }
+    }
+
+    /// ADR-034 §6: "the Agent overwrites the Docker volume's backing
+    /// directory contents (a bounded, single-pass zero-overwrite of the
+    /// volume's files, followed by `bollard::volume::remove_volume`)
+    /// rather than a bare `rm -rf`/`docker volume rm`." Not cryptographic
+    /// erasure (ADR-034 §6 names this explicitly: "a plainly weaker
+    /// guarantee than the encrypted-volume ideal") -- every regular
+    /// file's existing byte length is overwritten in place with zeros,
+    /// which is the real, bounded guarantee this ADR commits to, nothing
+    /// stronger claimed. Idempotent: a volume that does not exist (already
+    /// deleted, or never actually created on this host despite being
+    /// bound to it in Postgres) is treated as success, matching this
+    /// RPC's own doc comment (agent.proto's `DeleteVolumeRequest`).
+    async fn remove_volume_securely(&self, name: &str) -> Result<(), ExecutorError> {
+        let volume = match self.docker.inspect_volume(name).await {
+            Ok(volume) => volume,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(()),
+            Err(error) => return Err(ExecutorError::Engine(error.to_string())),
+        };
+        let mountpoint = volume.mountpoint.clone();
+        // File IO is blocking; this crate's Docker calls are otherwise
+        // all async over bollard's HTTP client, so the overwrite pass
+        // runs on a blocking-pool thread rather than stalling the async
+        // runtime for however long a large volume takes to overwrite.
+        tokio::task::spawn_blocking(move || overwrite_directory_contents(Path::new(&mountpoint)))
+            .await
+            .map_err(|error| {
+                ExecutorError::Engine(format!("secure delete task panicked: {error}"))
+            })?
+            .map_err(|error| {
+                ExecutorError::Engine(format!("secure delete overwrite failed: {error}"))
+            })?;
+        self.docker
+            .remove_volume(
+                name,
+                Some(bollard::volume::RemoveVolumeOptions { force: true }),
+            )
+            .await
+            .map_err(|error| ExecutorError::Engine(error.to_string()))
+    }
+}
+
+/// Recursively overwrites every regular file under `root` with
+/// zero-bytes of its own existing length, in place -- the mechanism
+/// behind `BollardEngine::remove_volume_securely` (see that method's doc
+/// comment for the guarantee this provides and does not provide). A
+/// containerized Agent without direct host filesystem access to
+/// `root` (e.g. `docker-socket-proxy`-fronted deployments, see
+/// `connect_docker`'s doc comment on that exact limitation for a
+/// different operation) will fail this step -- surfaced as a real error
+/// by the caller, never silently skipped, so a deployment missing this
+/// prerequisite finds out at delete time rather than believing secure
+/// deletion happened when it did not.
+fn overwrite_directory_contents(root: &Path) -> std::io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            overwrite_directory_contents(&path)?;
+        } else if file_type.is_file() {
+            let length = entry.metadata()?.len();
+            let zeros = vec![0u8; length as usize];
+            std::fs::write(&path, zeros)?;
+        }
+        // Symlinks and other special file types are left untouched --
+        // overwriting through a symlink risks writing outside the
+        // volume's own backing directory entirely, which would be worse
+        // than leaving that one entry's target unoverwritten.
+    }
+    Ok(())
 }
 
 /// Docker's API reports container timestamps as RFC3339 strings (not a
@@ -622,6 +819,42 @@ impl DockerExecutor {
             ("openinfra.lease_id".to_string(), request.lease_id.clone()),
             ("openinfra.spec_hash".to_string(), hex::encode(spec_hash)),
         ]);
+        // ADR-034 §1/§7: `volumes[].volume_id` is validated as a UUID
+        // (matching every Cinder volume_id the Control Plane ever mints,
+        // internal/openstackapi/cinder.PostgresRepository.CreateVolume)
+        // before it is ever turned into a Docker volume/mount name --
+        // the same "never trust a wire string into a shell/Docker-API
+        // argument unvalidated" discipline `image`'s own whitespace/URL-
+        // scheme check above already applies. Two attachments requesting
+        // the same in-container mount_path is rejected outright: Docker
+        // itself would only silently honor one of them.
+        let mut mount_paths = std::collections::HashSet::with_capacity(request.volumes.len());
+        let mut volume_mounts = Vec::with_capacity(request.volumes.len());
+        for attachment in &request.volumes {
+            if Uuid::parse_str(&attachment.volume_id).is_err() {
+                return Err(ExecutorError::InvalidRequest(
+                    "volumes[].volume_id must be a UUID".to_string(),
+                ));
+            }
+            if attachment.mount_path.is_empty()
+                || attachment.mount_path.len() > 255
+                || !attachment.mount_path.starts_with('/')
+            {
+                return Err(ExecutorError::InvalidRequest(
+                    "volumes[].mount_path must be a non-empty absolute path".to_string(),
+                ));
+            }
+            if !mount_paths.insert(attachment.mount_path.clone()) {
+                return Err(ExecutorError::InvalidRequest(
+                    "volumes[] must not mount two volumes at the same path".to_string(),
+                ));
+            }
+            volume_mounts.push(agent_core::local_state::VolumeMount {
+                volume_name: docker_volume_name(&attachment.volume_id),
+                mount_path: attachment.mount_path.clone(),
+                read_only: attachment.read_only,
+            });
+        }
         Ok((
             WorkloadRecord {
                 workload_id: request.workload_id.clone(),
@@ -635,6 +868,7 @@ impl DockerExecutor {
                 egress_mbps: limits.egress_mbps,
                 rate_limited: false,
                 lease_end: Some(lease_end_unix),
+                volume_mounts: volume_mounts.clone(),
             },
             ContainerSpec {
                 name: format!("openinfra-{}", request.workload_id),
@@ -644,6 +878,7 @@ impl DockerExecutor {
                 nano_cpus,
                 pids_limit: self.settings.pids_limit,
                 egress_mbps: limits.egress_mbps,
+                volume_mounts,
             },
         ))
     }
@@ -684,6 +919,43 @@ impl DockerExecutor {
                 Err(error) => {
                     warn!(workload_id = %record.workload_id, %error, "persisted container is unavailable");
                     record.phase = WorkloadPhase::Lost;
+                }
+            }
+            // ADR-034 §3: drift detection for this record's Cinder
+            // volumes -- "does the Docker volume this record claims is
+            // mounted actually exist" -- the exact question this ADR
+            // names for `recover()` to answer for volumes, the same way
+            // the `inspect()` call above already answers it for the
+            // container itself. A missing volume is logged, not silently
+            // ignored and not auto-repaired here: the record's own
+            // `volume_mounts` stays as persisted (it is still an
+            // accurate account of what this workload *was deployed
+            // with*), and the mismatch against Postgres's
+            // `cinder_volumes` authoritative state is exactly the
+            // orphan-detection signal that table's own `provider_id`/
+            // `state` columns exist to reconcile against (ADR-034 §3's
+            // "Control Plane's orchestrator treating a heartbeat-silent
+            // provider's in-use volumes the same cautious way" note) --
+            // this Agent-local check surfaces the drift; it is not itself
+            // the reconciliation authority.
+            for mount in &record.volume_mounts {
+                match self.engine.volume_exists(&mount.volume_name).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(
+                            workload_id = %record.workload_id,
+                            volume_name = %mount.volume_name,
+                            "recover(): a Cinder volume this workload was deployed with no longer exists on this host"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            workload_id = %record.workload_id,
+                            volume_name = %mount.volume_name,
+                            %error,
+                            "recover(): could not check whether a Cinder volume this workload was deployed with still exists"
+                        );
+                    }
                 }
             }
             self.state.store_workload(&record)?;
@@ -866,6 +1138,19 @@ impl Executor for DockerExecutor {
         let container_id = match record.container_id.clone() {
             Some(container_id) => container_id,
             None => {
+                // ADR-034 §1/§2: each attached volume must exist before
+                // `self.engine.create(&spec)` references it by name in
+                // its own `HostConfig.mounts` -- engine-agnostic (a
+                // `ContainerEngine::create` implementation must not have
+                // to duplicate this ordering itself), the same
+                // "must-exist-before-referenced-by-name" discipline
+                // `BollardEngine::ensure_workload_network` already
+                // established for the workload network, just enforced
+                // one layer up here so every `ContainerEngine`
+                // implementation gets it for free.
+                for mount in &spec.volume_mounts {
+                    self.engine.ensure_volume(&mount.volume_name).await?;
+                }
                 let container_id = self.engine.create(&spec).await?;
                 record.container_id = Some(container_id.clone());
                 record.phase = WorkloadPhase::Starting;
@@ -1035,6 +1320,25 @@ impl Executor for DockerExecutor {
             gpu_seconds: 0,
         })
     }
+
+    /// ADR-034 §6/§7: `volume_id` here is the Control Plane's
+    /// `cinder_volumes.volume_id` (a UUID) -- turned into this Agent's
+    /// own deterministic Docker volume name via `docker_volume_name`
+    /// before ever reaching `bollard`, exactly the same derivation
+    /// `deployment()` already applies to `DeployRequest.volumes` entries,
+    /// so a delete for a volume this Agent previously attached resolves
+    /// to the identical Docker volume name it was created under.
+    async fn delete_volume(&self, volume_id: &str) -> Result<()> {
+        if Uuid::parse_str(volume_id).is_err() {
+            return Err(
+                ExecutorError::InvalidRequest("volume_id must be a UUID".to_string()).into(),
+            );
+        }
+        self.engine
+            .remove_volume_securely(&docker_volume_name(volume_id))
+            .await?;
+        Ok(())
+    }
 }
 
 /// ADR-033 §9 / issue #168 point 3: routes a `DeployRequest` to
@@ -1132,6 +1436,17 @@ impl Executor for RoutingExecutor {
             .usage_summary(workload_id, now, max_period_seconds)
             .await
     }
+
+    /// ADR-034 §5: always routed to the Docker executor, never `self.vm`
+    /// -- there is no `runtime_of` lookup here (unlike stop/get_status/
+    /// usage_summary above) because a Cinder volume_id is not a
+    /// workload_id at all, so there is nothing to look up; volumes are a
+    /// Docker-only mechanism by this ADR's own explicit, deliberate
+    /// design (§8: "attaching a Cinder volume to a VM workload" is out
+    /// of scope).
+    async fn delete_volume(&self, volume_id: &str) -> Result<()> {
+        self.docker.delete_volume(volume_id).await
+    }
 }
 
 #[cfg(test)]
@@ -1160,6 +1475,12 @@ mod tests {
         // Per-container_id configured failure for rate_limit(); absent
         // means succeed.
         rate_limit_failures: StdMutex<HashMap<String, String>>,
+        // ADR-034: every Docker volume this engine believes exists,
+        // standing in for `bollard`'s real volume store.
+        volumes: StdMutex<std::collections::HashSet<String>>,
+        // Every volume name `remove_volume_securely` was called with, in
+        // order -- lets tests assert secure deletion actually ran.
+        removed_volumes: StdMutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1262,6 +1583,27 @@ mod tests {
             {
                 return Err(ExecutorError::Engine(reason.clone()));
             }
+            Ok(())
+        }
+
+        async fn ensure_volume(&self, name: &str) -> Result<(), ExecutorError> {
+            self.volumes
+                .lock()
+                .expect("volumes lock")
+                .insert(name.to_string());
+            Ok(())
+        }
+
+        async fn volume_exists(&self, name: &str) -> Result<bool, ExecutorError> {
+            Ok(self.volumes.lock().expect("volumes lock").contains(name))
+        }
+
+        async fn remove_volume_securely(&self, name: &str) -> Result<(), ExecutorError> {
+            self.volumes.lock().expect("volumes lock").remove(name);
+            self.removed_volumes
+                .lock()
+                .expect("removed volumes lock")
+                .push(name.to_string());
             Ok(())
         }
     }
@@ -1427,6 +1769,7 @@ mod tests {
             egress_mbps: 0,
             rate_limited: false,
             lease_end: None,
+            volume_mounts: Vec::new(),
         };
         // reserve_workload (not store_workload -- that requires an
         // existing row) is deploy()'s own first step: reserve the
@@ -1461,6 +1804,196 @@ mod tests {
             container_id
         );
         assert_eq!(engine.created.lock().expect("created lock").len(), 1);
+    }
+
+    // ADR-034 §1/§2/§7: `deploy()` with a `DeployRequest.volumes` entry
+    // creates the underlying Docker volume and mounts it into the
+    // container's `HostConfig` -- exercised through `DockerExecutor`,
+    // not just `BollardEngine::create` in isolation, so this proves the
+    // full `deployment()` -> `ContainerSpec.volume_mounts` ->
+    // `WorkloadRecord.volume_mounts` path, not only one half of it.
+    #[tokio::test]
+    async fn deploy_creates_and_mounts_an_attached_volume() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let volume_id = Uuid::new_v4().to_string();
+        let mut deploy_request = request(Uuid::new_v4(), Uuid::new_v4());
+        deploy_request.volumes = vec![agent_api::proto::VolumeAttachment {
+            volume_id: volume_id.clone(),
+            mount_path: "/data".to_string(),
+            read_only: false,
+        }];
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let container_id = executor
+            .deploy(deploy_request.clone())
+            .await
+            .expect("deploy");
+
+        let expected_volume_name = docker_volume_name(&volume_id);
+        assert!(
+            engine
+                .volumes
+                .lock()
+                .expect("volumes lock")
+                .contains(&expected_volume_name),
+            "expected the Docker volume to have been created"
+        );
+        let created = engine.created.lock().expect("created lock");
+        let spec = created.last().expect("a container was created");
+        assert_eq!(spec.volume_mounts.len(), 1);
+        assert_eq!(spec.volume_mounts[0].volume_name, expected_volume_name);
+        assert_eq!(spec.volume_mounts[0].mount_path, "/data");
+        assert!(!spec.volume_mounts[0].read_only);
+        drop(created);
+
+        // The record persisted in local state carries the same mount, so
+        // a later recover() (or a control-plane-side status read) can
+        // see it too.
+        let record = executor
+            .state
+            .workload(&deploy_request.workload_id)
+            .expect("workload record");
+        assert_eq!(record.volume_mounts.len(), 1);
+        assert_eq!(record.volume_mounts[0].volume_name, expected_volume_name);
+        assert_eq!(record.container_id.as_deref(), Some(container_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_two_volumes_mounted_at_the_same_path() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let mut deploy_request = request(Uuid::new_v4(), Uuid::new_v4());
+        deploy_request.volumes = vec![
+            agent_api::proto::VolumeAttachment {
+                volume_id: Uuid::new_v4().to_string(),
+                mount_path: "/data".to_string(),
+                read_only: false,
+            },
+            agent_api::proto::VolumeAttachment {
+                volume_id: Uuid::new_v4().to_string(),
+                mount_path: "/data".to_string(),
+                read_only: false,
+            },
+        ];
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let error = executor
+            .deploy(deploy_request)
+            .await
+            .expect_err("must reject two volumes at the same mount path");
+        assert!(error.to_string().contains("same path"));
+        assert!(engine.created.lock().expect("created lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_non_uuid_volume_id() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let mut deploy_request = request(Uuid::new_v4(), Uuid::new_v4());
+        deploy_request.volumes = vec![agent_api::proto::VolumeAttachment {
+            volume_id: "not-a-uuid".to_string(),
+            mount_path: "/data".to_string(),
+            read_only: false,
+        }];
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let error = executor
+            .deploy(deploy_request)
+            .await
+            .expect_err("must reject a non-UUID volume_id");
+        assert!(error.to_string().contains("UUID"));
+    }
+
+    // ADR-034 §3's own drift-detection scenario: after an Agent restart,
+    // a workload's persisted volume_mounts entry no longer corresponds
+    // to a real Docker volume (e.g. the volume was deleted out-of-band,
+    // or the Agent's local state survived a host rebuild that wiped
+    // Docker's own volume store). recover() must not crash or silently
+    // "fix" this -- it logs the drift and leaves the record's own
+    // volume_mounts intact, since it is still an accurate account of
+    // what the workload *was deployed with*.
+    #[tokio::test]
+    async fn recover_detects_a_missing_volume_without_failing() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let volume_id = Uuid::new_v4().to_string();
+        let mut deploy_request = request(Uuid::new_v4(), Uuid::new_v4());
+        deploy_request.volumes = vec![agent_api::proto::VolumeAttachment {
+            volume_id: volume_id.clone(),
+            mount_path: "/data".to_string(),
+            read_only: false,
+        }];
+        let workload_id = deploy_request.workload_id.clone();
+        {
+            let executor = executor(engine.clone(), directory.path(), 1);
+            executor.deploy(deploy_request).await.expect("deploy");
+        }
+
+        // Simulate the volume having vanished out-of-band (e.g. removed
+        // directly via `docker volume rm`, outside this Agent's own
+        // lifecycle) between the deploy above and the restart below.
+        let expected_volume_name = docker_volume_name(&volume_id);
+        engine
+            .volumes
+            .lock()
+            .expect("volumes lock")
+            .remove(&expected_volume_name);
+
+        let recovered = executor(engine.clone(), directory.path(), 1);
+        recovered
+            .recover()
+            .await
+            .expect("recover must not fail on a missing volume");
+
+        // The record's own account of what it was deployed with is
+        // preserved -- recover() does not silently drop the mount just
+        // because the backing volume is currently missing.
+        let record = recovered.state.workload(&workload_id).expect("record");
+        assert_eq!(record.volume_mounts.len(), 1);
+        assert_eq!(record.volume_mounts[0].volume_name, expected_volume_name);
+    }
+
+    #[tokio::test]
+    async fn delete_volume_calls_secure_removal_with_the_derived_docker_name() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let volume_id = Uuid::new_v4().to_string();
+        engine
+            .volumes
+            .lock()
+            .expect("volumes lock")
+            .insert(docker_volume_name(&volume_id));
+
+        Executor::delete_volume(&executor, &volume_id)
+            .await
+            .expect("delete_volume");
+
+        let expected_volume_name = docker_volume_name(&volume_id);
+        assert!(!engine
+            .volumes
+            .lock()
+            .expect("volumes lock")
+            .contains(&expected_volume_name));
+        assert_eq!(
+            engine
+                .removed_volumes
+                .lock()
+                .expect("removed volumes lock")
+                .as_slice(),
+            [expected_volume_name]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_volume_is_idempotent_for_an_unknown_volume() {
+        // ADR-034 §6 / agent.proto's DeleteVolumeRequest doc comment: a
+        // volume this Agent never actually created (bound in Postgres
+        // but never mounted here) must delete successfully, not error.
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        Executor::delete_volume(&executor, &Uuid::new_v4().to_string())
+            .await
+            .expect("deleting an unknown volume must be idempotent, not an error");
     }
 
     #[tokio::test]
@@ -2504,6 +3037,7 @@ mod tests {
             nano_cpus: 500_000_000,
             pids_limit: 32,
             egress_mbps: 0,
+            volume_mounts: Vec::new(),
         };
         let container_id = engine
             .create(&spec)
@@ -2603,6 +3137,7 @@ mod routing_tests {
             }),
             runtime,
             vm: None,
+            volumes: Vec::new(),
         }
     }
 
@@ -2625,6 +3160,7 @@ mod routing_tests {
                 vm_image_url: "https://example.com/image.qcow2".to_string(),
                 vm_image_sha256: "a".repeat(64),
             }),
+            volumes: Vec::new(),
         }
     }
 
@@ -2641,6 +3177,7 @@ mod routing_tests {
             egress_mbps: 0,
             rate_limited: false,
             lease_end: Some(4_102_444_800),
+            volume_mounts: Vec::new(),
         }
     }
 

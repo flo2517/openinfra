@@ -29,6 +29,7 @@ const (
 	ProviderAgentService_StreamMetrics_FullMethodName     = "/openinfra.agent.v1.ProviderAgentService/StreamMetrics"
 	ProviderAgentService_MeasureBandwidth_FullMethodName  = "/openinfra.agent.v1.ProviderAgentService/MeasureBandwidth"
 	ProviderAgentService_GetUsageSummary_FullMethodName   = "/openinfra.agent.v1.ProviderAgentService/GetUsageSummary"
+	ProviderAgentService_DeleteVolume_FullMethodName      = "/openinfra.agent.v1.ProviderAgentService/DeleteVolume"
 )
 
 // ProviderAgentServiceClient is the client API for ProviderAgentService service.
@@ -57,6 +58,18 @@ type ProviderAgentServiceClient interface {
 	// covering usage since that workload's last-issued sequence. See
 	// GetUsageSummaryResponse's doc comment for the signing/hash details.
 	GetUsageSummary(ctx context.Context, in *GetUsageSummaryRequest, opts ...grpc.CallOption) (*GetUsageSummaryResponse, error)
+	// ADR-034 §6/§7 / issue #171: securely deletes the Docker named volume
+	// backing a Cinder block volume (control-plane's cinder_volumes row,
+	// migration 000021) on this specific Agent -- the only volume
+	// lifecycle operation that needs a dedicated RPC rather than riding on
+	// Deploy/Stop, since a volume being deleted has, by construction
+	// (internal/openstackapi/cinder only permits delete from the
+	// 'available' state), no currently-running workload/DeployRequest to
+	// attach the request to. Called by the Control Plane only after its
+	// own Postgres-side transition to 'deleting' has already committed
+	// (ADR-034 §2) -- this RPC is the Agent-side half of that already-
+	// decided delete, not itself an authorization decision.
+	DeleteVolume(ctx context.Context, in *DeleteVolumeRequest, opts ...grpc.CallOption) (*DeleteVolumeResponse, error)
 }
 
 type providerAgentServiceClient struct {
@@ -176,6 +189,16 @@ func (c *providerAgentServiceClient) GetUsageSummary(ctx context.Context, in *Ge
 	return out, nil
 }
 
+func (c *providerAgentServiceClient) DeleteVolume(ctx context.Context, in *DeleteVolumeRequest, opts ...grpc.CallOption) (*DeleteVolumeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteVolumeResponse)
+	err := c.cc.Invoke(ctx, ProviderAgentService_DeleteVolume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ProviderAgentServiceServer is the server API for ProviderAgentService service.
 // All implementations must embed UnimplementedProviderAgentServiceServer
 // for forward compatibility.
@@ -202,6 +225,18 @@ type ProviderAgentServiceServer interface {
 	// covering usage since that workload's last-issued sequence. See
 	// GetUsageSummaryResponse's doc comment for the signing/hash details.
 	GetUsageSummary(context.Context, *GetUsageSummaryRequest) (*GetUsageSummaryResponse, error)
+	// ADR-034 §6/§7 / issue #171: securely deletes the Docker named volume
+	// backing a Cinder block volume (control-plane's cinder_volumes row,
+	// migration 000021) on this specific Agent -- the only volume
+	// lifecycle operation that needs a dedicated RPC rather than riding on
+	// Deploy/Stop, since a volume being deleted has, by construction
+	// (internal/openstackapi/cinder only permits delete from the
+	// 'available' state), no currently-running workload/DeployRequest to
+	// attach the request to. Called by the Control Plane only after its
+	// own Postgres-side transition to 'deleting' has already committed
+	// (ADR-034 §2) -- this RPC is the Agent-side half of that already-
+	// decided delete, not itself an authorization decision.
+	DeleteVolume(context.Context, *DeleteVolumeRequest) (*DeleteVolumeResponse, error)
 	mustEmbedUnimplementedProviderAgentServiceServer()
 }
 
@@ -241,6 +276,9 @@ func (UnimplementedProviderAgentServiceServer) MeasureBandwidth(context.Context,
 }
 func (UnimplementedProviderAgentServiceServer) GetUsageSummary(context.Context, *GetUsageSummaryRequest) (*GetUsageSummaryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetUsageSummary not implemented")
+}
+func (UnimplementedProviderAgentServiceServer) DeleteVolume(context.Context, *DeleteVolumeRequest) (*DeleteVolumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteVolume not implemented")
 }
 func (UnimplementedProviderAgentServiceServer) mustEmbedUnimplementedProviderAgentServiceServer() {}
 func (UnimplementedProviderAgentServiceServer) testEmbeddedByValue()                              {}
@@ -436,6 +474,24 @@ func _ProviderAgentService_GetUsageSummary_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ProviderAgentService_DeleteVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteVolumeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProviderAgentServiceServer).DeleteVolume(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProviderAgentService_DeleteVolume_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProviderAgentServiceServer).DeleteVolume(ctx, req.(*DeleteVolumeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ProviderAgentService_ServiceDesc is the grpc.ServiceDesc for ProviderAgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -478,6 +534,10 @@ var ProviderAgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetUsageSummary",
 			Handler:    _ProviderAgentService_GetUsageSummary_Handler,
+		},
+		{
+			MethodName: "DeleteVolume",
+			Handler:    _ProviderAgentService_DeleteVolume_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

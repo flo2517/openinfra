@@ -195,7 +195,7 @@ func (x GetWorkloadStatusResponse_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use GetWorkloadStatusResponse_State.Descriptor instead.
 func (GetWorkloadStatusResponse_State) EnumDescriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{10, 0}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{11, 0}
 }
 
 type GetAgentInfoResponse struct {
@@ -450,7 +450,29 @@ type DeployRequest struct {
 	// deliberately reuses `limits.cpu_cores`/`limits.memory_mb` rather than
 	// duplicating them on VmSpec -- cpu_cores must be a whole number for a
 	// VM's vcpu count (agent-executor rejects a fractional value).
-	Vm            *VmSpec `protobuf:"bytes,7,opt,name=vm,proto3" json:"vm,omitempty"`
+	Vm *VmSpec `protobuf:"bytes,7,opt,name=vm,proto3" json:"vm,omitempty"`
+	// ADR-034 §7 / issue #171: Cinder block volumes to mount into this
+	// workload's container at create time. Empty (the default -- every
+	// DeployRequest built before this field existed implicitly carries no
+	// volumes) is the common case and changes nothing about deploy
+	// behavior, additive and backward-compatible like `runtime`/`vm`
+	// above. Only meaningful for RUNTIME_CONTAINER: ADR-034 §5 keeps VM
+	// boot disks and Cinder volumes deliberately separate mechanisms, and
+	// attaching a Cinder volume to a VM workload is explicitly out of
+	// scope (ADR-034 §8) -- agent-executor's vm::VmExecutor ignores this
+	// field entirely, the same way DockerExecutor ignores `vm` (§4's own
+	// "ignored for a VM-flavored request" precedent, mirrored here).
+	//
+	// Populated by control-plane/internal/orchestrator's deploy dispatch
+	// from cinder_volumes rows already attached (Postgres-authoritative,
+	// ADR-034 §3) to this workload_id on the target provider at the
+	// moment Deploy is dispatched -- a volume attached to an already-
+	// *running* workload after its first Deploy has no effect until that
+	// workload's next Deploy dispatch (there is no live-remount
+	// mechanism), a named limitation matching this codebase's existing
+	// "no callable redeploy" gap (internal/openstackapi/nova's package
+	// doc comment) rather than a silently half-built fix.
+	Volumes       []*VolumeAttachment `protobuf:"bytes,8,rep,name=volumes,proto3" json:"volumes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -534,6 +556,80 @@ func (x *DeployRequest) GetVm() *VmSpec {
 	return nil
 }
 
+func (x *DeployRequest) GetVolumes() []*VolumeAttachment {
+	if x != nil {
+		return x.Volumes
+	}
+	return nil
+}
+
+// ADR-034 §1/§7: one Cinder volume attached into this container. volume_id
+// is the Docker named volume's own name (agent-executor mints it
+// deterministically from the Cinder volume_id, see agent-executor's own
+// doc comment on volume naming) -- the Agent creates the underlying
+// Docker volume on first use if it does not already exist (ADR-034 §2:
+// "nothing is created on any provider host until the volume is first
+// attached").
+type VolumeAttachment struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	MountPath     string                 `protobuf:"bytes,2,opt,name=mount_path,json=mountPath,proto3" json:"mount_path,omitempty"`
+	ReadOnly      bool                   `protobuf:"varint,3,opt,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VolumeAttachment) Reset() {
+	*x = VolumeAttachment{}
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VolumeAttachment) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VolumeAttachment) ProtoMessage() {}
+
+func (x *VolumeAttachment) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VolumeAttachment.ProtoReflect.Descriptor instead.
+func (*VolumeAttachment) Descriptor() ([]byte, []int) {
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *VolumeAttachment) GetVolumeId() string {
+	if x != nil {
+		return x.VolumeId
+	}
+	return ""
+}
+
+func (x *VolumeAttachment) GetMountPath() string {
+	if x != nil {
+		return x.MountPath
+	}
+	return ""
+}
+
+func (x *VolumeAttachment) GetReadOnly() bool {
+	if x != nil {
+		return x.ReadOnly
+	}
+	return false
+}
+
 // ADR-033 §4: digest-pinned, fetched over HTTPS, verified before first
 // boot -- the VM analog of `image`'s OCI `name@sha256:digest` convention,
 // necessarily shaped differently since there is no OCI registry concept
@@ -550,7 +646,7 @@ type VmSpec struct {
 
 func (x *VmSpec) Reset() {
 	*x = VmSpec{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[4]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -562,7 +658,7 @@ func (x *VmSpec) String() string {
 func (*VmSpec) ProtoMessage() {}
 
 func (x *VmSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[4]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -575,7 +671,7 @@ func (x *VmSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VmSpec.ProtoReflect.Descriptor instead.
 func (*VmSpec) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{4}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *VmSpec) GetVmImageUrl() string {
@@ -614,7 +710,7 @@ type ResourceLimits struct {
 
 func (x *ResourceLimits) Reset() {
 	*x = ResourceLimits{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[5]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -626,7 +722,7 @@ func (x *ResourceLimits) String() string {
 func (*ResourceLimits) ProtoMessage() {}
 
 func (x *ResourceLimits) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[5]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -639,7 +735,7 @@ func (x *ResourceLimits) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceLimits.ProtoReflect.Descriptor instead.
 func (*ResourceLimits) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{5}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ResourceLimits) GetCpuCores() float32 {
@@ -674,7 +770,7 @@ type DeployResponse struct {
 
 func (x *DeployResponse) Reset() {
 	*x = DeployResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[6]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -686,7 +782,7 @@ func (x *DeployResponse) String() string {
 func (*DeployResponse) ProtoMessage() {}
 
 func (x *DeployResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[6]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -699,7 +795,7 @@ func (x *DeployResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeployResponse.ProtoReflect.Descriptor instead.
 func (*DeployResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{6}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *DeployResponse) GetSuccess() bool {
@@ -732,7 +828,7 @@ type StopRequest struct {
 
 func (x *StopRequest) Reset() {
 	*x = StopRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[7]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -744,7 +840,7 @@ func (x *StopRequest) String() string {
 func (*StopRequest) ProtoMessage() {}
 
 func (x *StopRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[7]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -757,7 +853,7 @@ func (x *StopRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopRequest.ProtoReflect.Descriptor instead.
 func (*StopRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{7}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *StopRequest) GetWorkloadId() string {
@@ -777,7 +873,7 @@ type StopResponse struct {
 
 func (x *StopResponse) Reset() {
 	*x = StopResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[8]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -789,7 +885,7 @@ func (x *StopResponse) String() string {
 func (*StopResponse) ProtoMessage() {}
 
 func (x *StopResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[8]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -802,7 +898,7 @@ func (x *StopResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopResponse.ProtoReflect.Descriptor instead.
 func (*StopResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{8}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *StopResponse) GetSuccess() bool {
@@ -828,7 +924,7 @@ type GetWorkloadStatusRequest struct {
 
 func (x *GetWorkloadStatusRequest) Reset() {
 	*x = GetWorkloadStatusRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[9]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -840,7 +936,7 @@ func (x *GetWorkloadStatusRequest) String() string {
 func (*GetWorkloadStatusRequest) ProtoMessage() {}
 
 func (x *GetWorkloadStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[9]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -853,7 +949,7 @@ func (x *GetWorkloadStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetWorkloadStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetWorkloadStatusRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{9}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GetWorkloadStatusRequest) GetWorkloadId() string {
@@ -874,7 +970,7 @@ type GetWorkloadStatusResponse struct {
 
 func (x *GetWorkloadStatusResponse) Reset() {
 	*x = GetWorkloadStatusResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[10]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -886,7 +982,7 @@ func (x *GetWorkloadStatusResponse) String() string {
 func (*GetWorkloadStatusResponse) ProtoMessage() {}
 
 func (x *GetWorkloadStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[10]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -899,7 +995,7 @@ func (x *GetWorkloadStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetWorkloadStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetWorkloadStatusResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{10}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetWorkloadStatusResponse) GetWorkloadId() string {
@@ -931,7 +1027,7 @@ type GetInventoryRequest struct {
 
 func (x *GetInventoryRequest) Reset() {
 	*x = GetInventoryRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[11]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -943,7 +1039,7 @@ func (x *GetInventoryRequest) String() string {
 func (*GetInventoryRequest) ProtoMessage() {}
 
 func (x *GetInventoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[11]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -956,7 +1052,7 @@ func (x *GetInventoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetInventoryRequest.ProtoReflect.Descriptor instead.
 func (*GetInventoryRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{11}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{12}
 }
 
 type GetInventoryResponse struct {
@@ -970,7 +1066,7 @@ type GetInventoryResponse struct {
 
 func (x *GetInventoryResponse) Reset() {
 	*x = GetInventoryResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[12]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -982,7 +1078,7 @@ func (x *GetInventoryResponse) String() string {
 func (*GetInventoryResponse) ProtoMessage() {}
 
 func (x *GetInventoryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[12]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -995,7 +1091,7 @@ func (x *GetInventoryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetInventoryResponse.ProtoReflect.Descriptor instead.
 func (*GetInventoryResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{12}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GetInventoryResponse) GetCpuCores() float32 {
@@ -1027,7 +1123,7 @@ type StreamMetricsRequest struct {
 
 func (x *StreamMetricsRequest) Reset() {
 	*x = StreamMetricsRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[13]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1039,7 +1135,7 @@ func (x *StreamMetricsRequest) String() string {
 func (*StreamMetricsRequest) ProtoMessage() {}
 
 func (x *StreamMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[13]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1052,7 +1148,7 @@ func (x *StreamMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamMetricsRequest.ProtoReflect.Descriptor instead.
 func (*StreamMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{13}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{14}
 }
 
 type StreamMetricsResponse struct {
@@ -1066,7 +1162,7 @@ type StreamMetricsResponse struct {
 
 func (x *StreamMetricsResponse) Reset() {
 	*x = StreamMetricsResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1078,7 +1174,7 @@ func (x *StreamMetricsResponse) String() string {
 func (*StreamMetricsResponse) ProtoMessage() {}
 
 func (x *StreamMetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[14]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1091,7 +1187,7 @@ func (x *StreamMetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamMetricsResponse.ProtoReflect.Descriptor instead.
 func (*StreamMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{14}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *StreamMetricsResponse) GetMetricName() string {
@@ -1136,7 +1232,7 @@ type MeasureBandwidthRequest struct {
 
 func (x *MeasureBandwidthRequest) Reset() {
 	*x = MeasureBandwidthRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1148,7 +1244,7 @@ func (x *MeasureBandwidthRequest) String() string {
 func (*MeasureBandwidthRequest) ProtoMessage() {}
 
 func (x *MeasureBandwidthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[15]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1161,7 +1257,7 @@ func (x *MeasureBandwidthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MeasureBandwidthRequest.ProtoReflect.Descriptor instead.
 func (*MeasureBandwidthRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{15}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *MeasureBandwidthRequest) GetProbeId() string {
@@ -1198,7 +1294,7 @@ type MeasureBandwidthResponse struct {
 
 func (x *MeasureBandwidthResponse) Reset() {
 	*x = MeasureBandwidthResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1210,7 +1306,7 @@ func (x *MeasureBandwidthResponse) String() string {
 func (*MeasureBandwidthResponse) ProtoMessage() {}
 
 func (x *MeasureBandwidthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[16]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1223,7 +1319,7 @@ func (x *MeasureBandwidthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MeasureBandwidthResponse.ProtoReflect.Descriptor instead.
 func (*MeasureBandwidthResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{16}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *MeasureBandwidthResponse) GetProbeId() string {
@@ -1269,7 +1365,7 @@ type HealthCheckRequest struct {
 
 func (x *HealthCheckRequest) Reset() {
 	*x = HealthCheckRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1281,7 +1377,7 @@ func (x *HealthCheckRequest) String() string {
 func (*HealthCheckRequest) ProtoMessage() {}
 
 func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[17]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1294,7 +1390,7 @@ func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckRequest.ProtoReflect.Descriptor instead.
 func (*HealthCheckRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{17}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{18}
 }
 
 type HealthCheckResponse struct {
@@ -1307,7 +1403,7 @@ type HealthCheckResponse struct {
 
 func (x *HealthCheckResponse) Reset() {
 	*x = HealthCheckResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[18]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1319,7 +1415,7 @@ func (x *HealthCheckResponse) String() string {
 func (*HealthCheckResponse) ProtoMessage() {}
 
 func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[18]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1332,7 +1428,7 @@ func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckResponse.ProtoReflect.Descriptor instead.
 func (*HealthCheckResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{18}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *HealthCheckResponse) GetHealthy() bool {
@@ -1357,7 +1453,7 @@ type GetAgentInfoRequest struct {
 
 func (x *GetAgentInfoRequest) Reset() {
 	*x = GetAgentInfoRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[19]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1369,7 +1465,7 @@ func (x *GetAgentInfoRequest) String() string {
 func (*GetAgentInfoRequest) ProtoMessage() {}
 
 func (x *GetAgentInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[19]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1382,7 +1478,7 @@ func (x *GetAgentInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAgentInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetAgentInfoRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{19}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{20}
 }
 
 type GetUsageSummaryRequest struct {
@@ -1394,7 +1490,7 @@ type GetUsageSummaryRequest struct {
 
 func (x *GetUsageSummaryRequest) Reset() {
 	*x = GetUsageSummaryRequest{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[20]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1406,7 +1502,7 @@ func (x *GetUsageSummaryRequest) String() string {
 func (*GetUsageSummaryRequest) ProtoMessage() {}
 
 func (x *GetUsageSummaryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[20]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1419,7 +1515,7 @@ func (x *GetUsageSummaryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetUsageSummaryRequest.ProtoReflect.Descriptor instead.
 func (*GetUsageSummaryRequest) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{20}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *GetUsageSummaryRequest) GetWorkloadId() string {
@@ -1447,7 +1543,7 @@ type GetUsageSummaryResponse struct {
 
 func (x *GetUsageSummaryResponse) Reset() {
 	*x = GetUsageSummaryResponse{}
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[21]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1459,7 +1555,7 @@ func (x *GetUsageSummaryResponse) String() string {
 func (*GetUsageSummaryResponse) ProtoMessage() {}
 
 func (x *GetUsageSummaryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[21]
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1472,7 +1568,7 @@ func (x *GetUsageSummaryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetUsageSummaryResponse.ProtoReflect.Descriptor instead.
 func (*GetUsageSummaryResponse) Descriptor() ([]byte, []int) {
-	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{21}
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *GetUsageSummaryResponse) GetSummary() *v1.MeteringSummary {
@@ -1492,6 +1588,108 @@ func (x *GetUsageSummaryResponse) GetSignature() []byte {
 func (x *GetUsageSummaryResponse) GetEvidenceHash() string {
 	if x != nil {
 		return x.EvidenceHash
+	}
+	return ""
+}
+
+// ADR-034 §6: volume_id is the same Docker volume name VolumeAttachment
+// carries. Deleting a volume this Agent has no record of (never
+// attached here, or already removed) is treated as success -- the
+// desired end state (no such Docker volume) already holds, matching
+// Stop's own idempotent-at-the-Agent-boundary convention
+// (agentmanager.Client.StopAndConfirm's doc comment).
+type DeleteVolumeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId      string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteVolumeRequest) Reset() {
+	*x = DeleteVolumeRequest{}
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteVolumeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteVolumeRequest) ProtoMessage() {}
+
+func (x *DeleteVolumeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteVolumeRequest.ProtoReflect.Descriptor instead.
+func (*DeleteVolumeRequest) Descriptor() ([]byte, []int) {
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *DeleteVolumeRequest) GetVolumeId() string {
+	if x != nil {
+		return x.VolumeId
+	}
+	return ""
+}
+
+type DeleteVolumeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteVolumeResponse) Reset() {
+	*x = DeleteVolumeResponse{}
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteVolumeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteVolumeResponse) ProtoMessage() {}
+
+func (x *DeleteVolumeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_agent_v1_agent_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteVolumeResponse.ProtoReflect.Descriptor instead.
+func (*DeleteVolumeResponse) Descriptor() ([]byte, []int) {
+	return file_openinfra_agent_v1_agent_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *DeleteVolumeResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *DeleteVolumeResponse) GetError() string {
+	if x != nil {
+		return x.Error
 	}
 	return ""
 }
@@ -1526,7 +1724,7 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x06result\x18\x03 \x01(\fR\x06result\x12\x1f\n" +
 	"\vduration_ms\x18\x04 \x01(\rR\n" +
 	"durationMs\x12\x1c\n" +
-	"\tsignature\x18\x05 \x01(\fR\tsignature\"\xb9\x02\n" +
+	"\tsignature\x18\x05 \x01(\fR\tsignature\"\xf9\x02\n" +
 	"\rDeployRequest\x12\x1f\n" +
 	"\vworkload_id\x18\x01 \x01(\tR\n" +
 	"workloadId\x12\x19\n" +
@@ -1535,7 +1733,13 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x06limits\x18\x04 \x01(\v2\".openinfra.agent.v1.ResourceLimitsR\x06limits\x127\n" +
 	"\tlease_end\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\bleaseEnd\x125\n" +
 	"\aruntime\x18\x06 \x01(\x0e2\x1b.openinfra.agent.v1.RuntimeR\aruntime\x12*\n" +
-	"\x02vm\x18\a \x01(\v2\x1a.openinfra.agent.v1.VmSpecR\x02vm\"R\n" +
+	"\x02vm\x18\a \x01(\v2\x1a.openinfra.agent.v1.VmSpecR\x02vm\x12>\n" +
+	"\avolumes\x18\b \x03(\v2$.openinfra.agent.v1.VolumeAttachmentR\avolumes\"k\n" +
+	"\x10VolumeAttachment\x12\x1b\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
+	"\n" +
+	"mount_path\x18\x02 \x01(\tR\tmountPath\x12\x1b\n" +
+	"\tread_only\x18\x03 \x01(\bR\breadOnly\"R\n" +
 	"\x06VmSpec\x12 \n" +
 	"\fvm_image_url\x18\x01 \x01(\tR\n" +
 	"vmImageUrl\x12&\n" +
@@ -1604,12 +1808,17 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x17GetUsageSummaryResponse\x12>\n" +
 	"\asummary\x18\x01 \x01(\v2$.openinfra.shared.v1.MeteringSummaryR\asummary\x12\x1c\n" +
 	"\tsignature\x18\x02 \x01(\fR\tsignature\x12#\n" +
-	"\revidence_hash\x18\x03 \x01(\tR\fevidenceHash*I\n" +
+	"\revidence_hash\x18\x03 \x01(\tR\fevidenceHash\"2\n" +
+	"\x13DeleteVolumeRequest\x12\x1b\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\"F\n" +
+	"\x14DeleteVolumeResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error*I\n" +
 	"\aRuntime\x12\x17\n" +
 	"\x13RUNTIME_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11RUNTIME_CONTAINER\x10\x01\x12\x0e\n" +
 	"\n" +
-	"RUNTIME_VM\x10\x022\xf6\a\n" +
+	"RUNTIME_VM\x10\x022\xd9\b\n" +
 	"\x14ProviderAgentService\x12a\n" +
 	"\fGetAgentInfo\x12'.openinfra.agent.v1.GetAgentInfoRequest\x1a(.openinfra.agent.v1.GetAgentInfoResponse\x12^\n" +
 	"\vHealthCheck\x12&.openinfra.agent.v1.HealthCheckRequest\x1a'.openinfra.agent.v1.HealthCheckResponse\x12a\n" +
@@ -1620,7 +1829,8 @@ const file_openinfra_agent_v1_agent_proto_rawDesc = "" +
 	"\x11GetWorkloadStatus\x12,.openinfra.agent.v1.GetWorkloadStatusRequest\x1a-.openinfra.agent.v1.GetWorkloadStatusResponse\x12f\n" +
 	"\rStreamMetrics\x12(.openinfra.agent.v1.StreamMetricsRequest\x1a).openinfra.agent.v1.StreamMetricsResponse0\x01\x12m\n" +
 	"\x10MeasureBandwidth\x12+.openinfra.agent.v1.MeasureBandwidthRequest\x1a,.openinfra.agent.v1.MeasureBandwidthResponse\x12j\n" +
-	"\x0fGetUsageSummary\x12*.openinfra.agent.v1.GetUsageSummaryRequest\x1a+.openinfra.agent.v1.GetUsageSummaryResponseBEZCgithub.com/openinfra/network/protocol/generated/go/agent/v1;agentv1b\x06proto3"
+	"\x0fGetUsageSummary\x12*.openinfra.agent.v1.GetUsageSummaryRequest\x1a+.openinfra.agent.v1.GetUsageSummaryResponse\x12a\n" +
+	"\fDeleteVolume\x12'.openinfra.agent.v1.DeleteVolumeRequest\x1a(.openinfra.agent.v1.DeleteVolumeResponseBEZCgithub.com/openinfra/network/protocol/generated/go/agent/v1;agentv1b\x06proto3"
 
 var (
 	file_openinfra_agent_v1_agent_proto_rawDescOnce sync.Once
@@ -1635,7 +1845,7 @@ func file_openinfra_agent_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_openinfra_agent_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_openinfra_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_openinfra_agent_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_openinfra_agent_v1_agent_proto_goTypes = []any{
 	(Runtime)(0),                         // 0: openinfra.agent.v1.Runtime
 	(SolveChallengeRequest_Type)(0),      // 1: openinfra.agent.v1.SolveChallengeRequest.Type
@@ -1644,60 +1854,66 @@ var file_openinfra_agent_v1_agent_proto_goTypes = []any{
 	(*SolveChallengeRequest)(nil),        // 4: openinfra.agent.v1.SolveChallengeRequest
 	(*SolveChallengeResponse)(nil),       // 5: openinfra.agent.v1.SolveChallengeResponse
 	(*DeployRequest)(nil),                // 6: openinfra.agent.v1.DeployRequest
-	(*VmSpec)(nil),                       // 7: openinfra.agent.v1.VmSpec
-	(*ResourceLimits)(nil),               // 8: openinfra.agent.v1.ResourceLimits
-	(*DeployResponse)(nil),               // 9: openinfra.agent.v1.DeployResponse
-	(*StopRequest)(nil),                  // 10: openinfra.agent.v1.StopRequest
-	(*StopResponse)(nil),                 // 11: openinfra.agent.v1.StopResponse
-	(*GetWorkloadStatusRequest)(nil),     // 12: openinfra.agent.v1.GetWorkloadStatusRequest
-	(*GetWorkloadStatusResponse)(nil),    // 13: openinfra.agent.v1.GetWorkloadStatusResponse
-	(*GetInventoryRequest)(nil),          // 14: openinfra.agent.v1.GetInventoryRequest
-	(*GetInventoryResponse)(nil),         // 15: openinfra.agent.v1.GetInventoryResponse
-	(*StreamMetricsRequest)(nil),         // 16: openinfra.agent.v1.StreamMetricsRequest
-	(*StreamMetricsResponse)(nil),        // 17: openinfra.agent.v1.StreamMetricsResponse
-	(*MeasureBandwidthRequest)(nil),      // 18: openinfra.agent.v1.MeasureBandwidthRequest
-	(*MeasureBandwidthResponse)(nil),     // 19: openinfra.agent.v1.MeasureBandwidthResponse
-	(*HealthCheckRequest)(nil),           // 20: openinfra.agent.v1.HealthCheckRequest
-	(*HealthCheckResponse)(nil),          // 21: openinfra.agent.v1.HealthCheckResponse
-	(*GetAgentInfoRequest)(nil),          // 22: openinfra.agent.v1.GetAgentInfoRequest
-	(*GetUsageSummaryRequest)(nil),       // 23: openinfra.agent.v1.GetUsageSummaryRequest
-	(*GetUsageSummaryResponse)(nil),      // 24: openinfra.agent.v1.GetUsageSummaryResponse
-	(*timestamppb.Timestamp)(nil),        // 25: google.protobuf.Timestamp
-	(*v1.MeteringSummary)(nil),           // 26: openinfra.shared.v1.MeteringSummary
+	(*VolumeAttachment)(nil),             // 7: openinfra.agent.v1.VolumeAttachment
+	(*VmSpec)(nil),                       // 8: openinfra.agent.v1.VmSpec
+	(*ResourceLimits)(nil),               // 9: openinfra.agent.v1.ResourceLimits
+	(*DeployResponse)(nil),               // 10: openinfra.agent.v1.DeployResponse
+	(*StopRequest)(nil),                  // 11: openinfra.agent.v1.StopRequest
+	(*StopResponse)(nil),                 // 12: openinfra.agent.v1.StopResponse
+	(*GetWorkloadStatusRequest)(nil),     // 13: openinfra.agent.v1.GetWorkloadStatusRequest
+	(*GetWorkloadStatusResponse)(nil),    // 14: openinfra.agent.v1.GetWorkloadStatusResponse
+	(*GetInventoryRequest)(nil),          // 15: openinfra.agent.v1.GetInventoryRequest
+	(*GetInventoryResponse)(nil),         // 16: openinfra.agent.v1.GetInventoryResponse
+	(*StreamMetricsRequest)(nil),         // 17: openinfra.agent.v1.StreamMetricsRequest
+	(*StreamMetricsResponse)(nil),        // 18: openinfra.agent.v1.StreamMetricsResponse
+	(*MeasureBandwidthRequest)(nil),      // 19: openinfra.agent.v1.MeasureBandwidthRequest
+	(*MeasureBandwidthResponse)(nil),     // 20: openinfra.agent.v1.MeasureBandwidthResponse
+	(*HealthCheckRequest)(nil),           // 21: openinfra.agent.v1.HealthCheckRequest
+	(*HealthCheckResponse)(nil),          // 22: openinfra.agent.v1.HealthCheckResponse
+	(*GetAgentInfoRequest)(nil),          // 23: openinfra.agent.v1.GetAgentInfoRequest
+	(*GetUsageSummaryRequest)(nil),       // 24: openinfra.agent.v1.GetUsageSummaryRequest
+	(*GetUsageSummaryResponse)(nil),      // 25: openinfra.agent.v1.GetUsageSummaryResponse
+	(*DeleteVolumeRequest)(nil),          // 26: openinfra.agent.v1.DeleteVolumeRequest
+	(*DeleteVolumeResponse)(nil),         // 27: openinfra.agent.v1.DeleteVolumeResponse
+	(*timestamppb.Timestamp)(nil),        // 28: google.protobuf.Timestamp
+	(*v1.MeteringSummary)(nil),           // 29: openinfra.shared.v1.MeteringSummary
 }
 var file_openinfra_agent_v1_agent_proto_depIdxs = []int32{
 	1,  // 0: openinfra.agent.v1.SolveChallengeRequest.type:type_name -> openinfra.agent.v1.SolveChallengeRequest.Type
-	8,  // 1: openinfra.agent.v1.DeployRequest.limits:type_name -> openinfra.agent.v1.ResourceLimits
-	25, // 2: openinfra.agent.v1.DeployRequest.lease_end:type_name -> google.protobuf.Timestamp
+	9,  // 1: openinfra.agent.v1.DeployRequest.limits:type_name -> openinfra.agent.v1.ResourceLimits
+	28, // 2: openinfra.agent.v1.DeployRequest.lease_end:type_name -> google.protobuf.Timestamp
 	0,  // 3: openinfra.agent.v1.DeployRequest.runtime:type_name -> openinfra.agent.v1.Runtime
-	7,  // 4: openinfra.agent.v1.DeployRequest.vm:type_name -> openinfra.agent.v1.VmSpec
-	2,  // 5: openinfra.agent.v1.GetWorkloadStatusResponse.state:type_name -> openinfra.agent.v1.GetWorkloadStatusResponse.State
-	26, // 6: openinfra.agent.v1.GetUsageSummaryResponse.summary:type_name -> openinfra.shared.v1.MeteringSummary
-	22, // 7: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
-	20, // 8: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
-	14, // 9: openinfra.agent.v1.ProviderAgentService.GetInventory:input_type -> openinfra.agent.v1.GetInventoryRequest
-	4,  // 10: openinfra.agent.v1.ProviderAgentService.SolveChallenge:input_type -> openinfra.agent.v1.SolveChallengeRequest
-	6,  // 11: openinfra.agent.v1.ProviderAgentService.Deploy:input_type -> openinfra.agent.v1.DeployRequest
-	10, // 12: openinfra.agent.v1.ProviderAgentService.Stop:input_type -> openinfra.agent.v1.StopRequest
-	12, // 13: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:input_type -> openinfra.agent.v1.GetWorkloadStatusRequest
-	16, // 14: openinfra.agent.v1.ProviderAgentService.StreamMetrics:input_type -> openinfra.agent.v1.StreamMetricsRequest
-	18, // 15: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:input_type -> openinfra.agent.v1.MeasureBandwidthRequest
-	23, // 16: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:input_type -> openinfra.agent.v1.GetUsageSummaryRequest
-	3,  // 17: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
-	21, // 18: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
-	15, // 19: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
-	5,  // 20: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
-	9,  // 21: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
-	11, // 22: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
-	13, // 23: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
-	17, // 24: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
-	19, // 25: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:output_type -> openinfra.agent.v1.MeasureBandwidthResponse
-	24, // 26: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:output_type -> openinfra.agent.v1.GetUsageSummaryResponse
-	17, // [17:27] is the sub-list for method output_type
-	7,  // [7:17] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	8,  // 4: openinfra.agent.v1.DeployRequest.vm:type_name -> openinfra.agent.v1.VmSpec
+	7,  // 5: openinfra.agent.v1.DeployRequest.volumes:type_name -> openinfra.agent.v1.VolumeAttachment
+	2,  // 6: openinfra.agent.v1.GetWorkloadStatusResponse.state:type_name -> openinfra.agent.v1.GetWorkloadStatusResponse.State
+	29, // 7: openinfra.agent.v1.GetUsageSummaryResponse.summary:type_name -> openinfra.shared.v1.MeteringSummary
+	23, // 8: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:input_type -> openinfra.agent.v1.GetAgentInfoRequest
+	21, // 9: openinfra.agent.v1.ProviderAgentService.HealthCheck:input_type -> openinfra.agent.v1.HealthCheckRequest
+	15, // 10: openinfra.agent.v1.ProviderAgentService.GetInventory:input_type -> openinfra.agent.v1.GetInventoryRequest
+	4,  // 11: openinfra.agent.v1.ProviderAgentService.SolveChallenge:input_type -> openinfra.agent.v1.SolveChallengeRequest
+	6,  // 12: openinfra.agent.v1.ProviderAgentService.Deploy:input_type -> openinfra.agent.v1.DeployRequest
+	11, // 13: openinfra.agent.v1.ProviderAgentService.Stop:input_type -> openinfra.agent.v1.StopRequest
+	13, // 14: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:input_type -> openinfra.agent.v1.GetWorkloadStatusRequest
+	17, // 15: openinfra.agent.v1.ProviderAgentService.StreamMetrics:input_type -> openinfra.agent.v1.StreamMetricsRequest
+	19, // 16: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:input_type -> openinfra.agent.v1.MeasureBandwidthRequest
+	24, // 17: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:input_type -> openinfra.agent.v1.GetUsageSummaryRequest
+	26, // 18: openinfra.agent.v1.ProviderAgentService.DeleteVolume:input_type -> openinfra.agent.v1.DeleteVolumeRequest
+	3,  // 19: openinfra.agent.v1.ProviderAgentService.GetAgentInfo:output_type -> openinfra.agent.v1.GetAgentInfoResponse
+	22, // 20: openinfra.agent.v1.ProviderAgentService.HealthCheck:output_type -> openinfra.agent.v1.HealthCheckResponse
+	16, // 21: openinfra.agent.v1.ProviderAgentService.GetInventory:output_type -> openinfra.agent.v1.GetInventoryResponse
+	5,  // 22: openinfra.agent.v1.ProviderAgentService.SolveChallenge:output_type -> openinfra.agent.v1.SolveChallengeResponse
+	10, // 23: openinfra.agent.v1.ProviderAgentService.Deploy:output_type -> openinfra.agent.v1.DeployResponse
+	12, // 24: openinfra.agent.v1.ProviderAgentService.Stop:output_type -> openinfra.agent.v1.StopResponse
+	14, // 25: openinfra.agent.v1.ProviderAgentService.GetWorkloadStatus:output_type -> openinfra.agent.v1.GetWorkloadStatusResponse
+	18, // 26: openinfra.agent.v1.ProviderAgentService.StreamMetrics:output_type -> openinfra.agent.v1.StreamMetricsResponse
+	20, // 27: openinfra.agent.v1.ProviderAgentService.MeasureBandwidth:output_type -> openinfra.agent.v1.MeasureBandwidthResponse
+	25, // 28: openinfra.agent.v1.ProviderAgentService.GetUsageSummary:output_type -> openinfra.agent.v1.GetUsageSummaryResponse
+	27, // 29: openinfra.agent.v1.ProviderAgentService.DeleteVolume:output_type -> openinfra.agent.v1.DeleteVolumeResponse
+	19, // [19:30] is the sub-list for method output_type
+	8,  // [8:19] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_openinfra_agent_v1_agent_proto_init() }
@@ -1711,7 +1927,7 @@ func file_openinfra_agent_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_openinfra_agent_v1_agent_proto_rawDesc), len(file_openinfra_agent_v1_agent_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   22,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

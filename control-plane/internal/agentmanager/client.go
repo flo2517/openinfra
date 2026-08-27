@@ -134,6 +134,58 @@ func (c *Client) DeployAndConfirm(ctx context.Context, provider RegisteredProvid
 	return response.ContainerId, nil
 }
 
+// DeleteVolume asks provider's Agent to securely delete the Docker named
+// volume backing a Cinder block volume (ADR-034 §6, issue #171).
+// Idempotent at the Agent boundary, the same way StopAndConfirm already
+// is (agent-executor's DeleteVolume handler treats "no such volume" as
+// success -- see agent.proto's DeleteVolumeRequest doc comment): a retry
+// after a lost response, or a delete of a volume this Agent never
+// actually created (e.g. it was bound but never mounted), both succeed.
+func (c *Client) DeleteVolume(ctx context.Context, provider RegisteredProvider, volumeID string) error {
+	connection, client, err := c.ConnectVerified(ctx, provider)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	deleteCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	response, err := client.DeleteVolume(deleteCtx, &agentv1.DeleteVolumeRequest{VolumeId: volumeID})
+	if err != nil {
+		return fmt.Errorf("delete volume on Agent: %w", err)
+	}
+	if !response.Success {
+		return fmt.Errorf("Agent rejected volume deletion: %s", response.Error)
+	}
+	return nil
+}
+
+// VolumeDeleteDispatcher adapts a Client + ProviderLookup into the
+// (providerID, volumeID string) error shape
+// internal/openstackapi/cinder.VolumeDispatcher expects -- constructed
+// here rather than in the cinder package, since agentmanager already
+// owns both halves (the mTLS client, the provider directory) and cinder
+// must not import agentmanager's concrete types to stay a pure
+// translation layer over interfaces it declares itself (the same
+// narrow-interface-at-the-call-site discipline
+// internal/openstackapi/nova.WorkloadStore/ProviderDirectory already
+// establish).
+type VolumeDeleteDispatcher struct {
+	client *Client
+	lookup ProviderLookup
+}
+
+func NewVolumeDeleteDispatcher(client *Client, lookup ProviderLookup) *VolumeDeleteDispatcher {
+	return &VolumeDeleteDispatcher{client: client, lookup: lookup}
+}
+
+func (d *VolumeDeleteDispatcher) DeleteVolume(ctx context.Context, providerID, volumeID string) error {
+	provider, err := d.lookup.GetProvider(ctx, providerID)
+	if err != nil {
+		return fmt.Errorf("resolve provider %s for volume deletion: %w", providerID, err)
+	}
+	return d.client.DeleteVolume(ctx, provider, volumeID)
+}
+
 // FetchUsageSummary pulls one bounded, signed MeteringSummary from the
 // Agent's GetUsageSummary RPC (ADR-029 §6 / issue #20) -- the
 // least-invasive fit on ProviderAgentService (agent.proto's own doc

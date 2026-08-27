@@ -46,6 +46,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/agentmanager"
+	"github.com/openinfra/network/internal/openstackapi/cinder"
 	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/openstackapi/keystone"
 	"github.com/openinfra/network/internal/openstackapi/neutron"
@@ -72,6 +73,7 @@ type Server struct {
 	nova     *nova.Server
 	neutron  *neutron.Server
 	glance   *glance.Server
+	cinder   *cinder.Server
 	limiter  RateLimiter
 }
 
@@ -96,14 +98,26 @@ type Server struct {
 // (ADR-026) as its ZoneLister -- one live view of "which zones are
 // providers actually declaring right now," not a second one either
 // package maintains independently.
-func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, workloads *workloadapi.Service, workloadStore *workloadapi.PostgresRepository, directory *agentmanager.Directory, baseURL string, limiter RateLimiter) *Server {
+//
+// agentClient is #171's addition (internal/openstackapi/cinder): the
+// exact *agentmanager.Client cmd/controlplane/main.go already
+// constructs and shares with internal/orchestrator, reused here (wrapped
+// in agentmanager.NewVolumeDeleteDispatcher, against a second, cheap
+// *agentmanager.PostgresRegistry built from pool -- ProviderLookup has
+// no state of its own beyond the pool) so a volume's secure-deletion
+// dispatch (ADR-034 §6) reaches the Agent through the identical mTLS
+// client every other Agent-bound call already does, not a second,
+// independently-configured connection.
+func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, workloads *workloadapi.Service, workloadStore *workloadapi.PostgresRepository, directory *agentmanager.Directory, agentClient *agentmanager.Client, baseURL string, limiter RateLimiter) *Server {
 	audit := newAuditRecorder(pool)
+	volumeDispatcher := agentmanager.NewVolumeDeleteDispatcher(agentClient, agentmanager.NewPostgresRegistry(pool))
 	return &Server{
 		pool:     pool,
 		keystone: keystone.New(users, projectsRepo, baseURL, audit),
 		nova:     nova.New(pool, users, projectsRepo, workloads, workloadStore, directory, nova.DefaultFlavors),
 		neutron:  neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), directory),
 		glance:   glance.New(users, glance.NewPostgresRepository(pool), glance.AuditRecorder(audit)),
+		cinder:   cinder.New(users, cinder.NewPostgresRepository(pool), workloadStore, volumeDispatcher, projectsRepo, cinder.AuditRecorder(audit)),
 		limiter:  limiter,
 	}
 }
@@ -121,6 +135,7 @@ func (s *Server) Handler() http.Handler {
 	s.nova.Register(mux)
 	s.neutron.Register(mux)
 	s.glance.Register(mux)
+	s.cinder.Register(mux)
 	return rateLimitTokenIssuance(s.limiter, securityHeaders(mux))
 }
 

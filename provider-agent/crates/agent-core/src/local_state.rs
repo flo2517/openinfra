@@ -77,6 +77,23 @@ pub enum WorkloadRuntime {
     Vm,
 }
 
+/// ADR-034 §1/§3/§7: one Cinder volume this workload's container has
+/// mounted. `volume_name` is the underlying Docker named volume's own
+/// name (deterministically derived from the Cinder `volume_id`, not the
+/// Cinder `volume_id` string re-used verbatim -- see
+/// `agent_executor::docker_volume_name`'s doc comment), so `recover()`
+/// can check it directly against `bollard`'s volume API without any
+/// other lookup. Mirrors `agent.proto`'s `VolumeAttachment` wire message
+/// field-for-field, kept as its own local type (not a re-export of the
+/// generated proto type) the same way every other `WorkloadRecord` field
+/// is its own plain value, never a borrowed proto type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeMount {
+    pub volume_name: String,
+    pub mount_path: String,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadRecord {
     pub workload_id: String,
@@ -131,6 +148,17 @@ pub struct WorkloadRecord {
     /// fabricate" principle for locally-synthesized authority.
     #[serde(default)]
     pub lease_end: Option<i64>,
+    /// ADR-034 §3/§7: the Cinder volumes this workload's container was
+    /// deployed with, mirroring `DeployRequest.volumes`. Used by
+    /// `recover()` to detect drift after an Agent restart (does each
+    /// named Docker volume this record claims still exist?) the same way
+    /// `container_id` already is for the container itself.
+    /// `#[serde(default)]` for the same backward-compat reason as every
+    /// other field added after this struct's original shape -- a record
+    /// persisted before this field existed had, definitionally, no
+    /// volumes attached.
+    #[serde(default)]
+    pub volume_mounts: Vec<VolumeMount>,
 }
 
 /// ADR-027 §2/§3/§5: the Agent's current mTLS leaf identity, persisted by
@@ -565,6 +593,7 @@ mod tests {
             egress_mbps: 0,
             rate_limited: false,
             lease_end: Some(1_700_000_000),
+            volume_mounts: Vec::new(),
         };
         {
             let state = LocalState::open(directory.path()).expect("open state");
@@ -607,6 +636,7 @@ mod tests {
             egress_mbps: 0,
             rate_limited: false,
             lease_end: Some(1_700_000_000),
+            volume_mounts: Vec::new(),
         };
         let vm_record = |id: &str| WorkloadRecord {
             workload_id: id.to_string(),
@@ -620,6 +650,7 @@ mod tests {
             egress_mbps: 0,
             rate_limited: false,
             lease_end: Some(1_700_000_000),
+            volume_mounts: Vec::new(),
         };
 
         // A container workload at max_active=1 fills the Container
