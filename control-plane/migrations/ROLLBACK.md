@@ -28,9 +28,21 @@ Run manually (against a real database, never against `$POSTGRES_DB` in the
 Compose dev stack unless you mean it) with `psql -f`, applying each block in
 the order below, top to bottom.
 
-## 000018_nova_server_metadata.sql
+## 000020_nova_server_metadata.sql
 ```sql
 DROP TABLE IF EXISTS nova_server_metadata;
+```
+
+## 000019_workload_vm_image_digest.sql
+```sql
+ALTER TABLE workloads DROP COLUMN IF EXISTS vm_image_sha256;
+```
+
+## 000018_glance_images.sql
+```sql
+DROP INDEX IF EXISTS glance_images_public_idx;
+DROP INDEX IF EXISTS glance_images_project_idx;
+DROP TABLE IF EXISTS glance_images;
 ```
 
 ## 000017_projects_and_quotas.sql

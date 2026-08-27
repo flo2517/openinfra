@@ -148,6 +148,62 @@ func TestSubmitRejectsUnpinnedImageAndInvalidResources(t *testing.T) {
 	}
 }
 
+// ADR-033 §4/§9, issues #166/#168: a VM workload's image is an https://
+// qcow2 URL paired with a required vm_image_sha256, not an OCI digest --
+// validateSubmission must accept exactly that shape and reject the
+// ordinary OCI-digest one once requires_vm is set.
+func TestSubmitAcceptsAVmWorkloadWithAnHttpsImageAndDigest(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	request.Image = "https://example.com/images/ubuntu-22.04.qcow2"
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	response, err := service.SubmitWorkload(ownerCtx(), request)
+	if err != nil {
+		t.Fatalf("expected a valid VM submission to succeed, got: %v", err)
+	}
+	if response.State != controlplanev1.WorkloadState_WORKLOAD_STATE_REQUESTED {
+		t.Fatalf("state=%s", response.State)
+	}
+}
+
+func TestSubmitRejectsAVmWorkloadWithoutAnHttpsUrl(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	// Still an OCI-digest reference, not an https:// URL -- must be
+	// rejected for a VM workload even though it would have been accepted
+	// for a container workload.
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestSubmitRejectsAVmWorkloadWithAMalformedDigest(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	request.Image = "https://example.com/images/ubuntu-22.04.qcow2"
+	request.VmImageSha256 = "not-a-valid-digest"
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestSubmitRejectsAContainerWorkloadThatSetsVmImageSha256(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	request := validRequest()
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument", status.Code(err))
+	}
+}
+
 func TestSubmitWorkloadDeniesCrossTenantRequestIDReuse(t *testing.T) {
 	service := NewService(newMemoryRepository())
 	request := validRequest()

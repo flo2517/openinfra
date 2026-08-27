@@ -271,6 +271,19 @@ func (w *Worker) processOne(ctx context.Context) error {
 		// values can never independently drift.
 		definitionExpiry := time.Now().UTC().Add(time.Duration(definition.DurationSeconds) * time.Second)
 		request := &agentv1.DeployRequest{WorkloadId: item.WorkloadID, LeaseId: item.LeaseID, Image: item.Image, Limits: &agentv1.ResourceLimits{CpuCores: definition.Requirements.Cpu, MemoryMb: definition.Requirements.RamMb, EgressMbps: workloadEgressMbps(definition)}, LeaseEnd: timestamppb.New(definitionExpiry)}
+		// ADR-033 §9 / issues #166/#168: a VM-flavored workload carries its
+		// qcow2 reference via a sibling VmSpec message, not `Image` (which
+		// the Agent's Docker path would otherwise misinterpret as an OCI
+		// reference) -- validateSubmission (workloadapi/service.go) already
+		// enforced Image is an https:// URL and VmImageSha256 is a valid
+		// digest for exactly this case, and the scheduler already refused
+		// to rank a provider lacking virtualization_capable (rank.go's
+		// ReasonVmIncapable) before this state was ever reached.
+		if definition.GetConstraints().GetRequiresVm() {
+			request.Runtime = agentv1.Runtime_RUNTIME_VM
+			request.Image = ""
+			request.Vm = &agentv1.VmSpec{VmImageUrl: item.Image, VmImageSha256: item.VmImageSha256}
+		}
 		deployCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
 		defer cancel()
 		containerID, err := w.dispatcher.DeployAndConfirm(deployCtx, provider.RegisteredProvider, request)
@@ -419,6 +432,13 @@ func (w *Worker) rankableCandidates(ctx context.Context, providers []agentmanage
 			candidate.RAMAvailableMB, candidate.RAMTotalMB = c.RamAvailableMb, c.RamTotalMb
 			candidate.StorageAvailableGB, candidate.StorageTotalGB = c.StorageAvailableGb, c.StorageTotalGb
 			candidate.Zone = c.Zone
+			// ADR-033 §7 / issue #166: flows straight through from the
+			// Agent's own fail-closed KVM probe (agent-inventory's
+			// kvm.rs) -- no separate persistence layer needed, since
+			// ResourceCapability is already carried whole through the
+			// Redis-cached heartbeat payload (see agentmanager.Directory)
+			// exactly like every other capability field here.
+			candidate.VirtualizationCapable = c.VirtualizationCapable
 			var ingressMbps, egressMbps int64
 			if c.Bandwidth != nil {
 				ingressMbps, egressMbps = int64(c.Bandwidth.IngressMbps), int64(c.Bandwidth.EgressMbps)

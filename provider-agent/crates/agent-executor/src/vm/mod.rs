@@ -25,6 +25,8 @@ pub mod cloud_hypervisor;
 pub mod image;
 
 use crate::ExecutorError;
+use agent_api::proto::{get_workload_status_response::State, DeployRequest};
+use agent_api::{Executor, UsageSample, WorkloadStatus};
 use agent_core::local_state::{
     LocalState, LocalStateError, Reservation, WorkloadPhase, WorkloadRecord, WorkloadRuntime,
 };
@@ -114,6 +116,13 @@ impl VmExecutor {
             settings.cloud_hypervisor_binary.clone(),
             settings.vm_sockets_dir.clone(),
             PathBuf::new(),
+            cloud_hypervisor::VmmSecurityPolicy {
+                setpriv_binary: settings.setpriv_binary.clone(),
+                user: settings.vmm_user.clone(),
+                group: settings.vmm_group.clone(),
+                kvm_group: settings.vmm_kvm_group.clone(),
+                seccomp: true,
+            },
         ));
         let executor = Self::with_parts(
             engine,
@@ -435,6 +444,162 @@ impl VmExecutor {
         }
         Ok(stopped)
     }
+
+    fn map_observation(observation: &VmObservation) -> State {
+        if observation.running {
+            return State::Running;
+        }
+        match observation.status.as_str() {
+            "created" => State::Created,
+            // ADR-033 §6: Cloud Hypervisor's vm.info reports "Shutdown"
+            // both for a VM that was cleanly stopped and one that never
+            // started -- STATE_COMPLETED matches DockerExecutor's own
+            // "exited" mapping, which control-plane's orchestrator
+            // already treats as terminal-not-an-error (Issue #17).
+            "shutdown" => State::Completed,
+            // "paused"/"breakpoint" are real cloud-hypervisor vm.info
+            // states this Agent never itself requests (no pause/debug RPC
+            // is wired anywhere) but must still map to *something* rather
+            // than panic if observed (e.g. an operator drove the VMM
+            // directly via its socket). Pending is the same conservative
+            // "not confirmed running, not terminal" bucket
+            // DockerExecutor::map_observation's fallback arm uses.
+            _ => State::Pending,
+        }
+    }
+}
+
+/// ADR-033 §9 / issue #168: converts a wire `DeployRequest` (with
+/// `runtime == RUNTIME_VM`) into this crate's own `VmDeployRequest`.
+/// Deliberately thin -- only enough parsing to avoid unwrapping a `None`
+/// field; range/format validation (vcpus/memory policy ceilings, the
+/// https:// scheme, the sha256 hex shape, a positive lease_end) is
+/// `VmExecutor::validate`'s job, exactly like `DockerExecutor::deployment`
+/// keeps parsing and policy validation together for the container path --
+/// this split exists only because the VM path's parsing step doubles as
+/// the trait-boundary conversion `agent_api::Executor::deploy` needs and
+/// `DockerExecutor::deploy` does not.
+impl VmDeployRequest {
+    fn try_from_proto(request: &DeployRequest) -> Result<Self, ExecutorError> {
+        let vm_spec = request.vm.as_ref().ok_or_else(|| {
+            ExecutorError::InvalidRequest(
+                "vm spec is required for a VM-flavored DeployRequest".to_string(),
+            )
+        })?;
+        let limits = request.limits.as_ref().ok_or_else(|| {
+            ExecutorError::InvalidRequest("resource limits are required".to_string())
+        })?;
+        // A VM's vcpu count has no fractional analog the way Docker's
+        // NanoCPUs does -- limits.cpu_cores is reused rather than adding
+        // a duplicate integer field (see agent.proto's DeployRequest.vm
+        // doc comment), so it must itself already be a positive whole
+        // number here.
+        if !limits.cpu_cores.is_finite()
+            || limits.cpu_cores <= 0.0
+            || limits.cpu_cores.fract() != 0.0
+            || limits.cpu_cores > u32::MAX as f32
+        {
+            return Err(ExecutorError::InvalidRequest(
+                "a VM's vcpu count (limits.cpu_cores) must be a positive whole number".to_string(),
+            ));
+        }
+        let lease_end = request
+            .lease_end
+            .as_ref()
+            .ok_or_else(|| ExecutorError::InvalidRequest("lease_end is required".to_string()))?;
+        Ok(VmDeployRequest {
+            workload_id: request.workload_id.clone(),
+            lease_id: request.lease_id.clone(),
+            vcpus: limits.cpu_cores as u32,
+            memory_mb: limits.memory_mb,
+            vm_image_url: vm_spec.vm_image_url.clone(),
+            vm_image_sha256: vm_spec.vm_image_sha256.clone(),
+            lease_end: lease_end.seconds,
+        })
+    }
+}
+
+/// ADR-033 §9 / issue #168 point 3: `VmExecutor` implementing
+/// `agent_api::Executor`, mirroring `DockerExecutor`'s own impl of the
+/// same trait -- this is what makes `VmExecutor` reachable from the gRPC
+/// server at all (via `agent_executor::RoutingExecutor`, see this crate's
+/// `lib.rs`). Note this does not shadow or conflict with `VmExecutor`'s
+/// own inherent `deploy`/`stop` methods above (which take this module's
+/// internal `VmDeployRequest`/`&str` types): Rust always resolves a
+/// method call to an inherent method over a trait method when both share
+/// a name, so every direct call in this module and its tests keeps
+/// calling the inherent methods unchanged; only a caller going through
+/// `dyn Executor` (agent-api's gRPC server, via `RoutingExecutor`) reaches
+/// this impl.
+#[async_trait]
+impl Executor for VmExecutor {
+    async fn deploy(&self, req: DeployRequest) -> anyhow::Result<String> {
+        let vm_request = VmDeployRequest::try_from_proto(&req)?;
+        self.deploy(vm_request).await.map_err(Into::into)
+    }
+
+    async fn stop(&self, workload_id: &str) -> anyhow::Result<()> {
+        self.stop(workload_id).await.map_err(Into::into)
+    }
+
+    async fn get_status(&self, workload_id: &str) -> anyhow::Result<WorkloadStatus> {
+        let record = self.state.workload(workload_id)?;
+        if record.phase == WorkloadPhase::Stopped {
+            // Mirrors DockerExecutor::get_status's identical short-circuit
+            // (Issue #17): stop() already removed the VM but deliberately
+            // leaves the stale vm_handle on the record, so inspecting it
+            // here would fail against an already-deleted VM.
+            return Ok(WorkloadStatus {
+                state: State::Completed as i32,
+                details: "stopped".to_string(),
+            });
+        }
+        let Some(handle) = record.vm_handle else {
+            // Mirrors DockerExecutor::get_status's identical "no
+            // container/VM yet" case -- the normal state between
+            // reserve_workload and the engine actually creating the VM,
+            // including a first create() attempt that failed.
+            return Ok(WorkloadStatus {
+                state: State::Deploying as i32,
+                details: "no VM yet".to_string(),
+            });
+        };
+        let observation = self.engine.inspect(&handle).await?;
+        Ok(WorkloadStatus {
+            state: Self::map_observation(&observation) as i32,
+            details: format!("Cloud Hypervisor state: {}", observation.status),
+        })
+    }
+
+    /// Mirrors `DockerExecutor::usage_summary`'s own honesty: `lease_id`
+    /// and the sequence/period bounds are real and durable
+    /// (`LocalState::next_metering_period`, shared verbatim with the
+    /// Docker path); the five usage counters are honest zero stubs --
+    /// there is no per-VM CPU/RAM/storage/network metric source in this
+    /// codebase yet, matching agent-api's `UsageSample` doc comment.
+    async fn usage_summary(
+        &self,
+        workload_id: &str,
+        now: u64,
+        max_period_seconds: u64,
+    ) -> anyhow::Result<UsageSample> {
+        let record = self.state.workload(workload_id)?;
+        let period = self
+            .state
+            .next_metering_period(workload_id, now, max_period_seconds)?;
+        Ok(UsageSample {
+            lease_id: record.lease_id,
+            sequence: period.sequence,
+            period_start: period.period_start,
+            period_end: period.period_end,
+            cpu_core_seconds: 0,
+            ram_mb_seconds: 0,
+            storage_gb_seconds: 0,
+            network_egress_mb: 0,
+            network_ingress_mb: 0,
+            gpu_seconds: 0,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -729,5 +894,117 @@ mod tests {
 
         assert_eq!(stopped, vec![request.workload_id.clone()]);
         assert_eq!(engine.stopped.lock().expect("stopped lock").len(), 1);
+    }
+
+    // --- agent_api::Executor impl: the proto DeployRequest conversion
+    // path issue #168 point 3 adds (RoutingExecutor's own tests in
+    // agent-executor's lib.rs cover dispatch; these cover VmExecutor's
+    // own trait-boundary conversion logic).
+
+    fn proto_vm_deploy_request(workload_id: &str, digest: &str) -> agent_api::proto::DeployRequest {
+        agent_api::proto::DeployRequest {
+            workload_id: workload_id.to_string(),
+            lease_id: Uuid::new_v4().to_string(),
+            image: String::new(),
+            limits: Some(agent_api::proto::ResourceLimits {
+                cpu_cores: 2.0,
+                memory_mb: 1024,
+                egress_mbps: 0,
+            }),
+            lease_end: Some(prost_types::Timestamp {
+                seconds: 4_102_444_800,
+                nanos: 0,
+            }),
+            runtime: agent_api::proto::Runtime::Vm as i32,
+            vm: Some(agent_api::proto::VmSpec {
+                vm_image_url: "https://example.com/image.qcow2".to_string(),
+                vm_image_sha256: digest.to_string(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_trait_deploy_converts_the_proto_request_and_deploys_a_vm() {
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        let vm_executor = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        let workload_id = Uuid::new_v4().to_string();
+
+        let handle = Executor::deploy(&vm_executor, proto_vm_deploy_request(&workload_id, &digest))
+            .await
+            .expect("Executor::deploy via the proto conversion path");
+
+        assert!(!handle.is_empty());
+        assert_eq!(engine.created.lock().expect("created lock").len(), 1);
+        let created = engine.created.lock().expect("created lock");
+        assert_eq!(created[0].vcpus, 2);
+        assert_eq!(created[0].memory_mb, 1024);
+    }
+
+    #[tokio::test]
+    async fn executor_trait_deploy_rejects_a_fractional_vcpu_count() {
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        let vm_executor = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        let mut request = proto_vm_deploy_request(&Uuid::new_v4().to_string(), &digest);
+        request.limits.as_mut().expect("limits").cpu_cores = 1.5;
+
+        let result = Executor::deploy(&vm_executor, request).await;
+
+        assert!(result.is_err());
+        assert!(
+            engine.created.lock().expect("created lock").is_empty(),
+            "a fractional vcpu count must reject before ever reaching the engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_trait_deploy_rejects_a_request_with_no_vm_spec() {
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        let vm_executor = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        let mut request = proto_vm_deploy_request(&Uuid::new_v4().to_string(), &digest);
+        request.vm = None;
+
+        let result = Executor::deploy(&vm_executor, request).await;
+
+        assert!(result.is_err());
+        assert!(engine.created.lock().expect("created lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn executor_trait_get_status_reports_deploying_then_running_then_completed() {
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        let vm_executor = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        let workload_id = Uuid::new_v4().to_string();
+
+        Executor::deploy(&vm_executor, proto_vm_deploy_request(&workload_id, &digest))
+            .await
+            .expect("deploy");
+        let running = Executor::get_status(&vm_executor, &workload_id)
+            .await
+            .expect("status while running");
+        assert_eq!(
+            running.state,
+            agent_api::proto::get_workload_status_response::State::Running as i32
+        );
+
+        vm_executor.stop(&workload_id).await.expect("stop");
+        let completed = Executor::get_status(&vm_executor, &workload_id)
+            .await
+            .expect("status after stop");
+        assert_eq!(
+            completed.state,
+            agent_api::proto::get_workload_status_response::State::Completed as i32
+        );
     }
 }

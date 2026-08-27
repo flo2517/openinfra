@@ -136,6 +136,15 @@ message WorkloadConstraints {
   float min_reputation = 2;
   float max_price = 3;
   string required_zone = 4;
+  // ADR-033 §7 / issue #166: this workload must run as a VM, not a
+  // container. The scheduler must never rank a provider that has not
+  // explicitly reported ResourceCapability.virtualization_capable = true
+  // as eligible when this is set -- absent/false capability is "cannot
+  // run VM workloads", never "unknown, try anyway", matching how
+  // required_zone above is already a hard exclusion, not a soft
+  // preference (ADR-026 §4). Default false: an ordinary container
+  // workload is unaffected and needs no changes.
+  bool requires_vm = 5;
 }
 
 // --- Lease Object ---

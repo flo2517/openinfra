@@ -25,6 +25,15 @@
 // Handler below, and add its catalog entry in
 // keystone/response.go's serviceCatalog. That's the whole diff --
 // keystone's own routes and handlers are untouched by it.
+//
+// internal/openstackapi/glance (issue #26's Glance subset) is the first
+// subpackage to follow that shape: a project-scoped image-registry
+// surface with its own migration-000018-backed table, wired in below the
+// same way. It owns its own Repository (glance.NewPostgresRepository),
+// constructed here from the pool this package already has, rather than
+// threaded through New's signature -- no other component needs to
+// construct a glance.Repository, unlike users/projectsRepo above, which
+// internal/dashboard and the gRPC server also need.
 package openstackapi
 
 import (
@@ -37,7 +46,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/agentmanager"
+	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/openstackapi/keystone"
+	"github.com/openinfra/network/internal/openstackapi/neutron"
 	"github.com/openinfra/network/internal/openstackapi/nova"
 	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/userauth"
@@ -59,6 +70,8 @@ type Server struct {
 	pool     *pgxpool.Pool
 	keystone *keystone.Server
 	nova     *nova.Server
+	neutron  *neutron.Server
+	glance   *glance.Server
 	limiter  RateLimiter
 }
 
@@ -78,12 +91,19 @@ type Server struct {
 // ControlPlaneService, internal/dashboard, and internal/orchestrator --
 // so a Nova-created server runs through the identical
 // validation/scheduling/deploy path any other workload does, per
-// ADR-031 §4's "no parallel execution model."
+// ADR-031 §4's "no parallel execution model." The same directory also
+// backs internal/openstackapi/neutron's availability-zone listing
+// (ADR-026) as its ZoneLister -- one live view of "which zones are
+// providers actually declaring right now," not a second one either
+// package maintains independently.
 func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, workloads *workloadapi.Service, workloadStore *workloadapi.PostgresRepository, directory *agentmanager.Directory, baseURL string, limiter RateLimiter) *Server {
+	audit := newAuditRecorder(pool)
 	return &Server{
 		pool:     pool,
-		keystone: keystone.New(users, projectsRepo, baseURL, newAuditRecorder(pool)),
+		keystone: keystone.New(users, projectsRepo, baseURL, audit),
 		nova:     nova.New(pool, users, projectsRepo, workloads, workloadStore, directory, nova.DefaultFlavors),
+		neutron:  neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), directory),
+		glance:   glance.New(users, glance.NewPostgresRepository(pool), glance.AuditRecorder(audit)),
 		limiter:  limiter,
 	}
 }
@@ -99,6 +119,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", s.ready)
 	s.keystone.Register(mux)
 	s.nova.Register(mux)
+	s.neutron.Register(mux)
+	s.glance.Register(mux)
 	return rateLimitTokenIssuance(s.limiter, securityHeaders(mux))
 }
 
