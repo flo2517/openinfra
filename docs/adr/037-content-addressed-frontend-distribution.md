@@ -2,12 +2,13 @@
 
 ## Status
 
-Proposed.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
 
-Written by Claude Code, autonomously, in direct response to issue #35 and the follow-up ADR-012 §6
-names for it. Held as `Proposed` per the convention established by ADR-016/018/025/026/029/027/033:
-nothing here is implemented by this ADR itself. Issue #35 is unblocked only once a repository owner
-explicitly accepts this document, in-session, after reviewing its decisions.
+Originally written by Claude Code, autonomously, in direct response to issue #35 and the follow-up
+ADR-012 §6 names for it, held as `Proposed` per the convention established by
+ADR-016/018/025/026/029/027/033 until this acceptance. Nothing here is implemented yet by this ADR
+itself; issue #35 is unblocked by this acceptance and now carries the implementation work.
 
 **Numbering note, checked before writing anything.** ADR-012 §6's gate table names this gate
 `ADR-021` ("content-addressed distribution and decentralized storage"). Fresh `origin/main` tops out
