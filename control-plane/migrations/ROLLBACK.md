@@ -28,6 +28,14 @@ Run manually (against a real database, never against `$POSTGRES_DB` in the
 Compose dev stack unless you mean it) with `psql -f`, applying each block in
 the order below, top to bottom.
 
+## 000021_cinder_volumes.sql
+```sql
+DROP INDEX IF EXISTS cinder_volumes_attached_workload_idx;
+DROP INDEX IF EXISTS cinder_volumes_provider_state_idx;
+DROP INDEX IF EXISTS cinder_volumes_project_idx;
+DROP TABLE IF EXISTS cinder_volumes;
+```
+
 ## 000020_nova_server_metadata.sql
 ```sql
 DROP TABLE IF EXISTS nova_server_metadata;

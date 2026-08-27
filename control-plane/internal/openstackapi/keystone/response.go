@@ -102,12 +102,15 @@ func tokenResponseBody(baseURL string, user userauth.User, method string, issued
 // always present ("network" from ADR-031 §5/§8's QoS/AZ mapping slice,
 // internal/openstackapi/neutron; "image" from #26's Glance subset --
 // image registry only, Cinder's block-volume half is issue #171, gated
-// behind ADR-034); compute (#24's internal/openstackapi/nova) and
-// placement (#24, same package) are added only once a project is
+// behind ADR-034); compute (#24's internal/openstackapi/nova),
+// placement (#24, same package), and volumev3 (#171's Cinder subset,
+// internal/openstackapi/cinder, now implemented under this same ADR-034
+// acceptance) are added only once a project is
 // actually scoped (projectID non-empty -- serviceCatalog is only ever
 // called from that branch, see tokenResponseBody above), since Nova's
-// own 2.1-baseline URL shape is itself project-prefixed
-// (/v2.1/{project_id}/...) and there is no meaningful compute endpoint
+// own 2.1-baseline URL shape (and Cinder's own real v3 shape,
+// /v3/{project_id}/...) is itself project-prefixed
+// and there is no meaningful compute/volume endpoint
 // to advertise for an unscoped token. A future PR adds its own entries
 // here (or, more likely, this function grows a small registry future
 // packages append to) rather than this package guessing at endpoints
@@ -161,6 +164,14 @@ func serviceCatalog(baseURL, projectID string) []catalogEntryBody {
 					// see internal/openstackapi/nova/placement.go's own
 					// doc comments on this).
 					{ID: "placement-public", Interface: "public", Region: "RegionOne", URL: baseURL},
+				},
+			},
+			catalogEntryBody{
+				ID:   "volumev3",
+				Type: "volumev3",
+				Name: "cinder",
+				Endpoints: []endpointBody{
+					{ID: "volumev3-public", Interface: "public", Region: "RegionOne", URL: baseURL + "/v3/" + projectID},
 				},
 			},
 		)

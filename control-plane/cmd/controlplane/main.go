@@ -297,7 +297,7 @@ func run() error {
 	openstackTokenRateLimit := envIntOrDefault("OPENSTACK_TOKEN_RATE_LIMIT_PER_MINUTE", 30)
 	openstackTokenLimiter := ratelimit.NewRedisLimiter(redisClient, openstackTokenRateLimit, 60)
 	openstackAPIServer := &http.Server{
-		Handler:           openstackapi.New(pool, userRepository, projects.NewPostgresRepository(pool), workloadService, workloadRepository, directory, openstackAPIBaseURL, openstackTokenLimiter).Handler(),
+		Handler:           openstackapi.New(pool, userRepository, projects.NewPostgresRepository(pool), workloadService, workloadRepository, directory, agentClient, openstackAPIBaseURL, openstackTokenLimiter).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

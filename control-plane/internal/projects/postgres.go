@@ -138,17 +138,28 @@ func (r *PostgresRepository) GetQuota(ctx context.Context, projectID string) (Qu
 // at workload-creation time (migrations 000008/000010) -- one shared
 // notion of "how much does this workload actually claim," never a
 // second, independently-computed number that could drift from it.
+//
+// StorageGB additionally folds in every live (non-deleted)
+// cinder_volumes row's size_gb (migration 000021, ADR-034 §4: "a
+// volume's size_gb counts against \[the project's quota\] at create
+// time, the same commit-time reservation-ledger check … not a new
+// enforcement mechanism") -- a volume's committed storage is real
+// whether or not it is currently attached to any workload (ADR-034 §2:
+// an `available` volume still occupies real provider disk once created),
+// so this is not scoped by attachment state the way the workload sum
+// above is scoped by openWorkloadStates.
 func (r *PostgresRepository) CommittedUsage(ctx context.Context, projectID string) (Usage, error) {
 	var usage Usage
 	var workloadCount int64
 	err := r.pool.QueryRow(ctx, `
 		SELECT
-			COALESCE(SUM(reserved_cpu_millicores), 0),
-			COALESCE(SUM(reserved_ram_mb), 0),
-			COALESCE(SUM(reserved_storage_gb), 0),
+			COALESCE(SUM(w.reserved_cpu_millicores), 0),
+			COALESCE(SUM(w.reserved_ram_mb), 0),
+			COALESCE(SUM(w.reserved_storage_gb), 0)
+				+ (SELECT COALESCE(SUM(size_gb), 0) FROM cinder_volumes WHERE project_id = $1 AND deleted_at IS NULL),
 			COUNT(*)
-		FROM workloads
-		WHERE project_id = $1 AND state = ANY($2)`,
+		FROM workloads w
+		WHERE w.project_id = $1 AND w.state = ANY($2)`,
 		projectID, openWorkloadStates).
 		Scan(&usage.CPUMillicores, &usage.RAMMB, &usage.StorageGB, &workloadCount)
 	if err != nil {

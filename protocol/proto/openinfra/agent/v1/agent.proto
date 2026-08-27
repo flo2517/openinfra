@@ -30,6 +30,18 @@ service ProviderAgentService {
   // covering usage since that workload's last-issued sequence. See
   // GetUsageSummaryResponse's doc comment for the signing/hash details.
   rpc GetUsageSummary(GetUsageSummaryRequest) returns (GetUsageSummaryResponse);
+  // ADR-034 §6/§7 / issue #171: securely deletes the Docker named volume
+  // backing a Cinder block volume (control-plane's cinder_volumes row,
+  // migration 000021) on this specific Agent -- the only volume
+  // lifecycle operation that needs a dedicated RPC rather than riding on
+  // Deploy/Stop, since a volume being deleted has, by construction
+  // (internal/openstackapi/cinder only permits delete from the
+  // 'available' state), no currently-running workload/DeployRequest to
+  // attach the request to. Called by the Control Plane only after its
+  // own Postgres-side transition to 'deleting' has already committed
+  // (ADR-034 §2) -- this RPC is the Agent-side half of that already-
+  // decided delete, not itself an authorization decision.
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
 }
 
 message GetAgentInfoResponse {
@@ -99,12 +111,47 @@ message DeployRequest {
   // duplicating them on VmSpec -- cpu_cores must be a whole number for a
   // VM's vcpu count (agent-executor rejects a fractional value).
   VmSpec vm = 7;
+  // ADR-034 §7 / issue #171: Cinder block volumes to mount into this
+  // workload's container at create time. Empty (the default -- every
+  // DeployRequest built before this field existed implicitly carries no
+  // volumes) is the common case and changes nothing about deploy
+  // behavior, additive and backward-compatible like `runtime`/`vm`
+  // above. Only meaningful for RUNTIME_CONTAINER: ADR-034 §5 keeps VM
+  // boot disks and Cinder volumes deliberately separate mechanisms, and
+  // attaching a Cinder volume to a VM workload is explicitly out of
+  // scope (ADR-034 §8) -- agent-executor's vm::VmExecutor ignores this
+  // field entirely, the same way DockerExecutor ignores `vm` (§4's own
+  // "ignored for a VM-flavored request" precedent, mirrored here).
+  //
+  // Populated by control-plane/internal/orchestrator's deploy dispatch
+  // from cinder_volumes rows already attached (Postgres-authoritative,
+  // ADR-034 §3) to this workload_id on the target provider at the
+  // moment Deploy is dispatched -- a volume attached to an already-
+  // *running* workload after its first Deploy has no effect until that
+  // workload's next Deploy dispatch (there is no live-remount
+  // mechanism), a named limitation matching this codebase's existing
+  // "no callable redeploy" gap (internal/openstackapi/nova's package
+  // doc comment) rather than a silently half-built fix.
+  repeated VolumeAttachment volumes = 8;
 }
 
 enum Runtime {
   RUNTIME_UNSPECIFIED = 0;
   RUNTIME_CONTAINER = 1;
   RUNTIME_VM = 2;
+}
+
+// ADR-034 §1/§7: one Cinder volume attached into this container. volume_id
+// is the Docker named volume's own name (agent-executor mints it
+// deterministically from the Cinder volume_id, see agent-executor's own
+// doc comment on volume naming) -- the Agent creates the underlying
+// Docker volume on first use if it does not already exist (ADR-034 §2:
+// "nothing is created on any provider host until the volume is first
+// attached").
+message VolumeAttachment {
+  string volume_id = 1;
+  string mount_path = 2;
+  bool read_only = 3;
 }
 
 // ADR-033 §4: digest-pinned, fetched over HTTPS, verified before first
@@ -227,4 +274,19 @@ message GetUsageSummaryResponse {
   openinfra.shared.v1.MeteringSummary summary = 1;
   bytes signature = 2;
   string evidence_hash = 3;
+}
+
+// ADR-034 §6: volume_id is the same Docker volume name VolumeAttachment
+// carries. Deleting a volume this Agent has no record of (never
+// attached here, or already removed) is treated as success -- the
+// desired end state (no such Docker volume) already holds, matching
+// Stop's own idempotent-at-the-Agent-boundary convention
+// (agentmanager.Client.StopAndConfirm's doc comment).
+message DeleteVolumeRequest {
+  string volume_id = 1;
+}
+
+message DeleteVolumeResponse {
+  bool success = 1;
+  string error = 2;
 }
