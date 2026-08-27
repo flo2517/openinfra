@@ -8641,6 +8641,7 @@ dependencies = [
  "pallet-openinfra-lease",
  "pallet-openinfra-rewards",
  "pallet-provider-registry",
+ "pallet-provider-slashing",
  "pallet-reputation",
  "pallet-resource-market",
  "parity-scale-codec",
@@ -9627,6 +9628,7 @@ dependencies = [
  "frame-support",
  "frame-system",
  "pallet-balances",
+ "pallet-provider-registry",
  "parity-scale-codec",
  "scale-info",
  "sp-core",
@@ -9916,6 +9918,7 @@ dependencies = [
  "frame-support",
  "frame-system",
  "pallet-balances",
+ "pallet-provider-registry",
  "parity-scale-codec",
  "scale-info",
  "sp-io",
@@ -10243,6 +10246,19 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "pallet-balances",
+ "parity-scale-codec",
+ "scale-info",
+ "sp-io",
+ "sp-runtime",
+]
+
+[[package]]
+name = "pallet-provider-slashing"
+version = "0.1.0"
+dependencies = [
+ "frame-support",
+ "frame-system",
  "parity-scale-codec",
  "scale-info",
  "sp-io",
@@ -10362,6 +10378,7 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "pallet-balances",
  "pallet-provider-registry",
  "parity-scale-codec",
  "scale-info",

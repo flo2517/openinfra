@@ -133,6 +133,32 @@ fn set_has_open_escrow(account: u64, has_open_escrow: bool) {
     });
 }
 
+// ADR-036 §5: mock for the reserve-contamination guard's third edge
+// (`register_validator` rejects an account with an open provider bond).
+// Controlled per-test via `set_has_open_bond`, same shape as
+// `TestEscrowInspector` above.
+thread_local! {
+    static BONDED_PROVIDERS: std::cell::RefCell<std::collections::BTreeSet<u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+pub struct TestProviderBondInspector;
+impl pallet_provider_registry::ProviderBondInspector<u64> for TestProviderBondInspector {
+    fn has_open_bond(provider: &u64) -> bool {
+        BONDED_PROVIDERS.with(|set| set.borrow().contains(provider))
+    }
+}
+
+fn set_has_open_bond(account: u64, has_open_bond: bool) {
+    BONDED_PROVIDERS.with(|set| {
+        if has_open_bond {
+            set.borrow_mut().insert(account);
+        } else {
+            set.borrow_mut().remove(&account);
+        }
+    });
+}
+
 fn current_score(provider: u64, dimension: ScoreDimension) -> u16 {
     <RecordingUpdater as crate::ReputationUpdater<u64>>::dimension_score(&provider, dimension)
 }
@@ -167,6 +193,7 @@ impl crate::Config for Test {
     type ReputationUpdater = RecordingUpdater;
     type ValidatorRewards = RecordingRewards;
     type EscrowInspector = TestEscrowInspector;
+    type ProviderBondInspector = TestProviderBondInspector;
     type MinStake = MinStake;
     type UnbondingPeriod = UnbondingPeriod;
     type MaxSubmissionsPerRound = MaxSubmissionsPerRound;
@@ -187,6 +214,7 @@ fn new_test_ext() -> sp_io::TestExternalities {
     // `OPEN_ESCROW_PAYERS` itself.
     clear_recorded();
     OPEN_ESCROW_PAYERS.with(|set| set.borrow_mut().clear());
+    BONDED_PROVIDERS.with(|set| set.borrow_mut().clear());
     let mut storage = frame_system::GenesisConfig::<Test>::default()
         .build_storage()
         .unwrap();
@@ -278,6 +306,42 @@ fn register_succeeds_once_open_escrow_is_cleared() {
             crate::Error::<Test>::PayerHasOpenEscrow
         );
         set_has_open_escrow(1, false);
+        assert_ok!(NetworkValidator::register_validator(
+            RuntimeOrigin::signed(1),
+            100
+        ));
+        assert!(NetworkValidator::is_active(&1));
+    });
+}
+
+// ---------------------------------------------------------------------
+// ADR-036 §5: reserve-balance contamination guard, third edge --
+// register_validator rejects an account with an open bond in
+// pallet-provider-registry.
+// ---------------------------------------------------------------------
+
+#[test]
+fn register_rejects_bonded_provider() {
+    new_test_ext().execute_with(|| {
+        set_has_open_bond(1, true);
+        assert_noop!(
+            NetworkValidator::register_validator(RuntimeOrigin::signed(1), 100),
+            crate::Error::<Test>::CallerIsBondedProvider
+        );
+        assert_eq!(Balances::reserved_balance(1), 0);
+        assert!(!NetworkValidator::is_active(&1));
+    });
+}
+
+#[test]
+fn register_succeeds_once_bond_is_cleared() {
+    new_test_ext().execute_with(|| {
+        set_has_open_bond(1, true);
+        assert_noop!(
+            NetworkValidator::register_validator(RuntimeOrigin::signed(1), 100),
+            crate::Error::<Test>::CallerIsBondedProvider
+        );
+        set_has_open_bond(1, false);
         assert_ok!(NetworkValidator::register_validator(
             RuntimeOrigin::signed(1),
             100

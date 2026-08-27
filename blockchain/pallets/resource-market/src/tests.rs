@@ -1,5 +1,5 @@
 use crate::{self as pallet_resource_market, Error};
-use frame_support::{assert_noop, assert_ok, derive_impl, BoundedVec};
+use frame_support::{assert_noop, assert_ok, derive_impl, traits::ConstU64, BoundedVec};
 use pallet_provider_registry::ProviderStatus;
 use sp_runtime::BuildStorage;
 
@@ -8,6 +8,7 @@ type Block = frame_system::mocking::MockBlock<Test>;
 frame_support::construct_runtime!(
     pub enum Test {
         System: frame_system,
+        Balances: pallet_balances,
         ProviderRegistry: pallet_provider_registry,
         ResourceMarket: pallet_resource_market,
     }
@@ -16,11 +17,29 @@ frame_support::construct_runtime!(
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
     type Block = Block;
+    type AccountData = pallet_balances::AccountData<u64>;
+}
+
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+impl pallet_balances::Config for Test {
+    type ExistentialDeposit = ConstU64<1>;
+    type AccountStore = System;
 }
 
 impl pallet_provider_registry::Config for Test {
     type RegistrationOrigin = frame_system::EnsureRoot<u64>;
     type StatusOrigin = frame_system::EnsureRoot<u64>;
+    type Currency = Balances;
+    // This pallet's own tests are not about ADR-036 bonding: no bond is
+    // required to reach Active here (MinStake = 0), and the reserve-
+    // contamination/pending-slash guards are permissively disabled ((),
+    // this pallet's own default impl), same as every other pallet's mock
+    // that doesn't exercise those specific guards.
+    type EscrowInspector = ();
+    type ValidatorInspector = ();
+    type SlashInspector = ();
+    type MinStake = ConstU64<0>;
+    type UnbondingPeriod = ConstU64<5>;
     type WeightInfo = ();
 }
 
