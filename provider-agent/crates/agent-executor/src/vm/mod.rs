@@ -23,8 +23,10 @@
 
 pub mod cloud_hypervisor;
 pub mod image;
+pub mod tap;
 
 use crate::ExecutorError;
+use crate::WorkloadBandwidth;
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
 use agent_api::{Executor, UsageSample, WorkloadStatus};
 use agent_core::local_state::{
@@ -61,11 +63,15 @@ pub struct VmObservation {
 }
 
 /// ADR-033 §3: shaped analogously to `ContainerEngine`
-/// (`create`/`start`/`stop`/`inspect`/`remove`). Deliberately does not
-/// include a `bandwidth`/`rate_limit` pair the way `ContainerEngine`
-/// does -- the ADR's own §5 tap-device networking model (the VM
-/// equivalent of `ContainerEngine`'s veth-pair-based mechanism) is not
-/// implemented in this PR; see the PR description's follow-up list.
+/// (`create`/`start`/`stop`/`inspect`/`remove`), including its
+/// `bandwidth`/`rate_limit` pair (ADR-033 §5 / issue #176 point 1) --
+/// backed by a tap device (`vm::tap`) rather than a container's veth
+/// pair, which is why these are separate methods on this trait instead
+/// of `ContainerEngine`'s existing ones: the *mechanism* is genuinely
+/// different (a VM attaches via a tap device Cloud Hypervisor's `net`
+/// config opens by name, not a veth pair the Docker network driver
+/// creates), even though the *shape* of the guarantee -- per-workload
+/// cumulative counters, a `tc`-enforced egress ceiling -- is identical.
 #[async_trait]
 pub trait VmEngine: Send + Sync {
     /// Creates (but does not boot) the VM described by `spec`, returning
@@ -77,6 +83,19 @@ pub trait VmEngine: Send + Sync {
     async fn stop(&self, handle: &str) -> Result<(), ExecutorError>;
     async fn inspect(&self, handle: &str) -> Result<VmObservation, ExecutorError>;
     async fn remove(&self, handle: &str) -> Result<(), ExecutorError>;
+    /// ADR-033 §5: this workload's cumulative bandwidth counters, read
+    /// from its tap device -- the VM equivalent of
+    /// `ContainerEngine::bandwidth`. See
+    /// `bandwidth::read_bandwidth_for_interface` for the exact mechanism.
+    async fn bandwidth(&self, handle: &str) -> Result<WorkloadBandwidth, ExecutorError>;
+    /// ADR-033 §5: applies this workload's reserved egress rate as a
+    /// host-side `tc` ceiling against its tap device -- the VM equivalent
+    /// of `ContainerEngine::rate_limit`. Callers must only invoke this
+    /// when `egress_mbps > 0` (see `RateLimiter::apply_to_interface`'s
+    /// doc comment) -- `VmExecutor::apply_rate_limit_if_needed` is the
+    /// single call site and already guards on that, mirroring
+    /// `DockerExecutor::apply_rate_limit_if_needed` exactly.
+    async fn rate_limit(&self, handle: &str, egress_mbps: i32) -> Result<(), ExecutorError>;
 }
 
 /// This crate's own internal VM deploy request shape -- see this
@@ -97,6 +116,13 @@ pub struct VmDeployRequest {
     /// Unix seconds. Required, matching `DeployRequest.lease_end`'s
     /// existing "required, not optional" precedent (ADR-028 §3).
     pub lease_end: i64,
+    /// ADR-025 §3 / ADR-033 §5: the workload's reserved egress rate,
+    /// Mbps -- the VM analog of `ContainerSpec::egress_mbps`. 0 means "no
+    /// bandwidth requirement declared", the same convention the Docker
+    /// path uses; validated against the same shared
+    /// `ExecutorSettings::max_egress_mbps` policy ceiling `deployment()`
+    /// already enforces for container workloads (see `validate`).
+    pub egress_mbps: i32,
 }
 
 pub struct VmExecutor {
@@ -201,6 +227,15 @@ impl VmExecutor {
                 "lease_end must be a positive timestamp".to_string(),
             ));
         }
+        // ADR-025 §3 / ADR-033 §5: 0 is the valid, common "no bandwidth
+        // requirement declared" case, mirroring `deployment()`'s
+        // identical check for the Docker path -- only negative or
+        // above-policy is rejected.
+        if request.egress_mbps < 0 || request.egress_mbps > self.settings.max_egress_mbps {
+            return Err(ExecutorError::InvalidRequest(
+                "egress_mbps must not be negative and must be within policy".to_string(),
+            ));
+        }
         let mut hasher = Sha256::new();
         hasher.update(request.lease_id.as_bytes());
         hasher.update([0]);
@@ -219,10 +254,44 @@ impl VmExecutor {
             vm_handle: None,
             runtime: WorkloadRuntime::Vm,
             phase: WorkloadPhase::Provisioning,
-            egress_mbps: 0,
+            egress_mbps: request.egress_mbps,
             rate_limited: false,
             lease_end: Some(request.lease_end),
         })
+    }
+
+    /// Applies `record.egress_mbps`'s `tc` ceiling to the VM identified by
+    /// `handle` if a bandwidth reservation was declared (`egress_mbps >
+    /// 0`) and hasn't already been successfully applied
+    /// (`!record.rate_limited`) -- the VM analog of
+    /// `DockerExecutor::apply_rate_limit_if_needed`, reusing that method's
+    /// exact reasoning verbatim: idempotent both ways (a no-op if there's
+    /// nothing to do, safe to call again after a prior failure), and a
+    /// `rate_limit()` failure is deliberately never propagated as an
+    /// error and never changes `record.phase` -- by the time every caller
+    /// reaches this, the VM is already confirmed running via Cloud
+    /// Hypervisor's own `vm.info`, so it is genuinely consuming real
+    /// CPU/memory/network resources regardless of whether its egress
+    /// ceiling could be applied. `record.rate_limited` stays `false`,
+    /// which is exactly the signal this method itself checks on its next
+    /// call -- from a retried `deploy()` or from `recover()` after an
+    /// Agent restart. Errors are logged, not swallowed silently.
+    async fn apply_rate_limit_if_needed(&self, record: &mut WorkloadRecord, handle: &str) {
+        if record.egress_mbps <= 0 || record.rate_limited {
+            return;
+        }
+        match self.engine.rate_limit(handle, record.egress_mbps).await {
+            Ok(()) => record.rate_limited = true,
+            Err(error) => {
+                warn!(
+                    workload_id = %record.workload_id,
+                    %handle,
+                    egress_mbps = record.egress_mbps,
+                    %error,
+                    "rate limit not applied for a running VM; will retry on the next deploy/recover call"
+                );
+            }
+        }
     }
 
     /// ADR-033 §6/§7: the fail-closed quota gate. `max_vm_workloads == 0`
@@ -256,6 +325,13 @@ impl VmExecutor {
             if let Some(handle) = record.vm_handle.clone() {
                 let observation = self.engine.inspect(&handle).await?;
                 if observation.running {
+                    // Retried deploy() for an already-running VM -- a
+                    // prior attempt may have gotten this far and then
+                    // failed to apply the tc rule (see
+                    // apply_rate_limit_if_needed's doc comment). Mirrors
+                    // DockerExecutor::deploy's identical reconciliation
+                    // on its own idempotent-retry path.
+                    self.apply_rate_limit_if_needed(&mut record, &handle).await;
                     record.phase = WorkloadPhase::Running;
                     self.state.store_workload(&record)?;
                     return Ok(handle);
@@ -314,6 +390,13 @@ impl VmExecutor {
             self.state.store_workload(&record)?;
             return Err(ExecutorError::StateConfirmation(handle));
         }
+        // ADR-033 §5: the fourth quota, applied only now that the VM's
+        // tap device is actually attached and Cloud Hypervisor has
+        // confirmed it running -- same ordering ADR-025 §3 requires for
+        // the Docker path. See apply_rate_limit_if_needed's doc comment
+        // for why a failure here does not fail deploy() or mark the
+        // workload Failed.
+        self.apply_rate_limit_if_needed(&mut record, &handle).await;
         record.phase = WorkloadPhase::Running;
         self.state.store_workload(&record)?;
         info!(workload_id = %record.workload_id, %handle, "Cloud Hypervisor confirmed VM running");
@@ -373,13 +456,22 @@ impl VmExecutor {
             };
             match self.engine.inspect(&handle).await {
                 Ok(observation) => {
-                    record.phase = if observation.running {
-                        WorkloadPhase::Running
+                    if observation.running {
+                        // ADR-025 §3 / ADR-033 §5: an Agent restart
+                        // between the VM being confirmed running and
+                        // rate_limit() completing -- or a tc qdisc lost
+                        // out-of-band -- otherwise has no path back to
+                        // enforcement, since nothing else in this
+                        // codebase periodically reconciles tc rules.
+                        // Mirrors DockerExecutor::recover's identical
+                        // reconciliation.
+                        self.apply_rate_limit_if_needed(&mut record, &handle).await;
+                        record.phase = WorkloadPhase::Running;
                     } else if record.phase == WorkloadPhase::Stopping {
-                        WorkloadPhase::Stopped
+                        record.phase = WorkloadPhase::Stopped;
                     } else {
-                        WorkloadPhase::Failed
-                    };
+                        record.phase = WorkloadPhase::Failed;
+                    }
                 }
                 Err(error) => {
                     warn!(workload_id = %record.workload_id, %error, "persisted VM is unavailable");
@@ -515,6 +607,7 @@ impl VmDeployRequest {
             vm_image_url: vm_spec.vm_image_url.clone(),
             vm_image_sha256: vm_spec.vm_image_sha256.clone(),
             lease_end: lease_end.seconds,
+            egress_mbps: limits.egress_mbps,
         })
     }
 }
@@ -617,6 +710,15 @@ mod tests {
         removed: StdMutex<Vec<String>>,
         observations: StdMutex<HashMap<String, VmObservation>>,
         next_id: StdMutex<u64>,
+        // ADR-033 §5: every rate_limit() call this engine received, in
+        // order, as (handle, egress_mbps) -- lets tests assert deploy()/
+        // recover() invoked it with exactly the right target and rate (or
+        // not at all), mirroring FakeEngine's identical fields for the
+        // Docker path.
+        rate_limit_calls: StdMutex<Vec<(String, i32)>>,
+        // Per-handle configured failure for rate_limit(); absent means
+        // succeed.
+        rate_limit_failures: StdMutex<HashMap<String, String>>,
     }
 
     #[async_trait]
@@ -685,6 +787,33 @@ mod tests {
                 .push(handle.to_string());
             Ok(())
         }
+
+        async fn bandwidth(&self, _handle: &str) -> Result<WorkloadBandwidth, ExecutorError> {
+            // No test in this module exercises VmExecutor's own bandwidth
+            // collection today (there is no VM analog of
+            // collect_workload_bandwidth wired yet -- see the PR
+            // description); this stub exists only so FakeVmEngine
+            // satisfies the trait.
+            Err(ExecutorError::Engine(
+                "bandwidth not configured in this test".to_string(),
+            ))
+        }
+
+        async fn rate_limit(&self, handle: &str, egress_mbps: i32) -> Result<(), ExecutorError> {
+            self.rate_limit_calls
+                .lock()
+                .expect("rate limit calls lock")
+                .push((handle.to_string(), egress_mbps));
+            if let Some(reason) = self
+                .rate_limit_failures
+                .lock()
+                .expect("rate limit failures lock")
+                .get(handle)
+            {
+                return Err(ExecutorError::Engine(reason.clone()));
+            }
+            Ok(())
+        }
     }
 
     struct FakeImageFetcher {
@@ -719,6 +848,7 @@ mod tests {
             vm_image_url: "https://example.com/image.qcow2".to_string(),
             vm_image_sha256: digest.to_string(),
             lease_end: 4_102_444_800, // 2100-01-01T00:00:00Z
+            egress_mbps: 0,
         }
     }
 
@@ -894,6 +1024,165 @@ mod tests {
 
         assert_eq!(stopped, vec![request.workload_id.clone()]);
         assert_eq!(engine.stopped.lock().expect("stopped lock").len(), 1);
+    }
+
+    // --- ADR-033 §5 / issue #176 point 1: rate-limit wiring into
+    // VmExecutor's deploy()/recover(), mirroring lib.rs's identical
+    // Docker-path tests.
+
+    #[tokio::test]
+    async fn deploy_applies_the_rate_limit_once_the_vm_is_confirmed_running() {
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        let vm_executor = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4(), &digest);
+        request.egress_mbps = 50;
+
+        let handle = vm_executor.deploy(request.clone()).await.expect("deploy");
+
+        let calls = engine.rate_limit_calls.lock().expect("rate limit calls");
+        assert_eq!(calls.as_slice(), &[(handle.clone(), 50)]);
+        let record = vm_executor
+            .state
+            .workload(&request.workload_id)
+            .expect("record");
+        assert!(record.rate_limited);
+    }
+
+    #[tokio::test]
+    async fn deploy_does_not_apply_a_rate_limit_when_none_was_declared() {
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        let vm_executor = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        // egress_mbps left at request()'s default of 0.
+        vm_executor
+            .deploy(request(Uuid::new_v4(), Uuid::new_v4(), &digest))
+            .await
+            .expect("deploy");
+
+        assert!(
+            engine
+                .rate_limit_calls
+                .lock()
+                .expect("rate limit calls")
+                .is_empty(),
+            "no bandwidth reservation was declared; rate_limit() must never be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_succeeds_even_when_the_rate_limit_application_fails() {
+        // ADR-025 §3's reasoning, reused verbatim for VMs: a rate_limit()
+        // failure must never fail deploy() or mark the VM Failed -- it is
+        // already confirmed running and consuming real resources.
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        // FakeVmEngine's handle is only known after create() runs, so the
+        // failure is pre-registered against every handle this test's
+        // single deploy() will ever produce -- the first (and only) one.
+        engine
+            .rate_limit_failures
+            .lock()
+            .expect("rate limit failures lock")
+            .insert(
+                "/tmp/fake-vm-1.sock".to_string(),
+                "tc: RTNETLINK answers: Permission denied".to_string(),
+            );
+        let vm_executor = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4(), &digest);
+        request.egress_mbps = 50;
+
+        let handle = vm_executor
+            .deploy(request.clone())
+            .await
+            .expect("deploy must succeed despite the tc failure");
+
+        assert_eq!(handle, "/tmp/fake-vm-1.sock");
+        let record = vm_executor
+            .state
+            .workload(&request.workload_id)
+            .expect("record");
+        assert_eq!(record.phase, WorkloadPhase::Running);
+        assert!(
+            !record.rate_limited,
+            "a failed rate_limit() must leave rate_limited false so it is retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_reapplies_a_rate_limit_that_never_succeeded() {
+        let directory = tempfile::tempdir().expect("dir");
+        let cache = directory.path().join("cache");
+        let (bytes, digest) = image_fixture();
+        let engine = Arc::new(FakeVmEngine::default());
+        engine
+            .rate_limit_failures
+            .lock()
+            .expect("rate limit failures lock")
+            .insert(
+                "/tmp/fake-vm-1.sock".to_string(),
+                "tc: RTNETLINK answers: Permission denied".to_string(),
+            );
+        let mut request = request(Uuid::new_v4(), Uuid::new_v4(), &digest);
+        request.egress_mbps = 50;
+        let workload_id = request.workload_id.clone();
+        {
+            let vm_executor = executor(
+                engine.clone(),
+                directory.path(),
+                bytes.clone(),
+                4,
+                cache.clone(),
+            );
+            vm_executor
+                .deploy(request)
+                .await
+                .expect("deploy succeeds despite the tc failure");
+        }
+        assert_eq!(
+            engine
+                .rate_limit_calls
+                .lock()
+                .expect("rate limit calls lock")
+                .len(),
+            1,
+            "one attempt during the original deploy"
+        );
+
+        // The Agent process restarts; the backend has recovered by then.
+        engine
+            .rate_limit_failures
+            .lock()
+            .expect("rate limit failures lock")
+            .remove("/tmp/fake-vm-1.sock");
+        let recovered = executor(engine.clone(), directory.path(), bytes, 4, cache);
+        recovered.recover().await.expect("recover");
+
+        let calls = engine
+            .rate_limit_calls
+            .lock()
+            .expect("rate limit calls lock")
+            .clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "recover() must reapply the rate limit for a running-but-not-yet-limited VM: {calls:?}"
+        );
+        let record = recovered
+            .state
+            .workload(&workload_id)
+            .expect("workload record after recover");
+        assert_eq!(record.phase, WorkloadPhase::Running);
+        assert!(
+            record.rate_limited,
+            "rate_limited must be true once recover()'s retry succeeds"
+        );
     }
 
     // --- agent_api::Executor impl: the proto DeployRequest conversion
