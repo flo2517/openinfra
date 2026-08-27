@@ -442,18 +442,41 @@ fn appeal_slash_succeeds_within_window_and_blocks_execution() {
 }
 
 #[test]
-fn appeal_slash_exactly_at_the_deadline_still_succeeds() {
+fn appeal_slash_one_block_before_the_deadline_still_succeeds() {
+    new_test_ext().execute_with(|| {
+        set_eligible_streak(PROVIDER, 1, 5);
+        let created_at = 5 + DISPUTE_WINDOW;
+        System::set_block_number(created_at);
+        record_breach_ok(PROVIDER, 1);
+        System::set_block_number(created_at + SlashAppealWindow::get() - 1);
+        assert_ok!(ProviderSlashing::appeal_slash(
+            RuntimeOrigin::signed(PROVIDER),
+            PROVIDER,
+            DIM
+        ));
+    });
+}
+
+// The appeal and execute deadlines must be strictly complementary: exactly
+// one of `appeal_slash`/`execute_slash` may succeed at `now == deadline`,
+// never both. `execute_slash_succeeds_exactly_at_the_deadline` below claims
+// that block for execution, so appeal must close one block earlier -- not
+// share it. Before this fix both checks used `now <= deadline`/
+// `now >= deadline`, overlapping at that one block; see
+// `adversarial_execute_slash_before_appeal_at_the_exact_deadline_forecloses_the_appeal`
+// for the exploit this closes.
+#[test]
+fn appeal_slash_exactly_at_the_deadline_fails() {
     new_test_ext().execute_with(|| {
         set_eligible_streak(PROVIDER, 1, 5);
         let created_at = 5 + DISPUTE_WINDOW;
         System::set_block_number(created_at);
         record_breach_ok(PROVIDER, 1);
         System::set_block_number(created_at + SlashAppealWindow::get());
-        assert_ok!(ProviderSlashing::appeal_slash(
-            RuntimeOrigin::signed(PROVIDER),
-            PROVIDER,
-            DIM
-        ));
+        assert_noop!(
+            ProviderSlashing::appeal_slash(RuntimeOrigin::signed(PROVIDER), PROVIDER, DIM),
+            crate::Error::<Test>::AppealWindowClosed
+        );
     });
 }
 
@@ -468,6 +491,38 @@ fn appeal_slash_one_block_past_the_deadline_fails() {
         assert_noop!(
             ProviderSlashing::appeal_slash(RuntimeOrigin::signed(PROVIDER), PROVIDER, DIM),
             crate::Error::<Test>::AppealWindowClosed
+        );
+    });
+}
+
+// Regression test for the exact race an internal security review found and
+// reproduced before merge: at the single block where both the old
+// (overlapping) boundary checks were simultaneously true, a permissionless
+// `execute_slash` could win a same-block race against the provider's own
+// appeal, silently defeating ADR-036's "an open appeal blocks execution"
+// guarantee. With `appeal_slash` now strictly `now < deadline`, the appeal
+// filed in this exact scenario correctly fails with `NoPendingSlash`
+// (nothing left pending to appeal) rather than the race being decided by
+// extrinsic ordering within the block.
+#[test]
+fn adversarial_execute_slash_before_appeal_at_the_exact_deadline_forecloses_the_appeal() {
+    new_test_ext().execute_with(|| {
+        set_eligible_streak(PROVIDER, 1, 5);
+        let created_at = 5 + DISPUTE_WINDOW;
+        System::set_block_number(created_at);
+        record_breach_ok(PROVIDER, 1);
+        System::set_block_number(created_at + SlashAppealWindow::get());
+
+        assert_ok!(ProviderSlashing::execute_slash(
+            RuntimeOrigin::signed(9),
+            PROVIDER,
+            DIM
+        ));
+        assert_eq!(slash_calls(), vec![(PROVIDER, ProviderSlashAmount::get())]);
+
+        assert_noop!(
+            ProviderSlashing::appeal_slash(RuntimeOrigin::signed(PROVIDER), PROVIDER, DIM),
+            crate::Error::<Test>::NoPendingSlash
         );
     });
 }

@@ -426,8 +426,16 @@ pub mod pallet {
         }
 
         /// Only the scored provider itself may appeal, only while the
-        /// pending slash is still `Proposed`, only within
-        /// `SlashAppealWindow` of `record_breach` (ADR-036 §6).
+        /// pending slash is still `Proposed`, only strictly before
+        /// `SlashAppealWindow` of `record_breach` elapses (ADR-036 §6).
+        ///
+        /// Strictly `now < deadline`, not `now <= deadline`: `execute_slash`
+        /// below permits execution from `now >= deadline` onward, so the two
+        /// checks must be complementary rather than both true at the single
+        /// `now == deadline` block. Before this fix they overlapped there,
+        /// letting a permissionless `execute_slash` race a same-block appeal
+        /// and silently foreclose it -- exactly the race an internal
+        /// security review reproduced against this pallet before merge.
         #[pallet::call_index(1)]
         #[pallet::weight(T::WeightInfo::appeal_slash())]
         pub fn appeal_slash(
@@ -447,7 +455,7 @@ pub mod pallet {
                 let deadline = pending
                     .created_at
                     .saturating_add(T::SlashAppealWindow::get());
-                ensure!(now <= deadline, Error::<T>::AppealWindowClosed);
+                ensure!(now < deadline, Error::<T>::AppealWindowClosed);
                 pending.state = SlashState::Appealed;
                 Ok(())
             })?;
