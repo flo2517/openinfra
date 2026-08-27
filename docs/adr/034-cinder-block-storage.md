@@ -2,13 +2,16 @@
 
 ## Status
 
-Proposed. Written by Claude Code, autonomously, in response to issue #171 (split off from #26 per
-ADR-031 §6, which explicitly deferred Cinder to this follow-up ADR). **This needs the repository
-owner's live review before acceptance** — unlike a narrower technical decision, this ADR adds a new
-persistent, tenant-owned data class to a codebase that has none today, and issue #26 is tagged
-`type:security` specifically because of this half of it (ADR-031 §6). Held Proposed on the same
-footing ADR-016/025/026/027/028/029/030/031 were each held before an explicit owner sign-off,
-rather than self-accepted.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #171 (split off from #26 per
+ADR-031 §6, which explicitly deferred Cinder to this follow-up ADR). This ADR adds a new persistent,
+tenant-owned data class to a codebase that had none before, and issue #26 is tagged `type:security`
+specifically because of this half of it (ADR-031 §6) — held to the same standard
+ADR-016/025/026/027/028/029/030/031 were each held to before acceptance. Nothing here is implemented
+yet by this ADR itself; issue #26's Cinder half is unblocked by this acceptance and now carries the
+implementation work, including the dedicated security review its `type:security` tag calls for.
 
 ## Context
 
