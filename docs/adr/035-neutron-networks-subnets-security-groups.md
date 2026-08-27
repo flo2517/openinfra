@@ -2,13 +2,17 @@
 
 ## Status
 
-Proposed. Written by Claude Code, autonomously, in response to issue #170 (split off issue #25 per
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+
+Originally written by Claude Code, autonomously, in response to issue #170 (split off issue #25 per
 ADR-031 §5/§8, which named this exact slice as needing its own narrower follow-up ADR before
-implementation). **This needs the repository owner's live review before acceptance** — issue #25 is
-`type:security`-tagged specifically because of the security-group half of this design, and ADR-031
-§8 already flagged this as needing dedicated security review, the same posture ADR-016, ADR-025, and
-ADR-027 were each held to before self-acceptance was appropriate. Nothing in this ADR authorizes
-implementation; it is a design proposal only.
+implementation). Issue #25 is `type:security`-tagged specifically because of the security-group half
+of this design, and ADR-031 §8 already flagged this as needing dedicated security review — the same
+posture ADR-016, ADR-025, and ADR-027 were each held to before acceptance. Nothing here is
+implemented yet by this ADR itself; issue #25's hard half is unblocked by this acceptance and now
+carries the implementation work, including the dedicated security review its `type:security` tag
+calls for.
 
 ## Context
 
