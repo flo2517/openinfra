@@ -46,8 +46,30 @@ pub fn read_bandwidth(
     window_started_at: SystemTime,
 ) -> Result<WorkloadBandwidth, ExecutorError> {
     let veth = resolve_veth_name(sys_root, container_pid)?;
-    let ingress_bytes_total = read_counter(sys_root, &veth, "tx_bytes")?;
-    let egress_bytes_total = read_counter(sys_root, &veth, "rx_bytes")?;
+    read_bandwidth_for_interface(sys_root, &veth, window_started_at)
+}
+
+/// The same host-side-counter read `read_bandwidth` performs, against an
+/// interface name the caller already knows directly rather than one that
+/// needs PID-based veth resolution first. ADR-033 §5's tap-device path
+/// (`vm::tap`) calls this directly: a VM's tap device name is chosen by
+/// this Agent itself at creation time, not discovered after the fact the
+/// way a container's veth peer is.
+///
+/// Direction convention is the identical mirror-image relationship this
+/// module's other doc comments explain for veth: the *host* owns the tap
+/// device directly (there is no separate peer-namespace end to traverse
+/// the way a veth pair has one), and what the guest's virtio-net transmits
+/// arrives at the host as the tap's `rx_bytes` -- so, exactly like a
+/// veth's host side, `rx_bytes` is still the workload's egress and
+/// `tx_bytes` is still its ingress.
+pub(crate) fn read_bandwidth_for_interface(
+    sys_root: &Path,
+    iface: &str,
+    window_started_at: SystemTime,
+) -> Result<WorkloadBandwidth, ExecutorError> {
+    let ingress_bytes_total = read_counter(sys_root, iface, "tx_bytes")?;
+    let egress_bytes_total = read_counter(sys_root, iface, "rx_bytes")?;
     Ok(WorkloadBandwidth {
         ingress_bytes_total,
         egress_bytes_total,
@@ -216,6 +238,46 @@ mod tests {
         assert_eq!(
             reading.egress_bytes_total, 5,
             "container egress must come from the host side's rx_bytes"
+        );
+    }
+
+    // --- read_bandwidth_for_interface (ADR-033 §5): the same counter read,
+    // against an interface name the caller already knows -- no PID/iflink
+    // resolution fixture needed, unlike read_bandwidth's tests above.
+
+    #[test]
+    fn read_bandwidth_for_interface_reads_counters_directly_by_name() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let root = directory.path();
+        // Deliberately no proc/<pid>/... fixture at all -- if this
+        // function tried PID-based resolution the way read_bandwidth
+        // does, this would fail before ever reaching the counters.
+        write(
+            &root.join("sys/class/net/oivmabcd1234/statistics/rx_bytes"),
+            "111\n",
+        );
+        write(
+            &root.join("sys/class/net/oivmabcd1234/statistics/tx_bytes"),
+            "222\n",
+        );
+
+        let reading = read_bandwidth_for_interface(root, "oivmabcd1234", UNIX_EPOCH).expect("read");
+        assert_eq!(
+            reading.ingress_bytes_total, 222,
+            "workload ingress must come from the tap's tx_bytes, mirroring veth's host side"
+        );
+        assert_eq!(
+            reading.egress_bytes_total, 111,
+            "workload egress must come from the tap's rx_bytes, mirroring veth's host side"
+        );
+        assert_eq!(reading.window_started_at, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn read_bandwidth_for_interface_is_a_clear_error_when_the_interface_is_missing() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        assert!(
+            read_bandwidth_for_interface(directory.path(), "oivmmissing1", UNIX_EPOCH).is_err()
         );
     }
 }

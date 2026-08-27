@@ -51,18 +51,34 @@
 //! non-root with only `CAP_NET_ADMIN`) needs a real Linux host with a
 //! `setpriv`-capable root Agent process and is tracked as a follow-up
 //! (see this PR's description).
+//!
+//! **Networking (ADR-033 §5 / issue #176 point 1)**: `create()` attaches
+//! each VM to a host tap device via `vm::tap::TapBackend`, named in Cloud
+//! Hypervisor's `net` device config by the tap's device name (verified
+//! against Cloud Hypervisor's own OpenAPI spec's `NetConfig.tap` field --
+//! Cloud Hypervisor opens a pre-existing tap given by name, it does not
+//! create one). `bandwidth()`/`rate_limit()` below read/enforce against
+//! that same tap device, reusing `bandwidth::read_bandwidth_for_interface`
+//! and `RateLimiter::apply_to_interface` directly -- see `vm::tap`'s own
+//! top doc comment for the full design and honesty discipline (real tap
+//! creation needs `CAP_NET_ADMIN` and a real kernel netlink socket,
+//! neither available in this sandbox; what's tested for real is this
+//! engine's tap-attach/detach/lookup *wiring*, against a `FakeTapBackend`
+//! double, exactly like `VmmProcessSpawner`/`VmmTransport` already are).
 
-use crate::ExecutorError;
+use crate::rate_limit::RateLimiter;
+use crate::{ExecutorError, WorkloadBandwidth};
 use async_trait::async_trait;
 use hyper::{Body, Client, Method, Request};
 use hyperlocal::UnixClientExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use super::tap::TapBackend;
 use super::{VmEngine, VmObservation, VmSpec};
 
 const MIB: i64 = 1024 * 1024;
@@ -325,6 +341,19 @@ impl VmmProcessHandle for SystemVmmProcessHandle {
 
 type TransportFactory = Arc<dyn Fn(PathBuf) -> Arc<dyn VmmTransport> + Send + Sync>;
 
+/// A VM's tap device name plus the moment it was attached -- the latter
+/// stands in for `bandwidth()`'s counter-window start (`bandwidth.rs`'s
+/// `WorkloadBandwidth::window_started_at`). The Docker path reads this
+/// from the container's own `started_at` timestamp (via bollard inspect);
+/// there is no equivalent single source of truth for a VM's tap device,
+/// but since this Agent creates the tap fresh per VM and its counters
+/// start at zero, the attach time is the direct analog.
+#[derive(Debug, Clone)]
+struct TapAttachment {
+    name: String,
+    attached_at: SystemTime,
+}
+
 pub struct CloudHypervisorEngine {
     binary: PathBuf,
     sockets_dir: PathBuf,
@@ -336,6 +365,20 @@ pub struct CloudHypervisorEngine {
     /// process, so `remove()` can actually kill it. `create()`'s only
     /// mutation of this map; `remove()`'s only removal.
     processes: Mutex<HashMap<String, Box<dyn VmmProcessHandle>>>,
+    /// ADR-033 §5: handle -> this VM's tap device attachment, so
+    /// `bandwidth()`/`rate_limit()`/`remove()` can find the interface
+    /// `create()` attached without re-deriving it. `create()`'s only
+    /// mutation, `remove()`'s only removal -- the same lifecycle
+    /// `processes` above already has.
+    taps: Mutex<HashMap<String, TapAttachment>>,
+    tap_backend: Arc<dyn TapBackend>,
+    rate_limiter: RateLimiter,
+    /// Root sysfs is read under for `bandwidth()`'s tap counter reads --
+    /// `/` in production, overridable in tests so they never need a real
+    /// `/sys/class/net` entry. Mirrors `BollardEngine`'s own hardcoded
+    /// `Path::new("/")` for the Docker path; a field here (not a
+    /// constant) only because this engine's tests need to override it.
+    sys_root: PathBuf,
 }
 
 impl CloudHypervisorEngine {
@@ -358,15 +401,24 @@ impl CloudHypervisorEngine {
             Arc::new(|socket_path: PathBuf| -> Arc<dyn VmmTransport> {
                 Arc::new(UnixSocketTransport::new(socket_path))
             }),
+            Arc::new(super::tap::SystemTapBackend::new(Arc::new(
+                crate::rate_limit::SystemCommandRunner,
+            ))),
+            RateLimiter::new(Arc::new(crate::rate_limit::SystemCommandRunner)),
+            PathBuf::from("/"),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_parts(
         binary: PathBuf,
         sockets_dir: PathBuf,
         firmware_path: PathBuf,
         spawner: Arc<dyn VmmProcessSpawner>,
         transport_factory: TransportFactory,
+        tap_backend: Arc<dyn TapBackend>,
+        rate_limiter: RateLimiter,
+        sys_root: PathBuf,
     ) -> Self {
         Self {
             binary,
@@ -375,31 +427,65 @@ impl CloudHypervisorEngine {
             spawner,
             transport_factory,
             processes: Mutex::new(HashMap::new()),
+            taps: Mutex::new(HashMap::new()),
+            tap_backend,
+            rate_limiter,
+            sys_root,
         }
     }
 
     #[cfg(test)]
     fn for_test(spawner: Arc<dyn VmmProcessSpawner>, transport_factory: TransportFactory) -> Self {
+        Self::for_test_full(
+            spawner,
+            transport_factory,
+            Arc::new(tests::FakeTapBackend::default()),
+            Arc::new(tests::FakeCommandRunner::default()),
+            std::env::temp_dir(),
+        )
+    }
+
+    /// The fully-parameterized test constructor -- used directly by this
+    /// module's own tap/bandwidth/rate-limit tests; `for_test` above is
+    /// just this with always-succeeding fakes plumbed in, for the
+    /// existing create/start/stop/inspect/remove tests that don't care
+    /// about networking at all.
+    #[cfg(test)]
+    fn for_test_full(
+        spawner: Arc<dyn VmmProcessSpawner>,
+        transport_factory: TransportFactory,
+        tap_backend: Arc<dyn TapBackend>,
+        command_runner: Arc<dyn crate::rate_limit::CommandRunner>,
+        sys_root: PathBuf,
+    ) -> Self {
         Self::with_parts(
             PathBuf::from("cloud-hypervisor"),
             std::env::temp_dir(),
             PathBuf::from("/usr/share/cloud-hypervisor/CLOUDHV.fd"),
             spawner,
             transport_factory,
+            tap_backend,
+            RateLimiter::new(command_runner),
+            sys_root,
         )
     }
 
     fn socket_path(&self, name: &str) -> PathBuf {
         self.sockets_dir.join(format!("{name}.sock"))
     }
-}
 
-#[async_trait]
-impl VmEngine for CloudHypervisorEngine {
-    async fn create(&self, spec: &VmSpec) -> Result<String, ExecutorError> {
-        let socket_path = self.socket_path(&spec.name);
-        let process = self.spawner.spawn(&self.binary, &socket_path).await?;
-        let transport = (self.transport_factory)(socket_path.clone());
+    /// `create()`'s body, split out only so `create()` itself can wrap it
+    /// in one shared tap-cleanup-on-failure block (see `create()`'s doc
+    /// comment) instead of repeating that cleanup at every one of this
+    /// method's several fallible steps.
+    async fn create_after_tap(
+        &self,
+        spec: &VmSpec,
+        socket_path: &Path,
+        tap_name: &str,
+    ) -> Result<String, ExecutorError> {
+        let process = self.spawner.spawn(&self.binary, socket_path).await?;
+        let transport = (self.transport_factory)(socket_path.to_path_buf());
         let memory_bytes = spec.memory_mb.checked_mul(MIB).ok_or_else(|| {
             ExecutorError::InvalidRequest("VM memory limit overflows bytes".to_string())
         })?;
@@ -410,12 +496,18 @@ impl VmEngine for CloudHypervisorEngine {
         };
         // Field names/shape verified against Cloud Hypervisor's own
         // OpenAPI spec (VmConfig/CpusConfig/MemoryConfig/PayloadConfig/
-        // DiskConfig) -- see this module's top doc comment.
+        // DiskConfig/NetConfig) -- see this module's top doc comment.
+        // `net[0].tap` names the host tap device by name rather than
+        // supplying a raw fd -- the simpler of Cloud Hypervisor's two
+        // documented options, and the one that doesn't require this
+        // Agent to keep a tap fd alive across the `cloud-hypervisor`
+        // subprocess boundary.
         let body = serde_json::json!({
             "cpus": {"boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus},
             "memory": {"size": memory_bytes},
             "payload": {"firmware": firmware.to_string_lossy()},
             "disks": [{"path": spec.image_path.to_string_lossy(), "readonly": false}],
+            "net": [{"tap": tap_name}],
         });
         let body_bytes = serde_json::to_vec(&body).map_err(|error| {
             ExecutorError::Engine(format!("encoding cloud-hypervisor VmConfig: {error}"))
@@ -430,8 +522,50 @@ impl VmEngine for CloudHypervisorEngine {
             )));
         }
         let handle = socket_path.to_string_lossy().to_string();
+        self.taps.lock().await.insert(
+            handle.clone(),
+            TapAttachment {
+                name: tap_name.to_string(),
+                attached_at: SystemTime::now(),
+            },
+        );
         self.processes.lock().await.insert(handle.clone(), process);
         Ok(handle)
+    }
+
+    /// Looks up the tap device `create()` attached for `handle`, for
+    /// `bandwidth()`/`rate_limit()` -- an unknown handle is a clear error
+    /// rather than a panic or a silently-wrong default interface, the
+    /// same "fail closed on an unrecognized handle" posture `inspect`/
+    /// `remove` already have via their own transport/HTTP-status checks.
+    async fn tap_for_handle(&self, handle: &str) -> Result<TapAttachment, ExecutorError> {
+        self.taps.lock().await.get(handle).cloned().ok_or_else(|| {
+            ExecutorError::Engine(format!("no tap device recorded for VM handle {handle}"))
+        })
+    }
+}
+
+#[async_trait]
+impl VmEngine for CloudHypervisorEngine {
+    async fn create(&self, spec: &VmSpec) -> Result<String, ExecutorError> {
+        let socket_path = self.socket_path(&spec.name);
+        // ADR-033 §5: the tap device must exist before vm.create's `net`
+        // config below can reference it by name -- Cloud Hypervisor opens
+        // a pre-existing tap given by name, it does not create one (see
+        // this module's top doc comment and `vm::tap`'s). Attached before
+        // spawning the process: creation order relative to the VMM
+        // process doesn't matter (only "before vm.create is called"
+        // does), but attaching first means a spawn failure's cleanup path
+        // below is the only cleanup path this method needs, not two.
+        let tap_name = super::tap::tap_device_name(&spec.name);
+        self.tap_backend.attach(&tap_name)?;
+        let result = self.create_after_tap(spec, &socket_path, &tap_name).await;
+        if result.is_err() {
+            if let Err(cleanup_error) = self.tap_backend.detach(&tap_name) {
+                warn!(%tap_name, %cleanup_error, "failed to remove tap device after a failed VM create");
+            }
+        }
+        result
     }
 
     async fn start(&self, handle: &str) -> Result<(), ExecutorError> {
@@ -506,7 +640,42 @@ impl VmEngine for CloudHypervisorEngine {
                 warn!(%handle, %error, "failed to remove cloud-hypervisor API socket file");
             }
         }
+        // ADR-033 §5: tap teardown happens last, only after the VM itself
+        // is confirmed gone -- mirrors vm.delete's own idempotency, since
+        // a retried remove() for an already-torn-down VM must not error
+        // just because the tap (or the map entry recording it) is
+        // already gone; a missing map entry here is not itself an error,
+        // it just means there is nothing left to detach.
+        if let Some(attachment) = self.taps.lock().await.remove(handle) {
+            if let Err(error) = self.tap_backend.detach(&attachment.name) {
+                warn!(%handle, tap_name = %attachment.name, %error, "failed to remove tap device after vm.delete");
+            }
+        }
         Ok(())
+    }
+
+    /// ADR-033 §5: this workload's cumulative bandwidth counters, read
+    /// from its tap device. See `bandwidth::read_bandwidth_for_interface`
+    /// for the exact mechanism and direction convention.
+    async fn bandwidth(&self, handle: &str) -> Result<WorkloadBandwidth, ExecutorError> {
+        let attachment = self.tap_for_handle(handle).await?;
+        crate::bandwidth::read_bandwidth_for_interface(
+            &self.sys_root,
+            &attachment.name,
+            attachment.attached_at,
+        )
+    }
+
+    /// ADR-033 §5: applies `egress_mbps` as a host-side `tc` ceiling
+    /// against this workload's tap device. See
+    /// `RateLimiter::apply_to_interface`'s doc comment for the exact
+    /// mechanism; callers (`VmExecutor::apply_rate_limit_if_needed`) must
+    /// only invoke this when `egress_mbps > 0`, the same convention
+    /// `ContainerEngine::rate_limit`'s callers already follow.
+    async fn rate_limit(&self, handle: &str, egress_mbps: i32) -> Result<(), ExecutorError> {
+        let attachment = self.tap_for_handle(handle).await?;
+        self.rate_limiter
+            .apply_to_interface(&attachment.name, egress_mbps)
     }
 }
 
@@ -660,12 +829,26 @@ mod tests {
 
     struct FakeSpawner {
         calls: StdMutex<Vec<(PathBuf, PathBuf)>>,
+        // ADR-033 §5: when true, spawn() fails every call -- used by the
+        // tap-cleanup-on-failure tests below to exercise create()'s
+        // cleanup path without needing vm.create itself to fail.
+        fails: bool,
     }
 
     impl Default for FakeSpawner {
         fn default() -> Self {
             Self {
                 calls: StdMutex::new(Vec::new()),
+                fails: false,
+            }
+        }
+    }
+
+    impl FakeSpawner {
+        fn failing() -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                fails: true,
             }
         }
     }
@@ -693,9 +876,84 @@ mod tests {
                 .lock()
                 .expect("calls lock")
                 .push((binary.to_path_buf(), api_socket.to_path_buf()));
+            if self.fails {
+                return Err(ExecutorError::Engine("spawn failed (test)".to_string()));
+            }
             Ok(Box::new(FakeProcessHandle {
                 killed: Arc::new(StdMutex::new(false)),
             }))
+        }
+    }
+
+    // --- ADR-033 §5: fakes for the tap-device networking seams
+    // (`TapBackend`, `CommandRunner`), the same double-per-privileged-
+    // mechanism pattern `FakeTransport`/`FakeSpawner` above already use.
+
+    #[derive(Default)]
+    pub(super) struct FakeTapBackend {
+        pub(super) attached: StdMutex<Vec<String>>,
+        pub(super) detached: StdMutex<Vec<String>>,
+        attach_failures: StdMutex<HashMap<String, String>>,
+        detach_failures: StdMutex<HashMap<String, String>>,
+    }
+
+    impl FakeTapBackend {
+        fn fail_attach(&self, name: &str, reason: &str) {
+            self.attach_failures
+                .lock()
+                .expect("attach failures lock")
+                .insert(name.to_string(), reason.to_string());
+        }
+
+        fn fail_detach(&self, name: &str, reason: &str) {
+            self.detach_failures
+                .lock()
+                .expect("detach failures lock")
+                .insert(name.to_string(), reason.to_string());
+        }
+    }
+
+    impl TapBackend for FakeTapBackend {
+        fn attach(&self, name: &str) -> Result<(), ExecutorError> {
+            self.attached
+                .lock()
+                .expect("attached lock")
+                .push(name.to_string());
+            if let Some(reason) = self.attach_failures.lock().expect("lock").get(name) {
+                return Err(ExecutorError::Engine(reason.clone()));
+            }
+            Ok(())
+        }
+
+        fn detach(&self, name: &str) -> Result<(), ExecutorError> {
+            self.detached
+                .lock()
+                .expect("detached lock")
+                .push(name.to_string());
+            if let Some(reason) = self.detach_failures.lock().expect("lock").get(name) {
+                return Err(ExecutorError::Engine(reason.clone()));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct FakeCommandRunner {
+        pub(super) invocations: StdMutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl crate::rate_limit::CommandRunner for FakeCommandRunner {
+        fn run(&self, program: &str, args: &[String]) -> std::io::Result<std::process::Output> {
+            use std::os::unix::process::ExitStatusExt;
+            self.invocations
+                .lock()
+                .expect("invocations lock")
+                .push((program.to_string(), args.to_vec()));
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
         }
     }
 
@@ -709,6 +967,58 @@ mod tests {
             }),
         );
         (engine, transport)
+    }
+
+    /// Like `engine_with_fake_transport`, but also returns the
+    /// `FakeTapBackend`/`FakeCommandRunner` doubles directly, for tests
+    /// that assert on tap-device attach/detach calls or `tc` invocations
+    /// rather than just Cloud Hypervisor API calls.
+    fn engine_with_networking_fakes() -> (
+        CloudHypervisorEngine,
+        Arc<FakeTransport>,
+        Arc<FakeTapBackend>,
+        Arc<FakeCommandRunner>,
+    ) {
+        engine_with_networking_fakes_and_spawner(Arc::new(FakeSpawner::default()))
+    }
+
+    fn engine_with_networking_fakes_and_spawner(
+        spawner: Arc<dyn VmmProcessSpawner>,
+    ) -> (
+        CloudHypervisorEngine,
+        Arc<FakeTransport>,
+        Arc<FakeTapBackend>,
+        Arc<FakeCommandRunner>,
+    ) {
+        engine_with_networking_fakes_and_spawner_and_sysroot(spawner, std::env::temp_dir())
+    }
+
+    /// The fully general form -- also lets `bandwidth()`'s tests point
+    /// counter reads at a fake `/sys/class/net` tree instead of the real
+    /// root.
+    fn engine_with_networking_fakes_and_spawner_and_sysroot(
+        spawner: Arc<dyn VmmProcessSpawner>,
+        sys_root: PathBuf,
+    ) -> (
+        CloudHypervisorEngine,
+        Arc<FakeTransport>,
+        Arc<FakeTapBackend>,
+        Arc<FakeCommandRunner>,
+    ) {
+        let transport = Arc::new(FakeTransport::default());
+        let transport_for_factory = transport.clone();
+        let tap_backend = Arc::new(FakeTapBackend::default());
+        let command_runner = Arc::new(FakeCommandRunner::default());
+        let engine = CloudHypervisorEngine::for_test_full(
+            spawner,
+            Arc::new(move |_socket_path: PathBuf| -> Arc<dyn VmmTransport> {
+                transport_for_factory.clone()
+            }),
+            tap_backend.clone(),
+            command_runner.clone(),
+            sys_root,
+        );
+        (engine, transport, tap_backend, command_runner)
     }
 
     fn spec() -> VmSpec {
@@ -745,6 +1055,13 @@ mod tests {
         assert_eq!(
             body["payload"]["firmware"],
             "/usr/share/cloud-hypervisor/CLOUDHV.fd"
+        );
+        // ADR-033 §5: the tap device this engine attached must be named
+        // in the net config by exactly the name `vm::tap::tap_device_name`
+        // derives from the spec's own name.
+        assert_eq!(
+            body["net"][0]["tap"],
+            crate::vm::tap::tap_device_name(&spec().name)
         );
     }
 
@@ -828,6 +1145,227 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, PathBuf::from("cloud-hypervisor"));
         assert!(calls[0].1.ends_with("wl-1.sock"));
+    }
+
+    // --- ADR-033 §5 / issue #176 point 1: tap-device networking wiring
+    // (create/remove attach-detach, bandwidth/rate_limit), against the
+    // FakeTapBackend/FakeCommandRunner doubles above -- see this module's
+    // and vm::tap's top doc comments for exactly what this does and does
+    // not prove (no real CAP_NET_ADMIN/kernel netlink socket here).
+
+    #[tokio::test]
+    async fn create_attaches_the_tap_device_before_calling_vm_create() {
+        let (engine, _transport, tap_backend, _runner) = engine_with_networking_fakes();
+
+        let handle = engine.create(&spec()).await.expect("create");
+
+        let expected_tap = crate::vm::tap::tap_device_name(&spec().name);
+        assert_eq!(
+            tap_backend
+                .attached
+                .lock()
+                .expect("attached lock")
+                .as_slice(),
+            &[expected_tap]
+        );
+        assert!(engine.taps.lock().await.contains_key(&handle));
+    }
+
+    #[tokio::test]
+    async fn create_surfaces_a_tap_attach_failure_and_never_calls_vm_create() {
+        let (engine, transport, tap_backend, _runner) = engine_with_networking_fakes();
+        let expected_tap = crate::vm::tap::tap_device_name(&spec().name);
+        tap_backend.fail_attach(&expected_tap, "RTNETLINK answers: Permission denied");
+
+        let result = engine.create(&spec()).await;
+
+        let error = result.expect_err("a tap attach failure must surface");
+        assert!(error.to_string().contains("Permission denied"));
+        assert!(
+            transport.calls.lock().expect("calls lock").is_empty(),
+            "vm.create must never be called when the tap could not be attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_detaches_the_tap_device_when_the_vmm_process_fails_to_spawn() {
+        let (engine, _transport, tap_backend, _runner) =
+            engine_with_networking_fakes_and_spawner(Arc::new(FakeSpawner::failing()));
+
+        let result = engine.create(&spec()).await;
+
+        assert!(result.is_err());
+        let expected_tap = crate::vm::tap::tap_device_name(&spec().name);
+        assert_eq!(
+            tap_backend.attached.lock().expect("lock").as_slice(),
+            std::slice::from_ref(&expected_tap),
+            "the tap must still have been attached before the spawn failure"
+        );
+        assert_eq!(
+            tap_backend.detached.lock().expect("lock").as_slice(),
+            std::slice::from_ref(&expected_tap),
+            "a failed create() must clean up the tap device it already attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_detaches_the_tap_device_when_vm_create_returns_a_non_204() {
+        let (engine, transport, tap_backend, _runner) = engine_with_networking_fakes();
+        transport.respond("/vm.create", 400, b"bad config".to_vec());
+
+        let result = engine.create(&spec()).await;
+
+        assert!(result.is_err());
+        let expected_tap = crate::vm::tap::tap_device_name(&spec().name);
+        assert_eq!(
+            tap_backend.detached.lock().expect("lock").as_slice(),
+            &[expected_tap],
+            "a rejected vm.create must not leave an orphaned tap device"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_detaches_the_tap_device_after_vm_delete_succeeds() {
+        let (engine, _transport, tap_backend, _runner) = engine_with_networking_fakes();
+        let handle = engine.create(&spec()).await.expect("create");
+        let expected_tap = crate::vm::tap::tap_device_name(&spec().name);
+
+        engine.remove(&handle).await.expect("remove");
+
+        assert_eq!(
+            tap_backend.detached.lock().expect("lock").as_slice(),
+            &[expected_tap]
+        );
+        assert!(
+            !engine.taps.lock().await.contains_key(&handle),
+            "the tap attachment must be dropped from tracking after remove()"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_tolerates_a_tap_detach_failure_and_still_succeeds() {
+        let (engine, _transport, tap_backend, _runner) = engine_with_networking_fakes();
+        let handle = engine.create(&spec()).await.expect("create");
+        let expected_tap = crate::vm::tap::tap_device_name(&spec().name);
+        tap_backend.fail_detach(&expected_tap, "device busy");
+
+        engine
+            .remove(&handle)
+            .await
+            .expect("a tap detach failure must not fail remove() -- the VM itself is already gone");
+    }
+
+    #[tokio::test]
+    async fn remove_is_idempotent_about_the_tap_when_called_twice() {
+        let (engine, _transport, tap_backend, _runner) = engine_with_networking_fakes();
+        let handle = engine.create(&spec()).await.expect("create");
+
+        engine.remove(&handle).await.expect("first remove");
+        engine
+            .remove(&handle)
+            .await
+            .expect("second remove must also succeed");
+
+        // Only the first remove() found a tracked tap to detach; the
+        // second found none, which is not an error (see tap_for_handle's
+        // doc comment / remove()'s own comment).
+        assert_eq!(tap_backend.detached.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bandwidth_reads_the_attached_taps_counters() {
+        let directory = tempfile::tempdir().expect("dir");
+        let (engine, _transport, _tap_backend, _runner) =
+            engine_with_networking_fakes_and_spawner_and_sysroot(
+                Arc::new(FakeSpawner::default()),
+                directory.path().to_path_buf(),
+            );
+        let handle = engine.create(&spec()).await.expect("create");
+        let tap_name = crate::vm::tap::tap_device_name(&spec().name);
+        std::fs::create_dir_all(
+            directory
+                .path()
+                .join("sys/class/net")
+                .join(&tap_name)
+                .join("statistics"),
+        )
+        .expect("create fixture dirs");
+        std::fs::write(
+            directory
+                .path()
+                .join("sys/class/net")
+                .join(&tap_name)
+                .join("statistics/rx_bytes"),
+            "1024\n",
+        )
+        .expect("write rx_bytes");
+        std::fs::write(
+            directory
+                .path()
+                .join("sys/class/net")
+                .join(&tap_name)
+                .join("statistics/tx_bytes"),
+            "2048\n",
+        )
+        .expect("write tx_bytes");
+
+        let reading = engine.bandwidth(&handle).await.expect("bandwidth");
+
+        assert_eq!(reading.egress_bytes_total, 1024);
+        assert_eq!(reading.ingress_bytes_total, 2048);
+    }
+
+    #[tokio::test]
+    async fn bandwidth_fails_clearly_for_an_unrecognized_handle() {
+        let (engine, _transport, _tap_backend, _runner) = engine_with_networking_fakes();
+
+        let result = engine.bandwidth("/no/such/vm.sock").await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_applies_tc_directly_to_the_tap_device_by_name() {
+        let (engine, _transport, _tap_backend, runner) = engine_with_networking_fakes();
+        let handle = engine.create(&spec()).await.expect("create");
+        let expected_tap = crate::vm::tap::tap_device_name(&spec().name);
+
+        engine.rate_limit(&handle, 75).await.expect("rate_limit");
+
+        let invocations = runner.invocations.lock().expect("invocations lock");
+        assert_eq!(invocations.len(), 1);
+        let (program, args) = &invocations[0];
+        assert_eq!(program, "tc");
+        assert_eq!(
+            args,
+            &[
+                "qdisc",
+                "replace",
+                "dev",
+                expected_tap.as_str(),
+                "root",
+                "tbf",
+                "rate",
+                "75mbit",
+                "burst",
+                "32768",
+                "latency",
+                "50ms",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_fails_clearly_for_an_unrecognized_handle() {
+        let (engine, _transport, _tap_backend, runner) = engine_with_networking_fakes();
+
+        let result = engine.rate_limit("/no/such/vm.sock", 50).await;
+
+        assert!(result.is_err());
+        assert!(
+            runner.invocations.lock().expect("lock").is_empty(),
+            "tc must never be invoked for a handle this engine never created"
+        );
     }
 
     // --- UnixSocketTransport tests, against a real Unix-domain-socket
