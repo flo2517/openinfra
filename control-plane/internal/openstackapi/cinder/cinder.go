@@ -99,10 +99,20 @@ type Volume struct {
 // read-then-write, which is exactly the race issue #26's own
 // double-attachment acceptance criterion calls out.
 type Repository interface {
-	// CreateVolume inserts a new 'available' row, minting VolumeID
-	// server-side (a caller-supplied id is never trusted, the same
-	// internal/openstackapi/glance.CreateImage precedent).
+	// CreateVolume checks the project's storage_gb quota and inserts a
+	// new 'available' row atomically (see PostgresRepository.CreateVolume's
+	// doc comment for how), minting VolumeID server-side (a caller-supplied
+	// id is never trusted, the same internal/openstackapi/glance.CreateImage
+	// precedent). Returns an error satisfying
+	// errors.Is(err, projects.ErrQuotaExceeded) (via projects.
+	// NewQuotaExceededError) if the requested size would exceed the
+	// project's configured quota.
 	CreateVolume(ctx context.Context, volume Volume) (Volume, error)
+	// ListAttachedForWorkload returns every live, 'in-use' volume
+	// currently attached to workloadID -- see
+	// PostgresRepository.ListAttachedForWorkload's doc comment for
+	// exactly who calls this and why.
+	ListAttachedForWorkload(ctx context.Context, workloadID string) ([]Volume, error)
 	// GetVolume returns ErrNotFound unless volumeID names a live row
 	// owned by projectID.
 	GetVolume(ctx context.Context, volumeID, projectID string) (Volume, error)
@@ -187,17 +197,22 @@ type Server struct {
 	repository Repository
 	workloads  WorkloadLookup
 	dispatcher VolumeDispatcher
-	projects   projects.Repository
 	audit      AuditRecorder
 }
 
 // New builds a cinder Server. dispatcher and audit may both be nil (see
-// their own doc comments for what nil means for each).
-func New(users Users, repository Repository, workloads WorkloadLookup, dispatcher VolumeDispatcher, projectsRepo projects.Repository, audit AuditRecorder) *Server {
+// their own doc comments for what nil means for each). repository's
+// quota check against internal/projects (ADR-034 §4) is now
+// repository's own concern -- see PostgresRepository.CreateVolume's doc
+// comment for why it moved there from this package's HTTP handler --
+// so, unlike before, New itself takes no projects.Repository parameter;
+// a caller building a *PostgresRepository passes one to
+// NewPostgresRepository instead.
+func New(users Users, repository Repository, workloads WorkloadLookup, dispatcher VolumeDispatcher, audit AuditRecorder) *Server {
 	if audit == nil {
 		audit = func(context.Context, string, string, string, string, string) {}
 	}
-	return &Server{users: users, repository: repository, workloads: workloads, dispatcher: dispatcher, projects: projectsRepo, audit: audit}
+	return &Server{users: users, repository: repository, workloads: workloads, dispatcher: dispatcher, audit: audit}
 }
 
 // Register adds this package's routes to mux. Every route carries a real
@@ -244,11 +259,15 @@ type createVolumeRequest struct {
 }
 
 // createVolume is POST /v3/{project_id}/volumes: validates the request,
-// checks the project's storage_gb quota (internal/projects.CheckQuota,
-// ADR-034 §4), and inserts a new 'available' row. Nothing is created on
-// any provider host yet (ADR-034 §2) -- a volume with no attachment
-// costs no provider disk space, matching real Cinder's own
-// create-then-attach-later flow.
+// then inserts a new 'available' row via s.repository.CreateVolume,
+// which atomically checks the project's storage_gb quota
+// (internal/projects, ADR-034 §4) as part of the same insert -- see its
+// own doc comment for why the check moved out of this handler and into
+// the repository (issue #26 security review: the previous separate,
+// unlocked CheckQuota-then-insert let concurrent callers overrun the
+// quota). Nothing is created on any provider host yet (ADR-034 §2) -- a
+// volume with no attachment costs no provider disk space, matching real
+// Cinder's own create-then-attach-later flow.
 func (s *Server) createVolume(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -273,24 +292,18 @@ func (s *Server) createVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := projects.CheckQuota(ctx, s.projects, projectID, projects.Usage{StorageGB: body.Volume.Size}); err != nil {
-		if errors.Is(err, projects.ErrQuotaExceeded) {
-			dimension, requested, limit, _ := projects.QuotaErrorDetail(err)
-			s.audit(ctx, identity.UserID, "openstack.volume.create", "volume", "", "denied")
-			writeCinderError(w, http.StatusForbidden, "forbidden", quotaExceededMessage(dimension, requested, limit))
-			return
-		}
-		slog.Error("cinder: quota check failed", "project_id", projectID, "error", err)
-		writeCinderError(w, http.StatusServiceUnavailable, "volumeFault", "quota check unavailable")
-		return
-	}
-
 	volume, err := s.repository.CreateVolume(ctx, Volume{
 		ProjectID: projectID,
 		Name:      name,
 		SizeGB:    body.Volume.Size,
 		State:     StateAvailable,
 	})
+	if errors.Is(err, projects.ErrQuotaExceeded) {
+		dimension, requested, limit, _ := projects.QuotaErrorDetail(err)
+		s.audit(ctx, identity.UserID, "openstack.volume.create", "volume", "", "denied")
+		writeCinderError(w, http.StatusForbidden, "forbidden", quotaExceededMessage(dimension, requested, limit))
+		return
+	}
 	if err != nil {
 		slog.Error("cinder: volume creation failed", "error", err)
 		s.audit(ctx, identity.UserID, "openstack.volume.create", "volume", "", "error")

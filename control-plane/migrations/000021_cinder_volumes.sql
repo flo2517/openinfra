@@ -80,12 +80,23 @@ CREATE TABLE IF NOT EXISTS cinder_volumes (
 
 CREATE INDEX IF NOT EXISTS cinder_volumes_project_idx ON cinder_volumes (project_id) WHERE deleted_at IS NULL;
 
--- Speeds the Control Plane's own orphaned-volume reconciliation query
--- (ADR-034 §3 / issue #26's "failure reconciliation prevents … orphaned
--- resources" criterion): "every volume this provider currently holds
--- in-use" is the exact set a heartbeat-silent provider's reconciliation
--- pass needs to read, mirroring how internal/orchestrator's own
--- workload-reconciliation queries are indexed by provider+state.
+-- Indexed for "every volume this provider currently holds in-use", the
+-- exact set a heartbeat-silent provider's reconciliation pass would need
+-- to read, mirroring how internal/orchestrator's own workload
+-- reconciliation queries are indexed by provider+state.
+--
+-- KNOWN GAP (found in the issue #26 security review that also produced
+-- the CreateVolume atomic-quota-check and DeployRequest.volumes-wiring
+-- fixes landed alongside this comment change): no such reconciliation
+-- pass actually exists yet, despite this comment previously claiming one
+-- did. A volume permanently bound (ADR-034 §1: first-attach binding is
+-- for the volume's whole life) to a provider that goes permanently
+-- unreachable can today never be reattached or securely deleted (ADR-034
+-- §6 delete requires reaching the bound provider) -- it sits 'in-use'
+-- forever, consuming the project's storage_gb quota with no admin path
+-- to release it. This index is real and ready for that reconciliation
+-- pass whenever it's built; until then, treat the gap above as
+-- documented, not silently mitigated by this index existing.
 CREATE INDEX IF NOT EXISTS cinder_volumes_provider_state_idx ON cinder_volumes (provider_id, state) WHERE deleted_at IS NULL;
 
 -- At most one live (non-deleted) row may claim a given attached_workload_id

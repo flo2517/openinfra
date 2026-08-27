@@ -7,9 +7,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/openinfra/network/internal/projects"
 )
 
-type PostgresRepository struct{ pool *pgxpool.Pool }
+type PostgresRepository struct {
+	pool *pgxpool.Pool
+}
 
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
@@ -31,15 +34,83 @@ func scanVolume(row pgx.Row) (Volume, error) {
 	return v, nil
 }
 
+// CreateVolume atomically checks the project's storage_gb quota and
+// inserts a new 'available' row, in one Postgres transaction that holds
+// a FOR UPDATE lock on the project's project_quotas row for the whole
+// check-then-insert sequence -- the same "the query itself is the check"
+// discipline the Repository interface's own doc comment already
+// requires of every other state-changing method here (AttachVolume/
+// DetachVolume/BeginDelete). Before this fix, the createVolume HTTP
+// handler called internal/projects.CheckQuota and this method as two
+// independent, unlocked statements -- a security review's own
+// adversarial test (20 concurrent 5GB creates against a 10GB quota) got
+// 11-12 successes (55-60GB committed) every run, reproducible every
+// time, not a one-off (issue #26 security review).
+//
+// The FOR UPDATE lock serializes every concurrent CreateVolume call for
+// the same project: whichever transaction acquires the lock first reads
+// committed usage, decides, and inserts (or not) before releasing it via
+// commit/rollback; every other concurrent caller for that project blocks
+// on the same SELECT until then, so no two callers can ever both observe
+// the same "current usage" and independently decide there is room.
+//
+// The committed-usage read below deliberately reproduces
+// internal/projects.PostgresRepository.CommittedUsage's exact query
+// (referencing the same exported projects.OpenWorkloadStates, rather
+// than a second hand-copied list) instead of calling that method: doing
+// so would need a second connection from the pool alongside the one this
+// transaction's FOR UPDATE already holds -- fine in isolation, but under
+// a small connection pool with many concurrent callers for the same
+// project, every holder could simultaneously be blocked waiting for that
+// second connection while itself holding the only connections available
+// to hand out, a real deadlock. Reading on this transaction's own
+// connection instead needs nothing beyond what CreateVolume already
+// holds.
+//
+// A project with no project_quotas row is unbounded (mirrors
+// internal/projects.CheckQuota's own "no row = no ceiling" contract) and
+// skips the lock entirely -- there is no invariant to protect, so there
+// is nothing to serialize against.
 func (r *PostgresRepository) CreateVolume(ctx context.Context, volume Volume) (Volume, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return Volume{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var maxStorageGB int64
+	err = tx.QueryRow(ctx, `SELECT max_storage_gb FROM project_quotas WHERE project_id = $1 FOR UPDATE`, volume.ProjectID).Scan(&maxStorageGB)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Unbounded: no quota row for this project, nothing to check.
+	case err != nil:
+		return Volume{}, err
+	default:
+		var committedStorageGB int64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(w.reserved_storage_gb), 0)
+				+ (SELECT COALESCE(SUM(size_gb), 0) FROM cinder_volumes WHERE project_id = $1 AND deleted_at IS NULL)
+			FROM workloads w
+			WHERE w.project_id = $1 AND w.state = ANY($2)`,
+			volume.ProjectID, projects.OpenWorkloadStates,
+		).Scan(&committedStorageGB); err != nil {
+			return Volume{}, err
+		}
+		if projected := committedStorageGB + volume.SizeGB; projected > maxStorageGB {
+			return Volume{}, projects.NewQuotaExceededError("storage_gb", projected, maxStorageGB)
+		}
+	}
+
 	volume.VolumeID = uuid.NewString()
-	err := r.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO cinder_volumes (volume_id, project_id, name, size_gb, state)
 		VALUES ($1,$2,$3,$4,$5)
 		RETURNING created_at`,
 		volume.VolumeID, volume.ProjectID, volume.Name, volume.SizeGB, StateAvailable,
-	).Scan(&volume.CreatedAt)
-	if err != nil {
+	).Scan(&volume.CreatedAt); err != nil {
+		return Volume{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Volume{}, err
 	}
 	volume.State = StateAvailable
@@ -166,6 +237,32 @@ func (r *PostgresRepository) FinishDelete(ctx context.Context, volumeID string) 
 		return ErrNotFound
 	}
 	return nil
+}
+
+// ListAttachedForWorkload returns every live, currently 'in-use' volume
+// attached to workloadID -- irrespective of project, since a workload
+// already belongs to exactly one project and attached_workload_id is
+// unique across live rows (cinder_volumes_attached_workload_idx,
+// migration 000021). control-plane/internal/orchestrator's deploy
+// dispatch calls this at DEPLOYING time to populate DeployRequest.volumes
+// (agent.proto's VolumeAttachment, ADR-034 §7) -- see that field's own
+// doc comment for exactly which call site this is.
+func (r *PostgresRepository) ListAttachedForWorkload(ctx context.Context, workloadID string) ([]Volume, error) {
+	rows, err := r.pool.Query(ctx, selectVolume+` WHERE attached_workload_id = $1 AND deleted_at IS NULL AND state = 'in-use'`, workloadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	volumes := make([]Volume, 0)
+	for rows.Next() {
+		volume, err := scanVolume(rows)
+		if err != nil {
+			return nil, err
+		}
+		volumes = append(volumes, volume)
+	}
+	return volumes, rows.Err()
 }
 
 func (r *PostgresRepository) AbortDelete(ctx context.Context, volumeID string) error {

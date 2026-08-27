@@ -217,3 +217,18 @@ func QuotaErrorDetail(err error) (dimension string, requested, limit int64, ok b
 	}
 	return qe.dimension, qe.requested, qe.limit, true
 }
+
+// NewQuotaExceededError builds the identical *quotaError CheckQuota
+// itself returns (same errors.Is(err, ErrQuotaExceeded) and
+// QuotaErrorDetail behavior), for a caller that must reproduce
+// CheckQuota's per-dimension check atomically with its own write instead
+// of calling CheckQuota as a separate, unlocked step beforehand --
+// exactly the fix internal/openstackapi/cinder.PostgresRepository.
+// CreateVolume makes (issue #26 security review: an unlocked
+// CheckQuota-then-insert let 20 concurrent 5GB volume creates against a
+// 10GB quota commit 55-60GB). Exported so that fix (and any future one
+// needing the same shape) doesn't have to hand-roll a second error type
+// that could drift from CheckQuota's own.
+func NewQuotaExceededError(dimension string, requested, limit int64) error {
+	return quotaExceededf(dimension, requested, limit)
+}
