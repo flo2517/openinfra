@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/openstackapi/cinder"
 	"github.com/openinfra/network/internal/scheduler"
 	"github.com/openinfra/network/internal/workloadapi"
 	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
@@ -64,6 +65,26 @@ type DeploymentReconciler interface {
 	GetRunningWorkload(context.Context, agentmanager.RegisteredProvider, string) (bool, error)
 }
 
+// VolumeAttachments is the subset of internal/openstackapi/cinder's
+// Repository this package needs: which Cinder volumes are currently
+// attached to a given workload, read at DEPLOYING dispatch time so
+// DeployRequest.volumes (agent.proto's VolumeAttachment, ADR-034 §7) is
+// actually populated -- see that field's own doc comment, which
+// describes exactly this call site. Before this fix (issue #26 security
+// review), no code called it at all: attach reported 200 OK and the
+// volume's row flipped to 'in-use', but nothing was ever mounted into
+// any container on any real deploy, making agent-executor's fully
+// implemented, unit-tested mount logic dead code in production.
+//
+// Optional, set via SetVolumeAttachments: a nil value (the zero
+// *Worker's default, and every existing test/deployment that predates
+// this field) degrades DEPLOYING dispatch to "no volumes" exactly as
+// before this fix -- never a hard failure, since a workload with no
+// attached volumes must still deploy normally.
+type VolumeAttachments interface {
+	ListAttachedForWorkload(ctx context.Context, workloadID string) ([]cinder.Volume, error)
+}
+
 // OverlayManager is invoked only after the chain lease has been finalized and
 // the Agent has confirmed the workload container. Implementations must make
 // Attach/Revoke idempotent and must not persist private key material.
@@ -80,6 +101,7 @@ type Worker struct {
 	overlay             OverlayManager
 	ranker              *scheduler.Ranker
 	reputation          ReputationSource
+	volumes             VolumeAttachments
 	interval, blockTime time.Duration
 	workerID            string
 	claimDuration       time.Duration
@@ -168,6 +190,12 @@ func (w *Worker) SetOverlay(overlay OverlayManager) {
 // SetReputationSource enables real on-chain reputation-aware ranking. See
 // ReputationSource's doc comment for the degraded-mode behavior when unset.
 func (w *Worker) SetReputationSource(reputation ReputationSource) { w.reputation = reputation }
+
+// SetVolumeAttachments enables populating DeployRequest.volumes at
+// DEPLOYING dispatch time from cinder_volumes rows currently attached to
+// the workload being deployed. See VolumeAttachments' own doc comment
+// for the degraded-mode behavior when left unset.
+func (w *Worker) SetVolumeAttachments(volumes VolumeAttachments) { w.volumes = volumes }
 func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -283,6 +311,28 @@ func (w *Worker) processOne(ctx context.Context) error {
 			request.Runtime = agentv1.Runtime_RUNTIME_VM
 			request.Image = ""
 			request.Vm = &agentv1.VmSpec{VmImageUrl: item.Image, VmImageSha256: item.VmImageSha256}
+		}
+		// ADR-034 §7 / issue #26 security review: populate
+		// DeployRequest.volumes from whatever Cinder volumes are
+		// currently attached to this workload. Meaningful only for a
+		// RUNTIME_CONTAINER workload (agent-executor's vm::VmExecutor
+		// ignores this field entirely, matching Runtime/VmSpec's own
+		// "ignored for a VM-flavored request" precedent above) but
+		// populated unconditionally here anyway -- simpler than
+		// branching on runtime, and harmless for a VM request since
+		// the Agent-side VM path never reads it.
+		if w.volumes != nil {
+			attached, err := w.volumes.ListAttachedForWorkload(ctx, item.WorkloadID)
+			if err != nil {
+				return w.retry(ctx, item, "VOLUME_LOOKUP_FAILED", err)
+			}
+			for _, volume := range attached {
+				request.Volumes = append(request.Volumes, &agentv1.VolumeAttachment{
+					VolumeId:  volume.VolumeID,
+					MountPath: derefOrEmpty(volume.MountPath),
+					ReadOnly:  volume.ReadOnly,
+				})
+			}
 		}
 		deployCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
 		defer cancel()
@@ -612,6 +662,19 @@ func workloadEgressMbps(definition *sharedv1.WorkloadDefinition) int32 {
 		return 0
 	}
 	return definition.Requirements.Bandwidth.EgressMbps
+}
+
+// derefOrEmpty reads a possibly-nil string pointer -- cinder.Volume.
+// MountPath is nil whenever a volume is not attached, but
+// VolumeAttachments.ListAttachedForWorkload only ever returns rows that
+// are 'in-use' (see its own doc comment), which the cinder_volumes
+// migration's own CHECK constraint guarantees always have a non-nil
+// mount_path -- this is defensive, not a real expected-nil case.
+func derefOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func decodeDefinition(encoded []byte) (*sharedv1.WorkloadDefinition, error) {

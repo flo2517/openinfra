@@ -21,6 +21,7 @@ import (
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/dashboard"
 	"github.com/openinfra/network/internal/openstackapi"
+	"github.com/openinfra/network/internal/openstackapi/cinder"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/pki"
 	"github.com/openinfra/network/internal/projects"
@@ -233,6 +234,12 @@ func run() error {
 	ranker := scheduler.NewRanker(scheduler.DefaultMaxReputationScore, scheduler.DefaultDefaultReputationScore)
 	worker := orchestrator.NewWorker(workloadRepository, directory, registrar, agentClient, ranker)
 	worker.SetReputationSource(chainClient)
+	// ADR-034 §7 / issue #26 security review: without this, DEPLOYING
+	// dispatch never populated DeployRequest.volumes at all -- a tenant
+	// could attach a volume and get 200 OK, but nothing was ever mounted
+	// into any container on any real deploy (see Worker.SetVolumeAttachments'
+	// and VolumeAttachments' own doc comments).
+	worker.SetVolumeAttachments(cinder.NewPostgresRepository(pool))
 	if interfaceName := os.Getenv("WIREGUARD_INTERFACE"); interfaceName != "" {
 		firstPort := envIntOrDefault("WIREGUARD_FIRST_PORT", 51820)
 		lastPort := envIntOrDefault("WIREGUARD_LAST_PORT", 51999)

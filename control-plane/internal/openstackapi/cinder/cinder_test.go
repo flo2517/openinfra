@@ -98,7 +98,7 @@ func newTestServer(t *testing.T) (context.Context, testServer) {
 	projectsRepo := projects.NewPostgresRepository(pool)
 	workloadRepo := workloadapi.NewPostgresRepository(pool)
 	dispatcher := &fakeDispatcher{}
-	server := cinder.New(users, cinder.NewPostgresRepository(pool), workloadRepo, dispatcher, projectsRepo, nil)
+	server := cinder.New(users, cinder.NewPostgresRepository(pool), workloadRepo, dispatcher, nil)
 	mux := http.NewServeMux()
 	server.Register(mux)
 	return ctx, testServer{handler: mux, pool: pool, users: users, projects: projectsRepo, workloadRepo: workloadRepo, dispatcher: dispatcher}
@@ -309,6 +309,61 @@ func TestCreateVolumeEnforcesProjectQuota(t *testing.T) {
 	_, message := decodeFault(t, over.Body.Bytes())
 	if !strings.Contains(message, "storage_gb") {
 		t.Fatalf("fault message = %q, want it to name storage_gb", message)
+	}
+}
+
+// TestCreateVolumeQuotaCheckIsAtomicUnderConcurrency is the issue #26
+// security review's own adversarial reproduction, turned into a
+// regression test: N concurrent 5GB creates against a 10GB quota (room
+// for exactly 2) must never let more than 2 succeed. Before the fix in
+// PostgresRepository.CreateVolume (an unlocked internal/projects.
+// CheckQuota call, then a separate insert), this test reliably got 11-12
+// successes out of 20 -- 55-60GB committed against a 10GB limit, every
+// run. See CreateVolume's own doc comment for the FOR UPDATE lock that
+// now serializes concurrent callers for the same project.
+func TestCreateVolumeQuotaCheckIsAtomicUnderConcurrency(t *testing.T) {
+	ctx, s := newTestServer(t)
+	actor := newProjectActor(t, ctx, s, "alpha")
+	if err := s.projects.SetQuota(ctx, projects.Quota{ProjectID: actor.projectID, MaxCPUMillicores: 1000, MaxRAMMB: 1000, MaxStorageGB: 10, MaxWorkloads: 1000}); err != nil {
+		t.Fatal(err)
+	}
+
+	const concurrency = 20
+	const volumeSizeGB = 5
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	successes := 0
+	statuses := make(map[int]int)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			recorder := doRequest(t, s, http.MethodPost, "/v3/"+actor.projectID+"/volumes", actor.token,
+				createVolumeBody(fmt.Sprintf("vol-%d", i), volumeSizeGB))
+			mu.Lock()
+			defer mu.Unlock()
+			statuses[recorder.Code]++
+			if recorder.Code == http.StatusAccepted {
+				successes++
+			} else if recorder.Code != http.StatusForbidden {
+				t.Errorf("unexpected status %d for concurrent create; body=%s", recorder.Code, recorder.Body.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	const maxAllowedSuccesses = 2 // floor(10GB quota / 5GB per volume)
+	if successes > maxAllowedSuccesses {
+		t.Fatalf("quota race: %d/%d concurrent creates succeeded (statuses=%v), want at most %d -- committed storage would be %dGB against a 10GB quota",
+			successes, concurrency, statuses, maxAllowedSuccesses, successes*volumeSizeGB)
+	}
+
+	committed, err := s.projects.CommittedUsage(ctx, actor.projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.StorageGB > 10 {
+		t.Fatalf("committed storage_gb = %d, want <= 10 (quota)", committed.StorageGB)
 	}
 }
 
@@ -570,7 +625,7 @@ func TestDeleteVolumeFailsClosedWithNoDispatcherConfigured(t *testing.T) {
 	doRequest(t, s, http.MethodPost, "/v3/"+actor.projectID+"/volumes/"+volumeID+"/action", actor.token, detachActionBody())
 
 	users := userauth.NewPostgresRepository(s.pool)
-	noDispatcherServer := cinder.New(users, cinder.NewPostgresRepository(s.pool), s.workloadRepo, nil, s.projects, nil)
+	noDispatcherServer := cinder.New(users, cinder.NewPostgresRepository(s.pool), s.workloadRepo, nil, nil)
 	mux := http.NewServeMux()
 	noDispatcherServer.Register(mux)
 

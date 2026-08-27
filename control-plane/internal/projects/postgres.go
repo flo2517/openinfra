@@ -10,12 +10,23 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// openWorkloadStates mirrors internal/workloadapi's own "open,
+// OpenWorkloadStates mirrors internal/workloadapi's own "open,
 // provider-assigned" state list (see migration 000008's covering index)
 // -- a workload that has left this set (COMPLETED/FAILED, or never
 // scheduled at all) no longer holds a claim against its project's quota,
 // the same way it no longer holds one against its provider's capacity.
-var openWorkloadStates = []string{"LEASE_PENDING", "LEASED", "DEPLOYING", "RUNNING"}
+//
+// Exported (not just used internally by CommittedUsage below) so a
+// caller that must reproduce this exact scoping inside its own
+// transaction -- e.g. internal/openstackapi/cinder.PostgresRepository.
+// CreateVolume, which cannot call CommittedUsage directly without a
+// second pool connection alongside the one already held by its FOR
+// UPDATE transaction (a real deadlock risk under a small connection
+// pool: the transaction's own connection is busy holding the lock, and
+// CommittedUsage would need to acquire another one just to read through
+// it) -- uses the exact same list, not a second, hand-copied one that
+// could silently drift.
+var OpenWorkloadStates = []string{"LEASE_PENDING", "LEASED", "DEPLOYING", "RUNNING"}
 
 type PostgresRepository struct{ pool *pgxpool.Pool }
 
@@ -147,7 +158,7 @@ func (r *PostgresRepository) GetQuota(ctx context.Context, projectID string) (Qu
 // whether or not it is currently attached to any workload (ADR-034 §2:
 // an `available` volume still occupies real provider disk once created),
 // so this is not scoped by attachment state the way the workload sum
-// above is scoped by openWorkloadStates.
+// above is scoped by OpenWorkloadStates.
 func (r *PostgresRepository) CommittedUsage(ctx context.Context, projectID string) (Usage, error) {
 	var usage Usage
 	var workloadCount int64
@@ -160,7 +171,7 @@ func (r *PostgresRepository) CommittedUsage(ctx context.Context, projectID strin
 			COUNT(*)
 		FROM workloads w
 		WHERE w.project_id = $1 AND w.state = ANY($2)`,
-		projectID, openWorkloadStates).
+		projectID, OpenWorkloadStates).
 		Scan(&usage.CPUMillicores, &usage.RAMMB, &usage.StorageGB, &workloadCount)
 	if err != nil {
 		return Usage{}, err
