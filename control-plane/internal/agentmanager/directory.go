@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
@@ -27,6 +28,22 @@ type RegisteredProvider struct {
 type ProviderRegistry interface {
 	ListActive(context.Context) ([]RegisteredProvider, error)
 }
+
+// ProviderLookup resolves a single provider_id to its RegisteredProvider
+// -- narrower than ProviderRegistry.ListActive, and deliberately not
+// filtered to ACTIVE-only status the way ListActive is: Cinder's
+// delete-volume dispatch (ADR-034 §6, internal/openstackapi/cinder's
+// VolumeDispatcher) already knows exactly which provider it needs to
+// reach, and a provider that has gone quiet (not currently ACTIVE) is
+// still the right one to attempt to reach for a pending deletion, not a
+// reason to treat the provider as unknown.
+type ProviderLookup interface {
+	GetProvider(ctx context.Context, providerID string) (RegisteredProvider, error)
+}
+
+// ErrProviderNotFound is ProviderLookup.GetProvider's failure for an
+// unknown provider_id.
+var ErrProviderNotFound = errors.New("provider not found")
 
 type LivenessStore interface {
 	HeartbeatPayload(context.Context, string) ([]byte, error)
@@ -89,6 +106,21 @@ func (d *Directory) ListSchedulableProviders(ctx context.Context) ([]Schedulable
 type PostgresRegistry struct{ pool *pgxpool.Pool }
 
 func NewPostgresRegistry(pool *pgxpool.Pool) *PostgresRegistry { return &PostgresRegistry{pool: pool} }
+
+// GetProvider implements ProviderLookup, unfiltered by status (see that
+// interface's doc comment for why).
+func (r *PostgresRegistry) GetProvider(ctx context.Context, providerID string) (RegisteredProvider, error) {
+	var provider RegisteredProvider
+	err := r.pool.QueryRow(ctx, `SELECT provider_id, public_key, protocol_version, agent_version, COALESCE(agent_endpoint, '') FROM providers WHERE provider_id = $1`, providerID).
+		Scan(&provider.ProviderID, &provider.PublicKey, &provider.ProtocolVersion, &provider.AgentVersion, &provider.AgentEndpoint)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RegisteredProvider{}, ErrProviderNotFound
+	}
+	if err != nil {
+		return RegisteredProvider{}, err
+	}
+	return provider, nil
+}
 
 func (r *PostgresRegistry) ListActive(ctx context.Context) ([]RegisteredProvider, error) {
 	rows, err := r.pool.Query(ctx, `SELECT provider_id, public_key, protocol_version, agent_version, COALESCE(agent_endpoint, '') FROM providers WHERE status = $1 ORDER BY provider_id`, int16(sharedv1.NodeStatus_NODE_STATUS_ACTIVE))

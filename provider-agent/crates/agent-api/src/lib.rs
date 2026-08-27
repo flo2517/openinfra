@@ -187,6 +187,20 @@ pub trait Executor: Send + Sync {
         now: u64,
         max_period_seconds: u64,
     ) -> anyhow::Result<UsageSample>;
+    /// ADR-034 §6/§7 / issue #171: securely deletes the Docker named
+    /// volume backing a Cinder block volume identified by `volume_id`
+    /// (the Control Plane's `cinder_volumes.volume_id`, not any
+    /// container/workload id). Idempotent: deleting a volume this Agent
+    /// never actually created is success, not an error (see
+    /// `agent.proto`'s `DeleteVolumeRequest` doc comment). Default
+    /// implementation errs unsupported, so a test double or a
+    /// VM-execution-only `Executor` is not forced to implement Cinder
+    /// support it never exercises (ADR-034 §5: VM boot disks and Cinder
+    /// volumes are deliberately separate mechanisms) -- `DockerExecutor`
+    /// overrides this for real.
+    async fn delete_volume(&self, _volume_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this executor does not support Cinder volumes")
+    }
 }
 
 pub struct AgentGrpcServer {
@@ -663,6 +677,35 @@ impl provider_agent_service_server::ProviderAgentService for AgentGrpcServer {
             signature,
             evidence_hash,
         }))
+    }
+
+    /// ADR-034 §6/§7 / issue #171: unlike deploy/stop, this does not go
+    /// through the `AgentEvent` command bus -- it is not a workload
+    /// lifecycle transition (a volume being deleted has, by construction
+    /// of the Control Plane's own `internal/openstackapi/cinder`, no
+    /// currently-running workload attached to it), so there is no
+    /// existing single-writer command-processing task this needs to
+    /// serialize against. The same direct executor-call shape
+    /// `get_usage_summary` above already uses for an identical reason
+    /// (a read/side-effecting-but-not-workload-lifecycle operation).
+    async fn delete_volume(
+        &self,
+        request: Request<DeleteVolumeRequest>,
+    ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        let req = request.into_inner();
+        if req.volume_id.is_empty() || req.volume_id.len() > MAX_CHALLENGE_ID {
+            return Err(Status::invalid_argument("volume_id is empty or too long"));
+        }
+        match self.executor.delete_volume(&req.volume_id).await {
+            Ok(()) => Ok(Response::new(DeleteVolumeResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(DeleteVolumeResponse {
+                success: false,
+                error: error.to_string(),
+            })),
+        }
     }
 
     async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {

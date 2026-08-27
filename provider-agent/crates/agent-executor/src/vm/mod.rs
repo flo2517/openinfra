@@ -257,6 +257,12 @@ impl VmExecutor {
             egress_mbps: request.egress_mbps,
             rate_limited: false,
             lease_end: Some(request.lease_end),
+            // ADR-034 §5: Cinder volumes and VM boot disks are
+            // deliberately separate mechanisms -- attaching a Cinder
+            // volume to a VM workload is out of scope (ADR-034 §8), and
+            // `DeployRequest.volumes` is ignored entirely on this path,
+            // the same way `vm` is already ignored on the Docker path.
+            volume_mounts: Vec::new(),
         })
     }
 
@@ -1209,6 +1215,7 @@ mod tests {
                 vm_image_url: "https://example.com/image.qcow2".to_string(),
                 vm_image_sha256: digest.to_string(),
             }),
+            volumes: Vec::new(),
         }
     }
 
