@@ -102,14 +102,25 @@ impl RateLimiter {
         egress_mbps: i32,
     ) -> Result<(), ExecutorError> {
         let veth = resolve_veth_name(sys_root, container_pid)?;
-        let args = tbf_args(&veth, egress_mbps);
+        self.apply_to_interface(&veth, egress_mbps)
+    }
+
+    /// The same `tc qdisc replace ... tbf` enforcement `apply` performs,
+    /// against an interface name the caller already knows directly rather
+    /// than one that needs PID-based veth resolution first. ADR-033 §5's
+    /// tap-device networking path (`vm::tap`) calls this directly: a VM's
+    /// tap device name is chosen by this Agent itself at creation time
+    /// (`vm::tap::tap_device_name`), not discovered after the fact the
+    /// way a container's veth peer is via `resolve_veth_name`.
+    pub fn apply_to_interface(&self, iface: &str, egress_mbps: i32) -> Result<(), ExecutorError> {
+        let args = tbf_args(iface, egress_mbps);
         let output = self
             .runner
             .run("tc", &args)
             .map_err(|error| ExecutorError::Engine(format!("run tc: {error}")))?;
         if !output.status.success() {
             return Err(ExecutorError::Engine(format!(
-                "tc qdisc add on {veth} failed (status {}): {}",
+                "tc qdisc add on {iface} failed (status {}): {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             )));
@@ -348,5 +359,72 @@ mod tests {
         assert!(invocations[0].1.contains(&"50mbit".to_string()));
         assert!(invocations[1].1.contains(&"veth-b".to_string()));
         assert!(invocations[1].1.contains(&"200mbit".to_string()));
+    }
+
+    // --- apply_to_interface (ADR-033 §5): the same tc invocation, against
+    // an interface name the caller already knows -- no sys_root/PID
+    // resolution fixture needed, unlike `apply`'s tests above.
+
+    #[test]
+    fn apply_to_interface_issues_the_same_tc_command_shape_apply_does() {
+        let runner = Arc::new(FakeCommandRunner::succeeding());
+        let limiter = RateLimiter::new(runner.clone());
+
+        limiter
+            .apply_to_interface("oivmabcd1234", 100)
+            .expect("apply_to_interface");
+
+        let invocations = runner.invocations.lock().expect("invocations lock");
+        assert_eq!(invocations.len(), 1);
+        let (program, args) = &invocations[0];
+        assert_eq!(program, "tc");
+        assert_eq!(
+            args,
+            &[
+                "qdisc",
+                "replace",
+                "dev",
+                "oivmabcd1234",
+                "root",
+                "tbf",
+                "rate",
+                "100mbit",
+                "burst",
+                "32768",
+                "latency",
+                "50ms",
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_to_interface_never_attempts_any_pid_based_resolution() {
+        // No sys_root fixture exists anywhere for this call -- if
+        // apply_to_interface tried to resolve a veth via a PID the way
+        // `apply` does, this would fail before tc is ever invoked.
+        let runner = Arc::new(FakeCommandRunner::succeeding());
+        let limiter = RateLimiter::new(runner.clone());
+
+        limiter
+            .apply_to_interface("oivmdeadbeef", 7)
+            .expect("apply_to_interface must not need any veth/PID resolution");
+
+        let invocations = runner.invocations.lock().expect("invocations lock");
+        assert_eq!(invocations.len(), 1);
+        assert!(invocations[0].1.contains(&"oivmdeadbeef".to_string()));
+    }
+
+    #[test]
+    fn apply_to_interface_surfaces_a_nonzero_tc_exit_as_an_error() {
+        let runner = Arc::new(FakeCommandRunner::failing(
+            2,
+            "RTNETLINK answers: Permission denied",
+        ));
+        let limiter = RateLimiter::new(runner);
+
+        let result = limiter.apply_to_interface("oivmabcd1234", 100);
+
+        let error = result.expect_err("nonzero tc exit must surface as an error");
+        assert!(error.to_string().contains("Permission denied"));
     }
 }

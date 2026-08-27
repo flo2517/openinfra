@@ -175,6 +175,18 @@ func run() error {
 	// validation/hashing/persistence path a `workloadctl submit` gRPC
 	// call would.
 	workloadService := workloadapi.NewService(workloadRepository)
+	// ADR-033 §7: the operator-configured, narrow guest-image allowlist a
+	// VM workload's image URL must match -- comma-separated host/path
+	// prefixes (e.g. "https://cloud-images.ubuntu.com/,https://cloud.debian.org/images/cloud/"),
+	// matching this file's existing envOrDefault convention for
+	// operator tunables. Deliberately defaults to empty, not a built-in
+	// guess at "known-good" URLs this repository cannot actually vet on
+	// an operator's behalf -- an empty/unset allowlist means every VM
+	// workload submission is rejected (see Service.vmImageAllowlist's own
+	// doc comment), the same fail-closed default agent-core's
+	// `max_vm_workloads`/`vm_enabled` already use on the Agent side of
+	// this same ADR.
+	workloadService.SetVMImageAllowlist(splitNonEmpty(envOrDefault("VM_IMAGE_ALLOWLIST", "")))
 	providerRepository := providerjoin.NewPostgresRepository(pool)
 	service := providerjoin.NewService(providerRepository, providerjoin.NewRedisHeartbeatStore(redisClient), registrar)
 	service.SetWorkloadService(workloadService)
@@ -456,6 +468,28 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// splitNonEmpty splits a comma-separated operator-supplied list (e.g.
+// VM_IMAGE_ALLOWLIST), trims whitespace around each entry, and drops empty
+// entries (a leading/trailing/doubled comma must not silently become an
+// empty-string allowlist entry that then matches nothing forever, nor -- if
+// a caller ever treated empty specially -- something unintended). An empty
+// or unset input yields an empty (fail-closed) slice, not a slice
+// containing one empty string.
+func splitNonEmpty(csv string) []string {
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }
 
 func envIntOrDefault(name string, fallback int) int {

@@ -142,11 +142,33 @@ type Repository interface {
 type Service struct {
 	repository Repository
 	now        func() time.Time
+	// vmImageAllowlist is ADR-033 §7's operator-configured "narrow,
+	// curated guest-image allowlist for the first slice": a VM
+	// workload's image URL (already required to be https:// -- see
+	// validateSubmission) must have one of these entries as a literal
+	// prefix, or submission is rejected. Deliberately fails closed, not
+	// open, when unset or empty: unlike a genuinely optional dependency
+	// (there is none of that shape on this Service today), an empty
+	// allowlist here must reject every VM workload rather than silently
+	// accept an unvetted image -- matching agent-core's own
+	// `max_vm_workloads` "0 means disabled, not unlimited" precedent
+	// (ADR-033 §7) on the Agent side of this same ADR. Set via
+	// SetVMImageAllowlist; cmd/controlplane/main.go populates it from an
+	// operator-configured environment variable, matching this codebase's
+	// existing envOrDefault convention for operator tunables.
+	vmImageAllowlist []string
 }
 
 func NewService(repository Repository) *Service {
 	return &Service{repository: repository, now: time.Now}
 }
+
+// SetVMImageAllowlist installs the operator-configured VM guest-image
+// allowlist (ADR-033 §7). See the vmImageAllowlist field's doc comment for
+// the fail-closed behavior when this is never called, or called with an
+// empty slice: every VM workload submission is rejected either way, never
+// silently accepted.
+func (s *Service) SetVMImageAllowlist(prefixes []string) { s.vmImageAllowlist = prefixes }
 
 func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.SubmitWorkloadRequest) (*controlplanev1.SubmitWorkloadResponse, error) {
 	ownerID, err := requireOwner(ctx)
@@ -160,7 +182,7 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 	// it unset, producing the same ProjectID-less Workload row this method
 	// has always created.
 	projectID, _ := projectIDFromContext(ctx)
-	definitionBytes, requestHash, err := validateSubmission(request)
+	definitionBytes, requestHash, err := s.validateSubmission(request)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -336,7 +358,7 @@ func projectIDFromContext(ctx context.Context) (string, bool) {
 	return projectID, ok && projectID != ""
 }
 
-func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, [32]byte, error) {
+func (s *Service) validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, [32]byte, error) {
 	if request == nil || request.Definition == nil {
 		return nil, [32]byte{}, errors.New("definition is required")
 	}
@@ -360,6 +382,17 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 		}
 		if !vmImageDigest.MatchString(request.VmImageSha256) {
 			return nil, [32]byte{}, errors.New("vm_image_sha256 must be exactly 64 lowercase hex characters")
+		}
+		// ADR-033 §7: the guest-image allowlist, checked last among the
+		// VM-specific checks so a malformed URL/digest still gets its own
+		// more specific error rather than being folded into "not
+		// allowlisted". Fails closed by construction: an empty or unset
+		// vmImageAllowlist matches nothing (see imageMatchesAllowlist),
+		// so a misconfigured or freshly-deployed Control Plane rejects
+		// every VM workload rather than accepting an arbitrary
+		// tenant-supplied image.
+		if !imageMatchesAllowlist(request.Image, s.vmImageAllowlist) {
+			return nil, [32]byte{}, errors.New("VM image is not in the operator-configured guest-image allowlist")
 		}
 	} else {
 		if !digestImage.MatchString(request.Image) {
@@ -404,6 +437,26 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))
 	return definitionBytes, result, nil
+}
+
+// imageMatchesAllowlist reports whether image has one of allowlist's
+// entries as a literal prefix -- ADR-033 §7 names "host/path prefixes",
+// not a full URL match, so a single allowlist entry like
+// "https://cloud-images.ubuntu.com/" covers every object under that
+// host/path without the operator enumerating each qcow2 file
+// individually. An empty entry is ignored rather than treated as a
+// prefix every string matches, so a stray blank element in an
+// operator-supplied list (e.g. a trailing comma) can never accidentally
+// allow every image. A nil or empty allowlist matches nothing at all,
+// which is exactly the fail-closed behavior Service.vmImageAllowlist's
+// doc comment requires -- there is no implicit wildcard here.
+func imageMatchesAllowlist(image string, allowlist []string) bool {
+	for _, prefix := range allowlist {
+		if prefix != "" && strings.HasPrefix(image, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func stateToProto(state string) controlplanev1.WorkloadState {
