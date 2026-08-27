@@ -6,6 +6,7 @@ members = [
     "pallets/lease",
     "pallets/network-validator",
     "pallets/provider-registry",
+    "pallets/provider-slashing",
     "pallets/reputation",
     "pallets/resource-market",
     "pallets/rewards",

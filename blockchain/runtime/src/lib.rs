@@ -185,6 +185,8 @@ mod runtime {
     pub type NetworkValidator = pallet_network_validator::Pallet<Runtime>;
     #[runtime::pallet_index(17)]
     pub type Escrow = pallet_escrow::Pallet<Runtime>;
+    #[runtime::pallet_index(18)]
+    pub type ProviderSlashing = pallet_provider_slashing::Pallet<Runtime>;
 }
 
 parameter_types! {
@@ -246,6 +248,38 @@ parameter_types! {
     // runtime upgrade, while hard-blocking any single set_fee_basis_points
     // call from reaching anything close to confiscatory without one.
     pub const EscrowMaxFeeBasisPoints: u16 = 2_000;
+    // ADR-036 §3/§1: same order of magnitude as MinValidatorStake -- a
+    // placeholder ratio, not a calibrated economic figure (Balance is not
+    // pegged to a real-world unit anywhere in this codebase yet).
+    pub const MinProviderStake: u64 = 1_000;
+    // ADR-036 §1: mirrors ValidatorUnbondingPeriod's own ~1 day at 6s
+    // blocks -- the same order of magnitude already accepted for the
+    // symmetric validator bond.
+    pub const ProviderUnbondingPeriod: u32 = 14_400;
+    // ADR-036 §3: 5,000 bps (50%), deliberately generous to the provider --
+    // pallet-rewards already scales rewards linearly by availability, so
+    // slashing is reserved for delivery closer to "not delivering" than
+    // "delivering poorly".
+    pub const AvailabilityBreachThresholdBps: u16 = 5_000;
+    // ADR-036 §3: 8,000 bps (80% of TargetCommitteeSize, i.e. >= 4 of 5 at
+    // today's genesis parameters) -- strictly higher than MinQuorum's 60%
+    // needed merely to close a round; a slash needs the network's
+    // strongest available attestation, not its minimum viable one.
+    pub const SlashConfidenceThresholdBps: u16 = 8_000;
+    // ADR-036 §3: strictly consecutive round numbers, mirroring MinQuorum
+    // = 3 and ADR-018 §5's own forward note that one bad round never
+    // slashes over a consecutive-rounds window.
+    pub const ProviderBreachRounds: u32 = 3;
+    // ADR-036 §3: flat, 15% of MinProviderStake -- deliberately higher
+    // than ValidatorSlashAmount's 10% of MinValidatorStake, reflecting
+    // that a confirmed availability breach harms a paying tenant directly,
+    // while staying well short of a full-bond wipeout on one incident for
+    // the same single-key-governance-risk reason ADR-018 §3 gives.
+    pub const ProviderSlashAmount: u64 = 150;
+    // ADR-036 §3: ~1 day at 6s blocks, matching ValidatorUnbondingPeriod's
+    // existing magnitude -- long enough for a provider to assemble
+    // off-chain counter-evidence for a human-reviewed appeal.
+    pub const SlashAppealWindow: u32 = 14_400;
 }
 
 #[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
@@ -288,9 +322,69 @@ impl pallet_balances::Config for Runtime {
     type AccountStore = System;
 }
 
+/// Bridges `pallet-escrow`'s per-payer open-escrow counter into
+/// `pallet-provider-registry`'s narrow `EscrowPayerInspector` trait
+/// (ADR-036 §5, mirroring `EscrowPayerInspectorBridge` below): `bond_stake`
+/// must not succeed for an account that currently has escrow funds locked
+/// as `payer`.
+pub struct ProviderRegistryEscrowInspectorBridge;
+impl pallet_provider_registry::EscrowPayerInspector<interface::AccountId>
+    for ProviderRegistryEscrowInspectorBridge
+{
+    fn has_open_escrow(payer: &interface::AccountId) -> bool {
+        pallet_escrow::PayerOpenEscrowCount::<Runtime>::get(payer) > 0
+    }
+}
+
+/// Bridges `pallet-network-validator`'s registry into
+/// `pallet-provider-registry`'s narrow `ValidatorRegistrationInspector`
+/// trait (ADR-036 §5, mirroring `EscrowValidatorInspectorBridge` below):
+/// `bond_stake` must not succeed for an account that is currently a
+/// registered Network Validator, regardless of status.
+pub struct ProviderRegistryValidatorInspectorBridge;
+impl pallet_provider_registry::ValidatorRegistrationInspector<interface::AccountId>
+    for ProviderRegistryValidatorInspectorBridge
+{
+    fn is_registered(account: &interface::AccountId) -> bool {
+        pallet_network_validator::Validators::<Runtime>::contains_key(account)
+    }
+}
+
+/// Bridges `pallet-provider-slashing`'s pending-slash storage into
+/// `pallet-provider-registry`'s narrow `ProviderSlashInspector` trait
+/// (ADR-036 §6): `request_unbond`/`withdraw_unbonded` must not succeed
+/// while a live pending slash exists for the caller, in any dimension.
+pub struct ProviderSlashInspectorBridge;
+impl pallet_provider_registry::ProviderSlashInspector<interface::AccountId>
+    for ProviderSlashInspectorBridge
+{
+    fn has_pending_slash(provider: &interface::AccountId) -> bool {
+        [
+            pallet_provider_slashing::ScoreDimension::Compute,
+            pallet_provider_slashing::ScoreDimension::Storage,
+            pallet_provider_slashing::ScoreDimension::Network,
+            pallet_provider_slashing::ScoreDimension::Availability,
+            pallet_provider_slashing::ScoreDimension::Reliability,
+        ]
+        .into_iter()
+        .any(|dimension| {
+            pallet_provider_slashing::PendingSlashes::<Runtime>::contains_key((provider, dimension))
+        })
+    }
+}
+
 impl pallet_provider_registry::Config for Runtime {
     type RegistrationOrigin = frame_system::EnsureRoot<Self::AccountId>;
     type StatusOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    // ADR-036 §1: reuses pallet_balances, the same ReservableCurrency
+    // already backing Network Validator stake and escrow `payer`
+    // reservations -- no new asset pallet.
+    type Currency = Balances;
+    type EscrowInspector = ProviderRegistryEscrowInspectorBridge;
+    type ValidatorInspector = ProviderRegistryValidatorInspectorBridge;
+    type SlashInspector = ProviderSlashInspectorBridge;
+    type MinStake = MinProviderStake;
+    type UnbondingPeriod = ProviderUnbondingPeriod;
     type WeightInfo = ();
 }
 
@@ -467,6 +561,11 @@ impl pallet_network_validator::Config for Runtime {
     // Reserve-contamination fix: register_validator must not bond stake for
     // an account with funds locked in an open escrow as payer.
     type EscrowInspector = EscrowPayerInspectorBridge;
+    // ADR-036 §5: third edge of the same guard -- register_validator must
+    // not succeed for an account with an open provider bond.
+    // ProviderRegistry implements ProviderBondInspector directly, so no
+    // separate bridge type is needed here.
+    type ProviderBondInspector = ProviderRegistry;
     type MinStake = MinValidatorStake;
     type UnbondingPeriod = ValidatorUnbondingPeriod;
     type MaxSubmissionsPerRound = MaxValidatorSubmissionsPerRound;
@@ -551,6 +650,11 @@ impl pallet_escrow::Config for Runtime {
     // Reserve-contamination fix: fund_escrow must not accept a payer who
     // is currently a registered Network Validator.
     type ValidatorInspector = EscrowValidatorInspectorBridge;
+    // ADR-036 §5: third edge of the same guard -- fund_escrow must not
+    // accept a payer with an open provider bond. ProviderRegistry
+    // implements ProviderBondInspector directly, so no separate bridge
+    // type is needed here.
+    type ProviderBondInspector = ProviderRegistry;
     // Sec4.5/Sec9: the sole remaining sudo-key surface in this pallet.
     type DisputeOrigin = frame_system::EnsureRoot<Self::AccountId>;
     // Sec10: emergency circuit breaker.
@@ -564,6 +668,102 @@ impl pallet_escrow::Config for Runtime {
     type MinEscrowAmount = MinEscrowAmount;
     type ReliabilityPenaltyBps = EscrowReliabilityPenaltyBps;
     type MaxFeeBasisPoints = EscrowMaxFeeBasisPoints;
+    type WeightInfo = ();
+}
+
+/// Bridges `pallet-network-validator`'s closed rounds into
+/// `pallet-provider-slashing`'s narrow `AvailabilityRoundOracle` trait
+/// (ADR-036 §2): the oracle can only ever return an already-committed
+/// `RoundResult`, never a raw submission. Maps that pallet's own
+/// `ScoreDimension`/`RoundStatus` onto this crate's locally-declared
+/// copies, the same "redeclared per pallet, mapped by the runtime" pattern
+/// `ScoringReputationUpdater::map_dimension` above already uses.
+pub struct AvailabilityRoundOracleBridge;
+impl AvailabilityRoundOracleBridge {
+    fn map_dimension(
+        dimension: pallet_provider_slashing::ScoreDimension,
+    ) -> pallet_network_validator::ScoreDimension {
+        use pallet_network_validator::ScoreDimension as NV;
+        use pallet_provider_slashing::ScoreDimension as PS;
+        match dimension {
+            PS::Compute => NV::Compute,
+            PS::Storage => NV::Storage,
+            PS::Network => NV::Network,
+            PS::Availability => NV::Availability,
+            PS::Reliability => NV::Reliability,
+        }
+    }
+
+    fn map_status(
+        status: pallet_network_validator::pallet::RoundStatus,
+    ) -> pallet_provider_slashing::RoundViewStatus {
+        use pallet_network_validator::pallet::RoundStatus as NV;
+        use pallet_provider_slashing::RoundViewStatus as PS;
+        match status {
+            NV::Final => PS::Final,
+            NV::Disputed => PS::Disputed,
+            NV::DisputeUpheld => PS::DisputeUpheld,
+            NV::DisputeRejected => PS::DisputeRejected,
+        }
+    }
+}
+impl
+    pallet_provider_slashing::AvailabilityRoundOracle<interface::AccountId, BlockNumberFor<Runtime>>
+    for AvailabilityRoundOracleBridge
+{
+    fn round(
+        provider: &interface::AccountId,
+        round: u64,
+        dimension: pallet_provider_slashing::ScoreDimension,
+    ) -> Option<pallet_provider_slashing::RoundView<BlockNumberFor<Runtime>>> {
+        pallet_network_validator::Rounds::<Runtime>::get((
+            provider,
+            round,
+            Self::map_dimension(dimension),
+        ))
+        .map(|result| pallet_provider_slashing::RoundView {
+            status: Self::map_status(result.status),
+            score_bps: result.score_bps,
+            submissions: result.submissions,
+            committee_target: result.committee_target,
+            closed_at: result.closed_at,
+        })
+    }
+
+    fn dispute_window() -> BlockNumberFor<Runtime> {
+        ValidatorDisputeWindow::get()
+    }
+}
+
+/// Bridges `pallet-provider-slashing::execute_slash`/`resolve_slash_appeal`
+/// into `pallet-provider-registry`'s internal, non-extrinsic `slash_bond`
+/// entry point (ADR-036 §1/§6), so `pallet-provider-registry` stays the
+/// only writer of `ProviderBonds` regardless of which pallet triggers a
+/// change -- the same pattern `ScoringReputationUpdater`/
+/// `ValidatorRewardsBridge` above already use for their own internal
+/// writer pallets.
+pub struct ProviderStakeSlasherBridge;
+impl pallet_provider_slashing::ProviderStakeSlasher<interface::AccountId, u64>
+    for ProviderStakeSlasherBridge
+{
+    fn slash(provider: &interface::AccountId, amount: u64) -> (u64, bool) {
+        pallet_provider_registry::Pallet::<Runtime>::slash_bond(provider, amount)
+    }
+}
+
+impl pallet_provider_slashing::Config for Runtime {
+    type Balance = u64;
+    type AvailabilityRoundOracle = AvailabilityRoundOracleBridge;
+    type ProviderStakeSlasher = ProviderStakeSlasherBridge;
+    // Bounded window resolution origin (ADR-036 §6): EnsureRoot for the
+    // MVP, the same reused-origin choice every dispute/suspension path in
+    // this runtime already makes.
+    type SlashAppealOrigin = frame_system::EnsureRoot<Self::AccountId>;
+    type AvailabilityBreachThresholdBps = AvailabilityBreachThresholdBps;
+    type SlashConfidenceThresholdBps = SlashConfidenceThresholdBps;
+    type BreachRounds = ProviderBreachRounds;
+    type ProviderSlashAmount = ProviderSlashAmount;
+    type SlashAppealWindow = SlashAppealWindow;
     type WeightInfo = ();
 }
 
@@ -806,6 +1006,154 @@ mod tests {
                 pallet_network_validator::Error::<Runtime>::PayerHasOpenEscrow
             );
             assert!(pallet_network_validator::Validators::<Runtime>::get(&already_payer).is_none());
+        });
+    }
+
+    /// ADR-036 §5: the third edge of the same reserve-balance contamination
+    /// guard, exercised end to end against the real runtime wiring -- a
+    /// bonded provider cannot also become a Network Validator or an escrow
+    /// payer, and neither of those two can also bond as a provider. All
+    /// three pairings are checked; every attempt leaves no partial state.
+    #[test]
+    fn bonded_provider_role_is_mutually_exclusive_with_the_other_two_roles() {
+        use frame_support::{assert_noop, assert_ok};
+        use polkadot_sdk::sp_runtime::BuildStorage;
+
+        let already_bonded = interface::AccountId::from([4_u8; 32]);
+        let already_validator = interface::AccountId::from([5_u8; 32]);
+        let already_payer = interface::AccountId::from([6_u8; 32]);
+        let provider = interface::AccountId::from([7_u8; 32]);
+
+        let mut storage = frame_system::GenesisConfig::<Runtime>::default()
+            .build_storage()
+            .unwrap();
+        pallet_balances::GenesisConfig::<Runtime> {
+            balances: vec![
+                (already_bonded.clone(), 1_000_000),
+                (already_validator.clone(), 1_000_000),
+                (already_payer.clone(), 1_000_000),
+            ],
+            ..Default::default()
+        }
+        .assimilate_storage(&mut storage)
+        .unwrap();
+        let mut ext: sp_io::TestExternalities = storage.into();
+
+        ext.execute_with(|| {
+            System::set_block_number(1);
+            let price = pallet_escrow::PriceSchedule {
+                cpu_core_second: 1,
+                ram_mb_second: 1,
+                storage_gb_second: 1,
+                network_mb: 1,
+            };
+
+            // --- Direction 1: bond first, then attempt the other two roles.
+            assert_ok!(ProviderRegistry::register_provider_for(
+                RuntimeOrigin::root(),
+                already_bonded.clone(),
+                [4_u8; 32],
+            ));
+            assert_ok!(ProviderRegistry::bond_stake(
+                RuntimeOrigin::signed(already_bonded.clone()),
+                MinProviderStake::get(),
+            ));
+            assert_noop!(
+                NetworkValidator::register_validator(
+                    RuntimeOrigin::signed(already_bonded.clone()),
+                    MinValidatorStake::get(),
+                ),
+                pallet_network_validator::Error::<Runtime>::CallerIsBondedProvider
+            );
+            assert!(
+                pallet_network_validator::Validators::<Runtime>::get(&already_bonded).is_none()
+            );
+
+            let lease_id: pallet_escrow::LeaseId = 10;
+            pallet_openinfra_lease::Leases::<Runtime>::insert(
+                lease_id,
+                pallet_openinfra_lease::Lease::<Runtime> {
+                    provider: provider.clone(),
+                    consumer: already_bonded.clone(),
+                    resource_hash: [0u8; 32],
+                    start: 0,
+                    end: 1_000,
+                    state: pallet_openinfra_lease::LeaseState::Created,
+                },
+            );
+            assert_noop!(
+                Escrow::fund_escrow(
+                    RuntimeOrigin::signed(already_bonded.clone()),
+                    lease_id,
+                    provider.clone(),
+                    MinEscrowAmount::get() + 100,
+                    price,
+                    1,
+                ),
+                pallet_escrow::Error::<Runtime>::PayerIsBondedProvider
+            );
+            assert!(pallet_escrow::Escrows::<Runtime>::get(lease_id).is_none());
+
+            // --- Direction 2: register as a Network Validator first, then
+            // attempt to bond as a provider.
+            assert_ok!(ProviderRegistry::register_provider_for(
+                RuntimeOrigin::root(),
+                already_validator.clone(),
+                [5_u8; 32],
+            ));
+            assert_ok!(NetworkValidator::register_validator(
+                RuntimeOrigin::signed(already_validator.clone()),
+                MinValidatorStake::get(),
+            ));
+            assert_noop!(
+                ProviderRegistry::bond_stake(
+                    RuntimeOrigin::signed(already_validator.clone()),
+                    MinProviderStake::get(),
+                ),
+                pallet_provider_registry::Error::<Runtime>::CallerIsRegisteredValidator
+            );
+            assert!(
+                pallet_provider_registry::ProviderBonds::<Runtime>::get(&already_validator)
+                    .is_none()
+            );
+
+            // --- Direction 3: fund an escrow as payer first, then attempt
+            // to bond as a provider while that escrow is still open.
+            assert_ok!(ProviderRegistry::register_provider_for(
+                RuntimeOrigin::root(),
+                already_payer.clone(),
+                [6_u8; 32],
+            ));
+            let other_lease_id: pallet_escrow::LeaseId = 11;
+            pallet_openinfra_lease::Leases::<Runtime>::insert(
+                other_lease_id,
+                pallet_openinfra_lease::Lease::<Runtime> {
+                    provider: provider.clone(),
+                    consumer: already_payer.clone(),
+                    resource_hash: [0u8; 32],
+                    start: 0,
+                    end: 1_000,
+                    state: pallet_openinfra_lease::LeaseState::Created,
+                },
+            );
+            assert_ok!(Escrow::fund_escrow(
+                RuntimeOrigin::signed(already_payer.clone()),
+                other_lease_id,
+                provider.clone(),
+                MinEscrowAmount::get() + 100,
+                price,
+                1,
+            ));
+            assert_noop!(
+                ProviderRegistry::bond_stake(
+                    RuntimeOrigin::signed(already_payer.clone()),
+                    MinProviderStake::get(),
+                ),
+                pallet_provider_registry::Error::<Runtime>::PayerHasOpenEscrow
+            );
+            assert!(
+                pallet_provider_registry::ProviderBonds::<Runtime>::get(&already_payer).is_none()
+            );
         });
     }
 

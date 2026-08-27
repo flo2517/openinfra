@@ -1,5 +1,5 @@
 [package]
-name = "pallet-provider-registry"
+name = "pallet-provider-slashing"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -11,10 +11,6 @@ frame-system = { version = "48.0.0", default-features = false }
 scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
-# Pinned to the exact release already resolved elsewhere in this workspace
-# (via the runtime's polkadot-sdk umbrella pull), matching
-# pallet-network-validator's and pallet-escrow's Cargo.toml.
-pallet-balances = { version = "=50.0.0" }
 sp-io = "48.0.0"
 sp-runtime = "48.0.0"
 

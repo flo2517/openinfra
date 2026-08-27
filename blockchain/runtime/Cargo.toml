@@ -14,6 +14,7 @@ pallet-network-validator = { path = "../pallets/network-validator", default-feat
 pallet-openinfra-lease = { path = "../pallets/lease", default-features = false }
 pallet-openinfra-rewards = { path = "../pallets/rewards", default-features = false }
 pallet-provider-registry = { path = "../pallets/provider-registry", default-features = false }
+pallet-provider-slashing = { path = "../pallets/provider-slashing", default-features = false }
 pallet-reputation = { path = "../pallets/reputation", default-features = false }
 pallet-resource-market = { path = "../pallets/resource-market", default-features = false }
 scale-info = { workspace = true }
@@ -33,6 +34,7 @@ std = [
     "pallet-openinfra-lease/std",
     "pallet-openinfra-rewards/std",
     "pallet-provider-registry/std",
+    "pallet-provider-slashing/std",
     "pallet-reputation/std",
     "pallet-resource-market/std",
     "scale-info/std",
