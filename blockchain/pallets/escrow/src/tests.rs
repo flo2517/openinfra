@@ -2886,6 +2886,120 @@ fn dispute_escrow_rejects_after_window_elapsed_post_degraded() {
     });
 }
 
+// A `Degraded` escrow has already released the entirety of its reserved
+// funds to the provider (capped-and-paid at degrade time, reserved balance
+// left at 0 -- see stream_settle_caps_and_degrades_when_period_exceeds_
+// remaining_cap above); disputing and then resolving it afterward must hit
+// the same escrow-scoped write-off branch a post-Completed/post-Refunded
+// dispute does (funds_still_reserved == false), never attempt a transfer
+// against the payer's *other* open escrows, and never move currency twice
+// for the same charge.
+
+#[test]
+fn resolve_dispute_after_degraded_never_double_pays() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 100) // charge 200, caps at 50, Degraded
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_050);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(50)
+        ));
+
+        assert_eq!(
+            Balances::free_balance(PROVIDER),
+            1_000_050,
+            "provider must not be paid a second time for a charge already streamed in full"
+        );
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(
+            Escrow::escrows(LEASE).unwrap().state,
+            EscrowState::Completed
+        );
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff {
+                    lease_id: LEASE,
+                    payer: PAYER,
+                    provider: PROVIDER,
+                    expected_total: 50,
+                    provider_amount: 0,
+                    payer_amount: 0,
+                    shortfall: 50,
+                })
+            )
+        });
+        assert!(
+            found,
+            "EscrowShortfallWrittenOff was not emitted for the post-Degraded dispute"
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_refund_payer_after_degraded_never_double_refunds() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 100) // charge 200, caps at 50, Degraded
+        ));
+        assert_eq!(Balances::free_balance(PAYER), 999_950);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+
+        assert_eq!(
+            Balances::free_balance(PAYER),
+            999_950,
+            "payer must not be refunded a second time for funds already streamed to the provider"
+        );
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Refunded);
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowShortfallWrittenOff {
+                    lease_id: LEASE,
+                    payer: PAYER,
+                    provider: PROVIDER,
+                    expected_total: 50,
+                    provider_amount: 0,
+                    payer_amount: 0,
+                    shortfall: 50,
+                })
+            )
+        });
+        assert!(
+            found,
+            "EscrowShortfallWrittenOff was not emitted for the post-Degraded dispute"
+        );
+    });
+}
+
 #[test]
 fn resolve_dispute_pay_provider_after_streaming_pays_only_the_incremental_amount() {
     new_test_ext().execute_with(|| {
