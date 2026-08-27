@@ -2222,3 +2222,888 @@ fn invariant_provider_amount_plus_fee_amount_equals_charged_amount_across_fee_bp
         });
     }
 }
+
+// ---------------------------------------------------------------------
+// stream_settle: happy path (issue #51 -- streaming settlement)
+// ---------------------------------------------------------------------
+
+/// Evidence that charges exactly `cpu * price().cpu_core_second` (== `cpu *
+/// 2`) over `[period_start, period_end)` -- every other usage dimension is
+/// zero, so both the charge and the period-overlap bookkeeping are trivial
+/// to predict by hand across a sequence of calls.
+fn stream_evidence(
+    lease_id: LeaseId,
+    sequence: u64,
+    period_start: u64,
+    period_end: u64,
+    cpu: u64,
+) -> MeteringSummary<u64> {
+    signed_evidence(
+        &provider_pair(),
+        lease_id,
+        sequence,
+        period_start,
+        period_end,
+        cpu,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+    )
+}
+
+#[test]
+fn stream_settle_pays_period_and_leaves_escrow_funded() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        let evidence = stream_evidence(LEASE, 1, 0, 10, 10); // charge = 20
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            evidence
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_020);
+        assert_eq!(Balances::reserved_balance(PAYER), 980);
+        let escrow = Escrow::escrows(LEASE).unwrap();
+        assert_eq!(escrow.state, EscrowState::Funded);
+        assert_eq!(escrow.cumulative_charged, 20);
+        assert_eq!(escrow.last_evidence_sequence, 1);
+        assert_eq!(escrow.last_period_end, 10);
+        assert_eq!(escrow.last_streamed_at, Some(1));
+    });
+}
+
+#[test]
+fn stream_settle_emits_escrow_streamed_event() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        let evidence = stream_evidence(LEASE, 1, 0, 10, 10);
+        let expected_hash = frame_support::Hashable::blake2_256(&evidence);
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            evidence
+        ));
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowStreamed {
+                    lease_id: LEASE,
+                    provider: PROVIDER,
+                    period_charged: 20,
+                    cumulative_charged: 20,
+                    evidence_hash,
+                }) if evidence_hash == expected_hash
+            )
+        });
+        assert!(
+            found,
+            "EscrowStreamed was not emitted with the expected fields"
+        );
+    });
+}
+
+#[test]
+fn stream_settle_accumulates_across_multiple_periods() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10) // charge 20
+        ));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 2, 10, 20, 5) // charge 10
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_030);
+        assert_eq!(Balances::reserved_balance(PAYER), 970);
+        let escrow = Escrow::escrows(LEASE).unwrap();
+        assert_eq!(escrow.state, EscrowState::Funded);
+        assert_eq!(escrow.cumulative_charged, 30);
+        assert_eq!(escrow.last_period_end, 20);
+    });
+}
+
+// ---------------------------------------------------------------------
+// stream_settle: adversarial cases
+// ---------------------------------------------------------------------
+
+#[test]
+fn stream_settle_rejects_forged_signature() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        let forged = signed_evidence(&forged_pair(), LEASE, 1, 0, 10, 10, 0, 0, 0, 0, 0, 1);
+        assert_noop!(
+            Escrow::stream_settle(RuntimeOrigin::signed(OTHER), LEASE, forged),
+            crate::Error::<Test>::InvalidSignature
+        );
+    });
+}
+
+#[test]
+fn stream_settle_rejects_sequence_replay() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 5, 0, 10, 1)
+        ));
+        // Same sequence again, later (non-overlapping) period -- still a
+        // replay because `sequence` did not strictly increase.
+        assert_noop!(
+            Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 5, 10, 20, 1)
+            ),
+            crate::Error::<Test>::EvidenceSequenceReplay
+        );
+    });
+}
+
+#[test]
+fn stream_settle_rejects_replay_of_the_exact_same_evidence_message() {
+    // Issue #51's own acceptance criterion: replay of a settlement message
+    // must be rejected outright (idempotency), not silently re-accrued.
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        let evidence = stream_evidence(LEASE, 1, 0, 10, 10);
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            evidence.clone()
+        ));
+        assert_noop!(
+            Escrow::stream_settle(RuntimeOrigin::signed(OTHER), LEASE, evidence),
+            crate::Error::<Test>::EvidenceSequenceReplay
+        );
+        // Only ever charged once.
+        assert_eq!(Escrow::escrows(LEASE).unwrap().cumulative_charged, 20);
+    });
+}
+
+#[test]
+fn stream_settle_rejects_period_overlap() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10)
+        ));
+        // period_start = 5 re-claims part of the [0, 10) window already
+        // paid for, even though the sequence number is higher -- exactly
+        // the double-accrual vector `MeteringPeriodOverlap` closes that
+        // `EvidenceSequenceReplay` alone does not.
+        assert_noop!(
+            Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 2, 5, 15, 1)
+            ),
+            crate::Error::<Test>::MeteringPeriodOverlap
+        );
+    });
+}
+
+#[test]
+fn stream_settle_accepts_a_period_starting_exactly_at_the_previous_periods_end() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10)
+        ));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 2, 10, 20, 1) // period_start == last_period_end
+        ));
+    });
+}
+
+#[test]
+fn stream_settle_rejects_lease_id_mismatch() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(fund_other_lease());
+        let evidence = stream_evidence(OTHER_LEASE, 1, 0, 10, 1);
+        assert_noop!(
+            Escrow::stream_settle(RuntimeOrigin::signed(OTHER), LEASE, evidence),
+            crate::Error::<Test>::LeaseIdMismatch
+        );
+    });
+}
+
+#[test]
+fn stream_settle_rejects_schema_version_mismatch() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        let evidence = signed_evidence(&provider_pair(), LEASE, 1, 0, 10, 10, 0, 0, 0, 0, 0, 2);
+        assert_noop!(
+            Escrow::stream_settle(RuntimeOrigin::signed(OTHER), LEASE, evidence),
+            crate::Error::<Test>::MeteringSchemaVersionMismatch
+        );
+    });
+}
+
+#[test]
+fn stream_settle_rejects_unregistered_provider() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::fund_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            OTHER, // not registered in TestProviderKeyLookup
+            1_000,
+            price(),
+            1
+        ));
+        let evidence = signed_evidence(&provider_pair(), LEASE, 1, 0, 10, 10, 0, 0, 0, 0, 0, 1);
+        assert_noop!(
+            Escrow::stream_settle(RuntimeOrigin::signed(OTHER), LEASE, evidence),
+            crate::Error::<Test>::ProviderKeyNotFound
+        );
+    });
+}
+
+#[test]
+fn stream_settle_rejects_when_paused() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::set_paused(RuntimeOrigin::root(), true));
+        assert_noop!(
+            Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 1, 0, 10, 10)
+            ),
+            crate::Error::<Test>::Paused
+        );
+    });
+}
+
+#[test]
+fn stream_settle_rejects_unsigned_origin() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_noop!(
+            Escrow::stream_settle(
+                RuntimeOrigin::none(),
+                LEASE,
+                stream_evidence(LEASE, 1, 0, 10, 10)
+            ),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn stream_settle_rejects_when_escrow_not_in_funded_state() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            normal_evidence()
+        ));
+        assert_noop!(
+            Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 2, 10, 20, 1)
+            ),
+            crate::Error::<Test>::EscrowNotFunded
+        );
+    });
+}
+
+// ---------------------------------------------------------------------
+// stream_settle: explicit degradation (under-funded tenant, issue #51)
+// ---------------------------------------------------------------------
+
+#[test]
+fn stream_settle_caps_and_degrades_when_period_exceeds_remaining_cap() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        let evidence = stream_evidence(LEASE, 1, 0, 10, 100); // charge = 200 > 50
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            evidence
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_050);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        let escrow = Escrow::escrows(LEASE).unwrap();
+        assert_eq!(escrow.state, EscrowState::Degraded);
+        assert_eq!(escrow.cumulative_charged, 50);
+        assert_eq!(escrow.settled_at, Some(1));
+    });
+}
+
+#[test]
+fn stream_settle_emits_escrow_degraded_event_with_requested_and_capped_amounts() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        let evidence = stream_evidence(LEASE, 1, 0, 10, 100); // charge = 200
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            evidence
+        ));
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowDegraded {
+                    lease_id: LEASE,
+                    provider: PROVIDER,
+                    capped_amount: 50,
+                    requested_amount: 200,
+                })
+            )
+        });
+        assert!(found, "EscrowDegraded not emitted with expected fields");
+    });
+}
+
+#[test]
+fn stream_settle_decrements_payer_open_escrow_count_when_degraded() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 1);
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 100)
+        ));
+        assert_eq!(crate::PayerOpenEscrowCount::<Test>::get(PAYER), 0);
+    });
+}
+
+#[test]
+fn stream_settle_after_degraded_rejects_further_calls() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 100) // caps at 50, Degraded
+        ));
+        assert_noop!(
+            Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 2, 10, 20, 1)
+            ),
+            crate::Error::<Test>::EscrowNotFunded
+        );
+    });
+}
+
+#[test]
+fn stream_settle_exact_cap_completes_without_degrading() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(20));
+        let evidence = stream_evidence(LEASE, 1, 0, 10, 10); // charge = 20 == max_charge
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            evidence
+        ));
+        let escrow = Escrow::escrows(LEASE).unwrap();
+        assert_eq!(escrow.state, EscrowState::Completed);
+        assert_eq!(escrow.cumulative_charged, 20);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        let found_degraded = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowDegraded { .. })
+            )
+        });
+        assert!(
+            !found_degraded,
+            "an exact-cap period must not be reported as degraded"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------
+// stream_settle: ADR-030 fee split applies per period
+// ---------------------------------------------------------------------
+
+#[test]
+fn stream_settle_applies_fee_split_to_each_period() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Escrow::set_fee_basis_points(RuntimeOrigin::root(), 1_000)); // 10%
+        assert_ok!(Escrow::set_treasury_account(
+            RuntimeOrigin::root(),
+            TREASURY
+        ));
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 100) // charge 200, fee 20, provider 180
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_180);
+        assert_eq!(Balances::free_balance(TREASURY) - 1, 20);
+        assert_eq!(Escrow::escrows(LEASE).unwrap().cumulative_charged, 200);
+    });
+}
+
+// ---------------------------------------------------------------------
+// complete_and_payout after streaming: final settlement / early termination
+// ---------------------------------------------------------------------
+
+#[test]
+fn complete_and_payout_finalizes_a_streamed_escrow_and_refunds_true_remainder() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10) // charge 20
+        ));
+        // Lease ends / terminates early: one final settlement call.
+        let final_evidence = stream_evidence(LEASE, 2, 10, 15, 5); // charge 10
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            final_evidence
+        ));
+        // Total charged across the stream: 20 + 10 = 30; remainder 970
+        // returned to the payer.
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_030);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(Balances::free_balance(PAYER), 999_970);
+        let escrow = Escrow::escrows(LEASE).unwrap();
+        assert_eq!(escrow.state, EscrowState::Completed);
+        assert_eq!(escrow.cumulative_charged, 30);
+    });
+}
+
+#[test]
+fn complete_and_payout_after_streaming_settles_exactly_once() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10)
+        ));
+        assert_ok!(Escrow::complete_and_payout(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 2, 10, 15, 5)
+        ));
+        assert_noop!(
+            Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 3, 15, 20, 1)
+            ),
+            crate::Error::<Test>::EscrowNotFunded
+        );
+        assert_noop!(
+            Escrow::complete_and_payout(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 3, 15, 20, 1)
+            ),
+            crate::Error::<Test>::EscrowNotFunded
+        );
+    });
+}
+
+#[test]
+fn complete_and_payout_after_streaming_rejects_charge_exceeding_remaining_cap() {
+    // Deliberately different behavior from `stream_settle`: the manual
+    // final settlement call fails closed rather than silently capping --
+    // see the module doc comment's "Explicit degradation" section for why
+    // the two calls diverge here.
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(30));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10) // charge 20, remaining_cap now 10
+        ));
+        let too_much = stream_evidence(LEASE, 2, 10, 20, 10); // charge 20 > remaining 10
+        assert_noop!(
+            Escrow::complete_and_payout(RuntimeOrigin::signed(OTHER), LEASE, too_much),
+            crate::Error::<Test>::ChargedAmountExceedsCap
+        );
+        // Escrow is untouched -- still Funded, still streamable.
+        let escrow = Escrow::escrows(LEASE).unwrap();
+        assert_eq!(escrow.state, EscrowState::Funded);
+        assert_eq!(escrow.cumulative_charged, 20);
+    });
+}
+
+// ---------------------------------------------------------------------
+// refund_escrow: generalized for streaming
+// ---------------------------------------------------------------------
+
+#[test]
+fn refund_escrow_after_streaming_refunds_only_the_unstreamed_remainder() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10) // charge 20
+        ));
+        System::set_block_number(1 + RefundWindow::get());
+        assert_ok!(Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE));
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        // Only the unstreamed 980 comes back -- the 20 already streamed to
+        // the provider stays with the provider.
+        assert_eq!(Balances::free_balance(PAYER), 999_980);
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_020);
+        let escrow = Escrow::escrows(LEASE).unwrap();
+        assert_eq!(escrow.state, EscrowState::Refunded);
+    });
+}
+
+#[test]
+fn refund_escrow_emits_amount_equal_to_the_unstreamed_remainder() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10)
+        ));
+        System::set_block_number(1 + RefundWindow::get());
+        assert_ok!(Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE));
+        let found = System::events().into_iter().any(|record| {
+            matches!(
+                record.event,
+                RuntimeEvent::Escrow(crate::Event::EscrowRefunded {
+                    lease_id: LEASE,
+                    payer: PAYER,
+                    amount: 980,
+                })
+            )
+        });
+        assert!(
+            found,
+            "EscrowRefunded.amount should be the unstreamed remainder (980)"
+        );
+    });
+}
+
+#[test]
+fn refund_escrow_liveness_window_resets_on_each_stream_settle() {
+    // Demonstrates the fix described in the module doc comment: without
+    // it, a payer could self-refund out from under a provider who is
+    // actively, verifiably still streaming, simply because `RefundWindow`
+    // had elapsed since the *original* funding block.
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        // Stream shortly before the window (anchored at funded_at = 1)
+        // would have elapsed under the old, pre-streaming behavior.
+        System::set_block_number(5);
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 1)
+        ));
+        // Old anchor (funded_at = 1) would allow refund at block 1 +
+        // RefundWindow = 11. The new anchor (last_streamed_at = 5) must
+        // still block it here.
+        System::set_block_number(1 + RefundWindow::get());
+        assert_noop!(
+            Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE),
+            crate::Error::<Test>::RefundWindowNotElapsed
+        );
+        // Once RefundWindow has elapsed since the *last* stream, it opens.
+        System::set_block_number(5 + RefundWindow::get());
+        assert_ok!(Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE));
+    });
+}
+
+// ---------------------------------------------------------------------
+// dispute_escrow / resolve_dispute: mid-stream and generalized arithmetic
+// ---------------------------------------------------------------------
+
+#[test]
+fn dispute_escrow_allowed_while_actively_streaming() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10)
+        ));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Disputed);
+    });
+}
+
+#[test]
+fn dispute_escrow_disputable_from_degraded_within_window() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 100) // caps at 50, Degraded
+        ));
+        System::set_block_number(1 + DisputeWindow::get());
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Disputed);
+    });
+}
+
+#[test]
+fn dispute_escrow_rejects_after_window_elapsed_post_degraded() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(50));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 100)
+        ));
+        System::set_block_number(2 + DisputeWindow::get());
+        assert_noop!(
+            Escrow::dispute_escrow(RuntimeOrigin::signed(PAYER), LEASE, [1u8; 32]),
+            crate::Error::<Test>::DisputeWindowElapsed
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_pay_provider_after_streaming_pays_only_the_incremental_amount() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10) // charge 20
+        ));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        // Governance adjudicates a lifetime total of 50 for the provider --
+        // 20 of that was already streamed, so only 30 more should move.
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::PayProvider(50)
+        ));
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_050);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(Balances::free_balance(PAYER), 999_950);
+        assert_eq!(
+            Escrow::escrows(LEASE).unwrap().state,
+            EscrowState::Completed
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_pay_provider_rejects_amount_below_already_streamed() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10) // charge 20
+        ));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_noop!(
+            Escrow::resolve_dispute(
+                RuntimeOrigin::root(),
+                LEASE,
+                DisputeOutcome::PayProvider(10) // below the 20 already streamed
+            ),
+            crate::Error::<Test>::PayoutBelowAlreadyStreamed
+        );
+    });
+}
+
+#[test]
+fn resolve_dispute_refund_payer_after_streaming_keeps_streamed_payout_and_refunds_remainder() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(fund(1_000));
+        assert_ok!(Escrow::stream_settle(
+            RuntimeOrigin::signed(OTHER),
+            LEASE,
+            stream_evidence(LEASE, 1, 0, 10, 10) // charge 20
+        ));
+        assert_ok!(Escrow::dispute_escrow(
+            RuntimeOrigin::signed(PAYER),
+            LEASE,
+            [1u8; 32]
+        ));
+        assert_ok!(Escrow::resolve_dispute(
+            RuntimeOrigin::root(),
+            LEASE,
+            DisputeOutcome::RefundPayer
+        ));
+        // The 20 already streamed on verified evidence is not clawed back
+        // -- only the still-reserved 980 is returned (module doc comment's
+        // slashing-seam section: already-streamed funds are outside this
+        // pallet's reach).
+        assert_eq!(Balances::free_balance(PROVIDER), 1_000_020);
+        assert_eq!(Balances::free_balance(PAYER), 999_980);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert_eq!(Escrow::escrows(LEASE).unwrap().state, EscrowState::Refunded);
+        assert_eq!(penalties(), vec![(PROVIDER, ReliabilityPenaltyBps::get())]);
+    });
+}
+
+// ---------------------------------------------------------------------
+// chain reorganization and message replay (issue #51's own test bar)
+// ---------------------------------------------------------------------
+
+#[test]
+fn stream_settle_same_evidence_applied_in_two_independent_forks_never_double_accrues() {
+    // Models a chain reorg: the same signed `MeteringSummary` might be
+    // included in two competing, not-yet-final forks, but only one fork is
+    // ever finalized -- so it must be applied at most once in whichever
+    // history actually wins. Two independent `TestExternalities` built
+    // from the same genesis stand in for "fork A" and "fork B": each is
+    // its own canonical history and each accrues the evidence exactly
+    // once, never twice within itself -- the property that matters, since
+    // only one of them ever becomes the real chain. Replay *within* one
+    // canonical history is covered separately by
+    // `stream_settle_rejects_replay_of_the_exact_same_evidence_message`.
+    for _fork in 0..2 {
+        new_test_ext().execute_with(|| {
+            assert_ok!(fund(1_000));
+            let evidence = stream_evidence(LEASE, 1, 0, 10, 10);
+            assert_ok!(Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                evidence
+            ));
+            assert_eq!(Balances::free_balance(PROVIDER), 1_000_020);
+            assert_eq!(Escrow::escrows(LEASE).unwrap().cumulative_charged, 20);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------
+// streaming invariants
+// ---------------------------------------------------------------------
+
+#[test]
+fn invariant_streaming_conserves_total_balance_across_scenarios() {
+    // For every scenario: (payer free + payer reserved + provider free)
+    // must be identical before and after -- money only ever moves between
+    // payer and provider (fee disabled via new_test_ext's FeeBasisPoints=0
+    // default), never created or destroyed, across any sequence of
+    // stream_settle / complete_and_payout / refund_escrow /
+    // dispute_escrow / resolve_dispute calls.
+    let scenarios: Vec<fn()> = vec![
+        || {
+            assert_ok!(fund(1_000));
+            assert_ok!(Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 1, 0, 10, 10)
+            ));
+            assert_ok!(Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 2, 10, 20, 5)
+            ));
+            assert_ok!(Escrow::complete_and_payout(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 3, 20, 25, 1)
+            ));
+        },
+        || {
+            assert_ok!(fund(50));
+            assert_ok!(Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 1, 0, 10, 100) // caps and degrades
+            ));
+        },
+        || {
+            assert_ok!(fund(1_000));
+            assert_ok!(Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 1, 0, 10, 10)
+            ));
+            System::set_block_number(1 + RefundWindow::get());
+            assert_ok!(Escrow::refund_escrow(RuntimeOrigin::signed(PAYER), LEASE));
+        },
+        || {
+            assert_ok!(fund(1_000));
+            assert_ok!(Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 1, 0, 10, 10)
+            ));
+            assert_ok!(Escrow::dispute_escrow(
+                RuntimeOrigin::signed(PAYER),
+                LEASE,
+                [1u8; 32]
+            ));
+            assert_ok!(Escrow::resolve_dispute(
+                RuntimeOrigin::root(),
+                LEASE,
+                DisputeOutcome::PayProvider(50)
+            ));
+        },
+        || {
+            assert_ok!(fund(1_000));
+            assert_ok!(Escrow::stream_settle(
+                RuntimeOrigin::signed(OTHER),
+                LEASE,
+                stream_evidence(LEASE, 1, 0, 10, 10)
+            ));
+            assert_ok!(Escrow::dispute_escrow(
+                RuntimeOrigin::signed(PAYER),
+                LEASE,
+                [1u8; 32]
+            ));
+            assert_ok!(Escrow::resolve_dispute(
+                RuntimeOrigin::root(),
+                LEASE,
+                DisputeOutcome::RefundPayer
+            ));
+        },
+    ];
+
+    for (idx, scenario) in scenarios.into_iter().enumerate() {
+        new_test_ext().execute_with(|| {
+            let total_before = Balances::free_balance(PAYER)
+                + Balances::reserved_balance(PAYER)
+                + Balances::free_balance(PROVIDER);
+            scenario();
+            let total_after = Balances::free_balance(PAYER)
+                + Balances::reserved_balance(PAYER)
+                + Balances::free_balance(PROVIDER);
+            assert_eq!(
+                total_before, total_after,
+                "scenario {idx}: total balance across payer+provider must be conserved"
+            );
+        });
+    }
+}
