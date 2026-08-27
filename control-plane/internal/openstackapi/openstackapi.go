@@ -45,11 +45,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/openstackapi/keystone"
 	"github.com/openinfra/network/internal/openstackapi/neutron"
+	"github.com/openinfra/network/internal/openstackapi/nova"
 	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/userauth"
+	"github.com/openinfra/network/internal/workloadapi"
 )
 
 // RateLimiter is satisfied by internal/ratelimit.RedisLimiter -- named
@@ -66,6 +69,7 @@ type RateLimiter interface {
 type Server struct {
 	pool     *pgxpool.Pool
 	keystone *keystone.Server
+	nova     *nova.Server
 	neutron  *neutron.Server
 	glance   *glance.Server
 	limiter  RateLimiter
@@ -78,17 +82,27 @@ type Server struct {
 // nil (unlimited) -- issueToken is the one unauthenticated,
 // real-work-per-request route on this surface, the same shape
 // internal/dashboard's authChallenge/authLogin rate limiting already
-// follows. zones backs internal/openstackapi/neutron's availability-zone
-// listing (ADR-026) -- the caller (cmd/controlplane) passes the same
-// agentmanager.Directory already constructed for scheduling, so there is
-// exactly one live view of "which zones are providers actually declaring
-// right now," not a second one this package maintains independently.
-func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, zones neutron.ZoneLister, baseURL string, limiter RateLimiter) *Server {
+// follows.
+//
+// workloads/workloadStore/directory are #24's addition (internal/
+// openstackapi/nova): the exact *workloadapi.Service, *workloadapi.
+// PostgresRepository, and *agentmanager.Directory instances
+// cmd/controlplane/main.go already constructs and shares with the gRPC
+// ControlPlaneService, internal/dashboard, and internal/orchestrator --
+// so a Nova-created server runs through the identical
+// validation/scheduling/deploy path any other workload does, per
+// ADR-031 §4's "no parallel execution model." The same directory also
+// backs internal/openstackapi/neutron's availability-zone listing
+// (ADR-026) as its ZoneLister -- one live view of "which zones are
+// providers actually declaring right now," not a second one either
+// package maintains independently.
+func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, workloads *workloadapi.Service, workloadStore *workloadapi.PostgresRepository, directory *agentmanager.Directory, baseURL string, limiter RateLimiter) *Server {
 	audit := newAuditRecorder(pool)
 	return &Server{
 		pool:     pool,
 		keystone: keystone.New(users, projectsRepo, baseURL, audit),
-		neutron:  neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), zones),
+		nova:     nova.New(pool, users, projectsRepo, workloads, workloadStore, directory, nova.DefaultFlavors),
+		neutron:  neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), directory),
 		glance:   glance.New(users, glance.NewPostgresRepository(pool), glance.AuditRecorder(audit)),
 		limiter:  limiter,
 	}
@@ -104,6 +118,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
 	s.keystone.Register(mux)
+	s.nova.Register(mux)
 	s.neutron.Register(mux)
 	s.glance.Register(mux)
 	return rateLimitTokenIssuance(s.limiter, securityHeaders(mux))
