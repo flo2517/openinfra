@@ -18,6 +18,11 @@ frame-system = { version = "48.0.0", default-features = false }
 sp-core = { version = "43.0.0", default-features = false }
 sp-io = { version = "48.0.0", default-features = false }
 sp-runtime = { version = "48.0.0", default-features = false }
+# ADR-036 §5: consumes pallet-provider-registry's ProviderBondInspector
+# trait directly for fund_escrow's reserve-contamination guard (mirrors
+# pallet-resource-market's existing direct dependency on this crate for its
+# own ProviderInspector trait).
+pallet-provider-registry = { path = "../provider-registry", default-features = false }
 
 [dev-dependencies]
 # Pinned to the exact release already resolved elsewhere in this workspace
@@ -33,6 +38,7 @@ std = [
     "scale-info/std",
     "frame-support/std",
     "frame-system/std",
+    "pallet-provider-registry/std",
     "sp-core/std",
     "sp-io/std",
     "sp-runtime/std",

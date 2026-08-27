@@ -12,6 +12,11 @@ pallet-provider-registry = { path = "../provider-registry", default-features = f
 scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
+# Pinned to the exact release already resolved elsewhere in this workspace
+# (via the runtime's polkadot-sdk umbrella pull), matching
+# pallet-provider-registry's own Cargo.toml (ADR-036: this mock now needs
+# a Currency to satisfy pallet-provider-registry::Config).
+pallet-balances = { version = "=50.0.0" }
 sp-io = "48.0.0"
 sp-runtime = "48.0.0"
 

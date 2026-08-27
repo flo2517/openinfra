@@ -186,6 +186,7 @@ impl WeightInfo for () {
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
+    use pallet_provider_registry::ProviderBondInspector;
 
     #[pallet::config]
     pub trait Config: frame_system::Config<RuntimeEvent: From<Event<Self>>> {
@@ -207,6 +208,11 @@ pub mod pallet {
         /// guard; the runtime wires this to
         /// `pallet-escrow::PayerOpenEscrowCount`.
         type EscrowInspector: EscrowPayerInspector<Self::AccountId>;
+        /// ADR-036 §5: backs `register_validator`'s reserve-contamination
+        /// guard against the third role, a bonded provider -- the runtime
+        /// wires this directly to
+        /// `pallet-provider-registry::Pallet::has_open_bond`.
+        type ProviderBondInspector: pallet_provider_registry::ProviderBondInspector<Self::AccountId>;
         #[pallet::constant]
         type MinStake: Get<BalanceOf<Self>>;
         #[pallet::constant]
@@ -526,6 +532,12 @@ pub mod pallet {
         /// that escrow's `max_charge` is already sitting in -- see
         /// [`EscrowPayerInspector`].
         PayerHasOpenEscrow,
+        /// ADR-036 §5: the caller currently has an open bond in
+        /// `pallet-provider-registry`. Rejected for the same
+        /// reserve-contamination reason as [`Error::PayerHasOpenEscrow`] --
+        /// a bonded provider and a Network Validator would otherwise share
+        /// one untagged reserved balance.
+        CallerIsBondedProvider,
     }
 
     #[pallet::call]
@@ -550,6 +562,14 @@ pub mod pallet {
             ensure!(
                 !T::EscrowInspector::has_open_escrow(&who),
                 Error::<T>::PayerHasOpenEscrow
+            );
+            // ADR-036 §5: third edge of the same guard -- an account with
+            // an open provider bond may not also become a Network
+            // Validator, since both reserve against the same untagged
+            // per-account balance.
+            ensure!(
+                !T::ProviderBondInspector::has_open_bond(&who),
+                Error::<T>::CallerIsBondedProvider
             );
             Self::join_active_set(&who)?;
             T::Currency::reserve(&who, stake).map_err(|_| Error::<T>::InsufficientFreeBalance)?;

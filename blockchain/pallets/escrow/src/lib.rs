@@ -359,6 +359,7 @@ pub mod pallet {
     use super::*;
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
+    use pallet_provider_registry::ProviderBondInspector;
     use sp_runtime::traits::{Saturating, Zero};
 
     pub type BalanceOf<T> =
@@ -395,6 +396,10 @@ pub mod pallet {
         /// Backs [`Pallet::fund_escrow`]'s reserve-contamination guard; the
         /// runtime wires this to `pallet-network-validator::Validators`.
         type ValidatorInspector: ValidatorRegistrationInspector<Self::AccountId>;
+        /// ADR-036 §5: backs `fund_escrow`'s reserve-contamination guard
+        /// against the third role, a bonded provider -- wired directly to
+        /// `pallet-provider-registry::Pallet::has_open_bond`.
+        type ProviderBondInspector: pallet_provider_registry::ProviderBondInspector<Self::AccountId>;
         /// Sole remaining sudo-key surface in this pallet (ADR-029 Sec4.5):
         /// resolves a frozen, disputed escrow. `EnsureRoot` for the MVP,
         /// same as every other adjudicated decision in this codebase
@@ -897,6 +902,12 @@ pub mod pallet {
         /// roles risks an unrelated slash consuming this escrow's reserved
         /// `max_charge`. See [`ValidatorRegistrationInspector`].
         PayerIsRegisteredValidator,
+        /// ADR-036 §5: `payer` currently has an open bond in
+        /// `pallet-provider-registry`. Rejected for the same
+        /// reserve-contamination reason as [`Error::PayerIsRegisteredValidator`]
+        /// -- a bonded provider and an escrow payer would otherwise share
+        /// one untagged reserved balance.
+        PayerIsBondedProvider,
         /// `set_fee_basis_points`'s `new_bps` exceeds `MaxFeeBasisPoints`.
         FeeExceedsCap,
         /// A payout with `FeeBasisPoints > 0` was attempted with no
@@ -958,6 +969,12 @@ pub mod pallet {
             ensure!(
                 !T::ValidatorInspector::is_registered(&payer),
                 Error::<T>::PayerIsRegisteredValidator
+            );
+            // ADR-036 §5: third edge of the same guard -- an account with
+            // an open provider bond may not also become an escrow payer.
+            ensure!(
+                !T::ProviderBondInspector::has_open_bond(&payer),
+                Error::<T>::PayerIsBondedProvider
             );
 
             T::Currency::reserve(&payer, max_charge)

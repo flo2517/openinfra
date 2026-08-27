@@ -88,6 +88,32 @@ fn set_registered_validator(account: u64, registered: bool) {
     });
 }
 
+thread_local! {
+    static BONDED_PROVIDERS: std::cell::RefCell<std::collections::BTreeSet<u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// ADR-036 §5: mock for the reserve-contamination guard's third edge
+/// (`fund_escrow` rejects an account with an open provider bond).
+/// Controlled per-test via `set_bonded_provider`, same shape as
+/// `TestValidatorInspector` above.
+pub struct TestProviderBondInspector;
+impl pallet_provider_registry::ProviderBondInspector<u64> for TestProviderBondInspector {
+    fn has_open_bond(provider: &u64) -> bool {
+        BONDED_PROVIDERS.with(|set| set.borrow().contains(provider))
+    }
+}
+
+fn set_bonded_provider(account: u64, bonded: bool) {
+    BONDED_PROVIDERS.with(|set| {
+        if bonded {
+            set.borrow_mut().insert(account);
+        } else {
+            set.borrow_mut().remove(&account);
+        }
+    });
+}
+
 pub struct TestLeaseExists;
 impl crate::LeaseExists for TestLeaseExists {
     fn exists(_: LeaseId) -> bool {
@@ -115,6 +141,7 @@ fn reset_fixtures() {
     set_lease_exists(true);
     PENALTIES.with(|cell| cell.borrow_mut().clear());
     REGISTERED_VALIDATORS.with(|set| set.borrow_mut().clear());
+    BONDED_PROVIDERS.with(|set| set.borrow_mut().clear());
 }
 
 parameter_types! {
@@ -133,6 +160,7 @@ impl crate::Config for Test {
     type LeaseExists = TestLeaseExists;
     type ReputationPenalty = RecordingReputationPenalty;
     type ValidatorInspector = TestValidatorInspector;
+    type ProviderBondInspector = TestProviderBondInspector;
     type DisputeOrigin = frame_system::EnsureRoot<u64>;
     type PauseOrigin = frame_system::EnsureRoot<u64>;
     type FeeGovernanceOrigin = frame_system::EnsureRoot<u64>;
@@ -1219,6 +1247,32 @@ fn fund_escrow_does_not_reject_an_unrelated_validator() {
         // some other account's.
         set_registered_validator(PROVIDER, true);
         set_registered_validator(OTHER, true);
+        assert_ok!(fund(200));
+    });
+}
+
+// ---------------------------------------------------------------------
+// ADR-036 §5: reserve-balance contamination guard, third edge --
+// fund_escrow rejects a payer who currently has an open bond in
+// pallet-provider-registry.
+// ---------------------------------------------------------------------
+
+#[test]
+fn fund_escrow_rejects_bonded_provider() {
+    new_test_ext().execute_with(|| {
+        set_bonded_provider(PAYER, true);
+        assert_noop!(fund(200), crate::Error::<Test>::PayerIsBondedProvider);
+        assert_eq!(Balances::reserved_balance(PAYER), 0);
+        assert!(Escrow::escrows(LEASE).is_none());
+    });
+}
+
+#[test]
+fn fund_escrow_succeeds_once_bond_is_cleared() {
+    new_test_ext().execute_with(|| {
+        set_bonded_provider(PAYER, true);
+        assert_noop!(fund(200), crate::Error::<Test>::PayerIsBondedProvider);
+        set_bonded_provider(PAYER, false);
         assert_ok!(fund(200));
     });
 }
