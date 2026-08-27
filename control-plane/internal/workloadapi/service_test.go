@@ -2,6 +2,7 @@ package workloadapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,6 +146,165 @@ func TestSubmitRejectsUnpinnedImageAndInvalidResources(t *testing.T) {
 	_, err = service.SubmitWorkload(ownerCtx(), request)
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("code=%s", status.Code(err))
+	}
+}
+
+// ADR-033 §4/§9, issues #166/#168: a VM workload's image is an https://
+// qcow2 URL paired with a required vm_image_sha256, not an OCI digest --
+// validateSubmission must accept exactly that shape and reject the
+// ordinary OCI-digest one once requires_vm is set.
+func TestSubmitAcceptsAVmWorkloadWithAnHttpsImageAndDigest(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	service.SetVMImageAllowlist([]string{"https://example.com/images/"})
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	request.Image = "https://example.com/images/ubuntu-22.04.qcow2"
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	response, err := service.SubmitWorkload(ownerCtx(), request)
+	if err != nil {
+		t.Fatalf("expected a valid VM submission to succeed, got: %v", err)
+	}
+	if response.State != controlplanev1.WorkloadState_WORKLOAD_STATE_REQUESTED {
+		t.Fatalf("state=%s", response.State)
+	}
+}
+
+func TestSubmitRejectsAVmWorkloadWithoutAnHttpsUrl(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	service.SetVMImageAllowlist([]string{"https://example.com/images/"})
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	// Still an OCI-digest reference, not an https:// URL -- must be
+	// rejected for a VM workload even though it would have been accepted
+	// for a container workload.
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestSubmitRejectsAVmWorkloadWithAMalformedDigest(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	service.SetVMImageAllowlist([]string{"https://example.com/images/"})
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	request.Image = "https://example.com/images/ubuntu-22.04.qcow2"
+	request.VmImageSha256 = "not-a-valid-digest"
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument", status.Code(err))
+	}
+}
+
+// ADR-033 §7: the guest-image allowlist itself -- an allowed URL passes, a
+// disallowed one is rejected with a clear message, and an unconfigured
+// allowlist fails closed (rejects every VM workload, not just unlisted
+// ones) rather than failing open.
+
+func TestSubmitRejectsAVmImageNotCoveredByTheAllowlist(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	service.SetVMImageAllowlist([]string{"https://cloud-images.ubuntu.com/"})
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	request.Image = "https://attacker.example.com/malicious.qcow2"
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "allowlist") {
+		t.Fatalf("expected a clear allowlist error, got: %v", err)
+	}
+}
+
+func TestSubmitRejectsEveryVmImageWhenTheAllowlistIsUnconfigured(t *testing.T) {
+	// No SetVMImageAllowlist call at all -- the zero value must fail
+	// closed (reject every VM workload), never fail open.
+	service := NewService(newMemoryRepository())
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	request.Image = "https://cloud-images.ubuntu.com/ubuntu-22.04.qcow2"
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument (unconfigured allowlist must fail closed)", status.Code(err))
+	}
+}
+
+func TestSubmitRejectsEveryVmImageWhenTheAllowlistIsExplicitlyEmpty(t *testing.T) {
+	// An explicitly-set-but-empty allowlist (e.g. VM_IMAGE_ALLOWLIST=""
+	// or a misconfigured deploy) must behave identically to never having
+	// called SetVMImageAllowlist at all.
+	service := NewService(newMemoryRepository())
+	service.SetVMImageAllowlist([]string{})
+	request := validRequest()
+	request.Definition.Constraints = &sharedv1.WorkloadConstraints{RequiresVm: true}
+	request.Image = "https://cloud-images.ubuntu.com/ubuntu-22.04.qcow2"
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument (empty allowlist must fail closed)", status.Code(err))
+	}
+}
+
+// TestVmImageAllowlistDoesNotAffectContainerWorkloadSubmission: an ordinary
+// container workload (no requires_vm, no VmImageSha256) must succeed
+// regardless of whether a VM allowlist is configured at all -- the
+// allowlist check only ever runs on the requires_vm branch of
+// validateSubmission.
+func TestVmImageAllowlistDoesNotAffectContainerWorkloadSubmission(t *testing.T) {
+	for _, allowlist := range [][]string{nil, {}, {"https://cloud-images.ubuntu.com/"}} {
+		service := NewService(newMemoryRepository())
+		service.SetVMImageAllowlist(allowlist)
+		request := validRequest()
+
+		response, err := service.SubmitWorkload(ownerCtx(), request)
+		if err != nil {
+			t.Fatalf("allowlist=%v: expected an ordinary container submission to succeed, got: %v", allowlist, err)
+		}
+		if response.State != controlplanev1.WorkloadState_WORKLOAD_STATE_REQUESTED {
+			t.Fatalf("allowlist=%v: state=%s", allowlist, response.State)
+		}
+	}
+}
+
+func TestImageMatchesAllowlist(t *testing.T) {
+	cases := []struct {
+		name      string
+		image     string
+		allowlist []string
+		want      bool
+	}{
+		{"nil allowlist matches nothing", "https://cloud-images.ubuntu.com/x.qcow2", nil, false},
+		{"empty allowlist matches nothing", "https://cloud-images.ubuntu.com/x.qcow2", []string{}, false},
+		{"matching prefix", "https://cloud-images.ubuntu.com/x.qcow2", []string{"https://cloud-images.ubuntu.com/"}, true},
+		{"non-matching host", "https://attacker.example.com/x.qcow2", []string{"https://cloud-images.ubuntu.com/"}, false},
+		{"one of several prefixes matches", "https://cloud.debian.org/images/cloud/x.qcow2", []string{"https://cloud-images.ubuntu.com/", "https://cloud.debian.org/images/cloud/"}, true},
+		{"an empty allowlist entry is never a wildcard", "https://anything-at-all/x.qcow2", []string{""}, false},
+		{"prefix match is case-sensitive", "https://Cloud-Images.ubuntu.com/x.qcow2", []string{"https://cloud-images.ubuntu.com/"}, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := imageMatchesAllowlist(testCase.image, testCase.allowlist)
+			if got != testCase.want {
+				t.Fatalf("imageMatchesAllowlist(%q, %v) = %v, want %v", testCase.image, testCase.allowlist, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestSubmitRejectsAContainerWorkloadThatSetsVmImageSha256(t *testing.T) {
+	service := NewService(newMemoryRepository())
+	request := validRequest()
+	request.VmImageSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	_, err := service.SubmitWorkload(ownerCtx(), request)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s, want InvalidArgument", status.Code(err))
 	}
 }
 

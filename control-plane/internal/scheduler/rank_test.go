@@ -158,6 +158,59 @@ func TestRankEnforcesRequiredZoneConstraint(t *testing.T) {
 	}
 }
 
+// ADR-033 §7 / issue #166: a real regression/reproduction test proving
+// the scheduler itself refuses to offer a VM workload to a provider that
+// has not reported virtualization_capable = true -- not merely that the
+// Agent would have caught it anyway. This is the scheduling-layer half of
+// ADR-033's fail-closed guarantee.
+func TestRankEnforcesVirtualizationCapableConstraintForAVmWorkload(t *testing.T) {
+	requirements := &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 512}
+	constraints := &sharedv1.WorkloadConstraints{RequiresVm: true}
+	candidates := []Candidate{
+		{ProviderID: "kvm-capable", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096, VirtualizationCapable: true},
+		{ProviderID: "kvm-incapable", AgentEndpoint: "https://b", CPUAvailableCores: 4, RAMAvailableMB: 4096, VirtualizationCapable: false},
+		// A provider that never even sets the field (e.g. an Agent build
+		// predating ADR-033, or a probe that returned an inconclusive
+		// result) has VirtualizationCapable's Go zero value, false --
+		// exercised as its own candidate to make sure "absent" is treated
+		// identically to "explicitly false", never as "unknown, try
+		// anyway".
+		{ProviderID: "field-never-set", AgentEndpoint: "https://c", CPUAvailableCores: 4, RAMAvailableMB: 4096},
+	}
+	decision := testRanker().Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, constraints, candidates)
+
+	if len(decision.Ranked) != 1 || decision.Ranked[0].ProviderID != "kvm-capable" {
+		t.Fatalf("expected only 'kvm-capable' to survive a requires_vm workload, got %+v (excluded: %+v)", decision.Ranked, decision.Excluded)
+	}
+	if decision.Selected == nil || decision.Selected.ProviderID != "kvm-capable" {
+		t.Fatalf("Selected = %+v, want kvm-capable", decision.Selected)
+	}
+	reasons := map[string]string{}
+	for _, e := range decision.Excluded {
+		reasons[e.ProviderID] = e.Reason
+	}
+	for _, want := range []string{"kvm-incapable", "field-never-set"} {
+		if reasons[want] != ReasonVmIncapable {
+			t.Fatalf("expected %q excluded with reason %q, got %q", want, ReasonVmIncapable, reasons[want])
+		}
+	}
+}
+
+// The mirror image of the above: an ordinary (non-VM) workload must not
+// be affected by virtualization_capable at all -- a provider that never
+// advertised it is perfectly eligible for a container workload.
+func TestRankIgnoresVirtualizationCapableWhenTheWorkloadDoesNotRequireAVm(t *testing.T) {
+	requirements := &sharedv1.ResourceRequirements{Cpu: 1, RamMb: 512}
+	candidates := []Candidate{
+		{ProviderID: "kvm-capable", AgentEndpoint: "https://a", CPUAvailableCores: 4, RAMAvailableMB: 4096, VirtualizationCapable: true},
+		{ProviderID: "kvm-incapable", AgentEndpoint: "https://b", CPUAvailableCores: 4, RAMAvailableMB: 4096, VirtualizationCapable: false},
+	}
+	decision := testRanker().Rank(sharedv1.WorkloadProfile_WORKLOAD_PROFILE_COMPUTE_INTENSIVE, requirements, nil, candidates)
+	if len(decision.Ranked) != 2 {
+		t.Fatalf("expected both candidates to survive an ordinary container workload, got %+v (excluded: %+v)", decision.Ranked, decision.Excluded)
+	}
+}
+
 func TestRankReturnsNoSelectionWhenEverythingIsExcluded(t *testing.T) {
 	requirements := &sharedv1.ResourceRequirements{Cpu: 100, RamMb: 100_000}
 	candidates := []Candidate{

@@ -140,13 +140,13 @@ async fn handle_start(dev: bool) -> Result<()> {
     tokio::spawn(async move {
         run_renewal_loop(renewal_config, dev, renewal_state, renewal_identity).await;
     });
-    let executor =
+    let docker_executor =
         Arc::new(DockerExecutor::connect(Arc::clone(&local_state), config.executor.clone()).await?);
     // ADR-028 §3: reuses the same 15s cadence as the heartbeat loop above
     // (no new timer). Runs unconditionally, connected or not -- see
     // DockerExecutor::enforce_lease_expiry's own doc comment for why this
     // is deliberately not gated on disconnect_state.
-    let lease_expiry_executor = Arc::clone(&executor);
+    let lease_expiry_executor = Arc::clone(&docker_executor);
     tokio::spawn(async move {
         loop {
             match lease_expiry_executor
@@ -164,6 +164,46 @@ async fn handle_start(dev: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
+    // ADR-033 §7 / issue #168 point 4: VmExecutor is only ever constructed
+    // when the operator has explicitly opted in (vm_enabled) -- a
+    // KVM-capable host with vm_enabled=false must still never be offered
+    // a VM deploy locally, which RoutingExecutor enforces by simply never
+    // holding a VmExecutor to route to (see ExecutorError::VmDisabled).
+    let vm_executor: Option<Arc<agent_executor::vm::VmExecutor>> = if config.executor.vm_enabled {
+        let vm = Arc::new(
+            agent_executor::vm::VmExecutor::connect(
+                Arc::clone(&local_state),
+                config.executor.clone(),
+            )
+            .await?,
+        );
+        let lease_expiry_vm = Arc::clone(&vm);
+        tokio::spawn(async move {
+            loop {
+                match lease_expiry_vm
+                    .enforce_lease_expiry(std::time::SystemTime::now())
+                    .await
+                {
+                    Ok(stopped) if !stopped.is_empty() => {
+                        info!(?stopped, "stopped VM workloads past their lease_end");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        error!(%error, "VM lease-expiry enforcement pass failed");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+        Some(vm)
+    } else {
+        None
+    };
+    let executor: Arc<dyn Executor> = Arc::new(agent_executor::RoutingExecutor::new(
+        docker_executor,
+        vm_executor.map(|vm| vm as Arc<dyn Executor>),
+        Arc::clone(&local_state),
+    ));
     let (event_bus, mut events) = tokio::sync::mpsc::channel(100);
     let event_executor = Arc::clone(&executor);
 
@@ -760,6 +800,16 @@ fn apply_executor_env_overrides(config: &mut AgentConfig) -> Result<()> {
     if let Some(value) = parse_env("OPENINFRA_AGENT_MAX_EGRESS_MBPS")? {
         config.executor.max_egress_mbps = value;
     }
+    // ADR-033 §7 / issue #168 point 4: the operator's explicit,
+    // separate-from-hardware-capability opt-in to running VM workloads at
+    // all -- see ExecutorSettings::vm_enabled's own doc comment for why
+    // this is not folded into max_vm_workloads.
+    if let Some(value) = parse_env("OPENINFRA_AGENT_VM_ENABLED")? {
+        config.executor.vm_enabled = value;
+    }
+    if let Some(value) = parse_env("OPENINFRA_AGENT_MAX_VM_WORKLOADS")? {
+        config.executor.max_vm_workloads = value;
+    }
     Ok(())
 }
 
@@ -948,6 +998,28 @@ mod tests {
         assert_eq!(config.executor.max_egress_mbps, 500);
     }
 
+    // ADR-033 §7 / issue #168 point 4: the operator's explicit VM-support
+    // opt-in, distinct from the KVM hardware-capability probe -- defaults
+    // to false and is only ever flipped on by this exact env var.
+    #[test]
+    fn vm_enabled_env_override_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_VM_ENABLED", "true");
+        let mut config = AgentConfig::default();
+        assert!(!config.executor.vm_enabled, "default must be off");
+        apply_executor_env_overrides(&mut config).expect("override should apply");
+        assert!(config.executor.vm_enabled);
+    }
+
+    #[test]
+    fn max_vm_workloads_env_override_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvVarGuard::set("OPENINFRA_AGENT_MAX_VM_WORKLOADS", "3");
+        let mut config = AgentConfig::default();
+        apply_executor_env_overrides(&mut config).expect("override should apply");
+        assert_eq!(config.executor.max_vm_workloads, 3);
+    }
+
     #[test]
     fn unset_env_leaves_config_value_untouched() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -956,6 +1028,8 @@ mod tests {
         env::remove_var("OPENINFRA_AGENT_MAX_MEMORY_MB");
         env::remove_var("OPENINFRA_AGENT_PIDS_LIMIT");
         env::remove_var("OPENINFRA_AGENT_MAX_EGRESS_MBPS");
+        env::remove_var("OPENINFRA_AGENT_VM_ENABLED");
+        env::remove_var("OPENINFRA_AGENT_MAX_VM_WORKLOADS");
 
         let mut config = AgentConfig::default();
         config.executor.max_workloads = 3;
@@ -963,6 +1037,8 @@ mod tests {
         config.executor.max_memory_mb = 2048;
         config.executor.pids_limit = 64;
         config.executor.max_egress_mbps = 100;
+        config.executor.vm_enabled = true;
+        config.executor.max_vm_workloads = 2;
 
         apply_executor_env_overrides(&mut config).expect("no env vars set, nothing to apply");
 
@@ -971,6 +1047,8 @@ mod tests {
         assert_eq!(config.executor.max_memory_mb, 2048);
         assert_eq!(config.executor.pids_limit, 64);
         assert_eq!(config.executor.max_egress_mbps, 100);
+        assert!(config.executor.vm_enabled);
+        assert_eq!(config.executor.max_vm_workloads, 2);
     }
 
     #[test]

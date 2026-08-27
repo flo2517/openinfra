@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,16 +29,36 @@ var (
 	// provider rather than treating it as a stale-read bug.
 	ErrCapacityExceeded = errors.New("provider capacity exceeded")
 	digestImage         = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9._-]+)?@sha256:[a-f0-9]{64}$`)
+	// ADR-033 §4: exactly 64 lowercase hex characters, matching
+	// agent-executor's own `image::validate_sha256_hex` shape on the
+	// Agent side of this same digest.
+	vmImageDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
 type Workload struct {
 	WorkloadID, RequestID, Image, State string
+	// VmImageSha256 is set only for a VM workload
+	// (Definition.Constraints.RequiresVm = true, ADR-033 §4/§9, issues
+	// #166/#168): the pinned SHA-256 digest of the qcow2 blob at Image,
+	// verified by the Agent before it is ever booted. Empty for an
+	// ordinary container workload.
+	VmImageSha256 string
 	// OwnerID is the authenticated tenant this workload belongs to (see
 	// internal/userauth). Empty for workloads created before migration
 	// 000009 -- those are permanently unreachable through the
 	// authenticated user API by design, not a bug; see that migration's
 	// comment.
-	OwnerID                                     string
+	OwnerID string
+	// ProjectID is the Keystone-compatible project (ADR-031 §3,
+	// internal/projects) this workload is scoped to, when it was created
+	// through internal/openstackapi/nova. Empty for every workload created
+	// through the gRPC ControlPlaneService or the dashboard's tenant-tier
+	// submit path directly (neither sets WithProjectID on the context) --
+	// the same "extended, not replaced" relationship ADR-031 §3 describes
+	// between this column and OwnerID: a workload always has an OwnerID,
+	// and additionally has a ProjectID only when created via the OpenStack
+	// surface.
+	ProjectID                                   string
 	StopRequestID                               string
 	RequestHash                                 [32]byte
 	ResourceHash                                [32]byte
@@ -121,18 +142,47 @@ type Repository interface {
 type Service struct {
 	repository Repository
 	now        func() time.Time
+	// vmImageAllowlist is ADR-033 §7's operator-configured "narrow,
+	// curated guest-image allowlist for the first slice": a VM
+	// workload's image URL (already required to be https:// -- see
+	// validateSubmission) must have one of these entries as a literal
+	// prefix, or submission is rejected. Deliberately fails closed, not
+	// open, when unset or empty: unlike a genuinely optional dependency
+	// (there is none of that shape on this Service today), an empty
+	// allowlist here must reject every VM workload rather than silently
+	// accept an unvetted image -- matching agent-core's own
+	// `max_vm_workloads` "0 means disabled, not unlimited" precedent
+	// (ADR-033 §7) on the Agent side of this same ADR. Set via
+	// SetVMImageAllowlist; cmd/controlplane/main.go populates it from an
+	// operator-configured environment variable, matching this codebase's
+	// existing envOrDefault convention for operator tunables.
+	vmImageAllowlist []string
 }
 
 func NewService(repository Repository) *Service {
 	return &Service{repository: repository, now: time.Now}
 }
 
+// SetVMImageAllowlist installs the operator-configured VM guest-image
+// allowlist (ADR-033 §7). See the vmImageAllowlist field's doc comment for
+// the fail-closed behavior when this is never called, or called with an
+// empty slice: every VM workload submission is rejected either way, never
+// silently accepted.
+func (s *Service) SetVMImageAllowlist(prefixes []string) { s.vmImageAllowlist = prefixes }
+
 func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.SubmitWorkloadRequest) (*controlplanev1.SubmitWorkloadResponse, error) {
 	ownerID, err := requireOwner(ctx)
 	if err != nil {
 		return nil, err
 	}
-	definitionBytes, requestHash, err := validateSubmission(request)
+	// projectID is optional: only internal/openstackapi/nova's server-create
+	// handler ever calls WithProjectID before reaching here (see that
+	// function's doc comment); every other caller of SubmitWorkload
+	// (gRPC ControlPlaneService, the dashboard's tenant-tier submit) leaves
+	// it unset, producing the same ProjectID-less Workload row this method
+	// has always created.
+	projectID, _ := projectIDFromContext(ctx)
+	definitionBytes, requestHash, err := s.validateSubmission(request)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -147,9 +197,11 @@ func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.Su
 		WorkloadID:            request.Definition.WorkloadId,
 		RequestID:             request.RequestId,
 		OwnerID:               ownerID,
+		ProjectID:             projectID,
 		RequestHash:           requestHash,
 		Definition:            definitionBytes,
 		Image:                 request.Image,
+		VmImageSha256:         request.VmImageSha256,
 		State:                 "REQUESTED",
 		CreatedAt:             now,
 		UpdatedAt:             now,
@@ -287,7 +339,26 @@ func requireOwner(ctx context.Context) (string, error) {
 	return ownerID, nil
 }
 
-func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, [32]byte, error) {
+type projectIDContextKey struct{}
+
+// WithProjectID attaches a Keystone-compatible project scope (ADR-031 §3)
+// to ctx, for SubmitWorkload to record on the created Workload row --
+// mirrors userauth.WithUserID's exact shape. Called only by
+// internal/openstackapi/nova's server-create handler, alongside
+// userauth.WithUserID(ctx, callerUserID): the two are independent (a
+// caller always has a user ID; a project ID is only present when the
+// request came in on a project-scoped token), matching how OwnerID and
+// ProjectID coexist on Workload itself.
+func WithProjectID(ctx context.Context, projectID string) context.Context {
+	return context.WithValue(ctx, projectIDContextKey{}, projectID)
+}
+
+func projectIDFromContext(ctx context.Context) (string, bool) {
+	projectID, ok := ctx.Value(projectIDContextKey{}).(string)
+	return projectID, ok && projectID != ""
+}
+
+func (s *Service) validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, [32]byte, error) {
 	if request == nil || request.Definition == nil {
 		return nil, [32]byte{}, errors.New("definition is required")
 	}
@@ -297,10 +368,40 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 	if _, err := uuid.Parse(request.Definition.WorkloadId); err != nil {
 		return nil, [32]byte{}, errors.New("workload_id must be a UUID")
 	}
-	if !digestImage.MatchString(request.Image) {
-		return nil, [32]byte{}, errors.New("image must be an OCI reference pinned by a lowercase sha256 digest")
-	}
 	definition := request.Definition
+	// ADR-033 §4/§9, issues #166/#168: a VM workload has no OCI registry
+	// concept to pin a digest against -- `image` is instead an HTTPS URL
+	// to a qcow2 blob, paired with the required vm_image_sha256 the Agent
+	// verifies before ever booting it (mirroring issue #154/PR #155's
+	// "never run before the artifact matches what was promised"
+	// discipline for the container path). An ordinary container workload
+	// is unaffected and keeps the existing OCI-digest requirement.
+	if definition.GetConstraints().GetRequiresVm() {
+		if !strings.HasPrefix(request.Image, "https://") {
+			return nil, [32]byte{}, errors.New("a VM workload's image must be an https:// URL")
+		}
+		if !vmImageDigest.MatchString(request.VmImageSha256) {
+			return nil, [32]byte{}, errors.New("vm_image_sha256 must be exactly 64 lowercase hex characters")
+		}
+		// ADR-033 §7: the guest-image allowlist, checked last among the
+		// VM-specific checks so a malformed URL/digest still gets its own
+		// more specific error rather than being folded into "not
+		// allowlisted". Fails closed by construction: an empty or unset
+		// vmImageAllowlist matches nothing (see imageMatchesAllowlist),
+		// so a misconfigured or freshly-deployed Control Plane rejects
+		// every VM workload rather than accepting an arbitrary
+		// tenant-supplied image.
+		if !imageMatchesAllowlist(request.Image, s.vmImageAllowlist) {
+			return nil, [32]byte{}, errors.New("VM image is not in the operator-configured guest-image allowlist")
+		}
+	} else {
+		if !digestImage.MatchString(request.Image) {
+			return nil, [32]byte{}, errors.New("image must be an OCI reference pinned by a lowercase sha256 digest")
+		}
+		if request.VmImageSha256 != "" {
+			return nil, [32]byte{}, errors.New("vm_image_sha256 must not be set for a container workload")
+		}
+	}
 	if definition.Profile == sharedv1.WorkloadProfile_WORKLOAD_PROFILE_UNSPECIFIED {
 		return nil, [32]byte{}, errors.New("workload profile is required")
 	}
@@ -331,9 +432,31 @@ func validateSubmission(request *controlplanev1.SubmitWorkloadRequest) ([]byte, 
 	hash.Write(definitionBytes)
 	hash.Write([]byte{0})
 	hash.Write([]byte(request.Image))
+	hash.Write([]byte{0})
+	hash.Write([]byte(request.VmImageSha256))
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))
 	return definitionBytes, result, nil
+}
+
+// imageMatchesAllowlist reports whether image has one of allowlist's
+// entries as a literal prefix -- ADR-033 §7 names "host/path prefixes",
+// not a full URL match, so a single allowlist entry like
+// "https://cloud-images.ubuntu.com/" covers every object under that
+// host/path without the operator enumerating each qcow2 file
+// individually. An empty entry is ignored rather than treated as a
+// prefix every string matches, so a stray blank element in an
+// operator-supplied list (e.g. a trailing comma) can never accidentally
+// allow every image. A nil or empty allowlist matches nothing at all,
+// which is exactly the fail-closed behavior Service.vmImageAllowlist's
+// doc comment requires -- there is no implicit wildcard here.
+func imageMatchesAllowlist(image string, allowlist []string) bool {
+	for _, prefix := range allowlist {
+		if prefix != "" && strings.HasPrefix(image, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func stateToProto(state string) controlplanev1.WorkloadState {

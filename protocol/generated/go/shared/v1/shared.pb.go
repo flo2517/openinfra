@@ -842,6 +842,15 @@ type WorkloadConstraints struct {
 	MinReputation float32                `protobuf:"fixed32,2,opt,name=min_reputation,json=minReputation,proto3" json:"min_reputation,omitempty"`
 	MaxPrice      float32                `protobuf:"fixed32,3,opt,name=max_price,json=maxPrice,proto3" json:"max_price,omitempty"`
 	RequiredZone  string                 `protobuf:"bytes,4,opt,name=required_zone,json=requiredZone,proto3" json:"required_zone,omitempty"`
+	// ADR-033 §7 / issue #166: this workload must run as a VM, not a
+	// container. The scheduler must never rank a provider that has not
+	// explicitly reported ResourceCapability.virtualization_capable = true
+	// as eligible when this is set -- absent/false capability is "cannot
+	// run VM workloads", never "unknown, try anyway", matching how
+	// required_zone above is already a hard exclusion, not a soft
+	// preference (ADR-026 §4). Default false: an ordinary container
+	// workload is unaffected and needs no changes.
+	RequiresVm    bool `protobuf:"varint,5,opt,name=requires_vm,json=requiresVm,proto3" json:"requires_vm,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -902,6 +911,13 @@ func (x *WorkloadConstraints) GetRequiredZone() string {
 		return x.RequiredZone
 	}
 	return ""
+}
+
+func (x *WorkloadConstraints) GetRequiresVm() bool {
+	if x != nil {
+		return x.RequiresVm
+	}
+	return false
 }
 
 // --- Lease Object ---
@@ -1318,12 +1334,14 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\n" +
 	"storage_gb\x18\x03 \x01(\x03R\tstorageGb\x12\x1b\n" +
 	"\tgpu_count\x18\x04 \x01(\x05R\bgpuCount\x12<\n" +
-	"\tbandwidth\x18\x05 \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\"\xa4\x01\n" +
+	"\tbandwidth\x18\x05 \x01(\v2\x1e.openinfra.shared.v1.BandwidthR\tbandwidth\"\xc5\x01\n" +
 	"\x13WorkloadConstraints\x12$\n" +
 	"\x0emax_latency_ms\x18\x01 \x01(\x05R\fmaxLatencyMs\x12%\n" +
 	"\x0emin_reputation\x18\x02 \x01(\x02R\rminReputation\x12\x1b\n" +
 	"\tmax_price\x18\x03 \x01(\x02R\bmaxPrice\x12#\n" +
-	"\rrequired_zone\x18\x04 \x01(\tR\frequiredZone\"\x9c\x02\n" +
+	"\rrequired_zone\x18\x04 \x01(\tR\frequiredZone\x12\x1f\n" +
+	"\vrequires_vm\x18\x05 \x01(\bR\n" +
+	"requiresVm\"\x9c\x02\n" +
 	"\x05Lease\x12\x19\n" +
 	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
