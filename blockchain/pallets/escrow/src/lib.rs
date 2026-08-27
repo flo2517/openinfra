@@ -66,6 +66,151 @@
 //! definition none of that escrow's own funds remain reserved at that
 //! point, so any transfer could only ever be pulling from a different
 //! escrow; the full adjudicated amount is written off honestly instead.
+//!
+//! # Streaming settlement (issue #51, ADR-012 Sec5 Stage 1)
+//!
+//! **What "streaming" means here.** There is no wall-clock timer and no
+//! `on_initialize`/`on_finalize` hook anywhere in this design -- a Substrate
+//! runtime has neither, and iterating every open escrow once per block would
+//! be exactly the unbounded, lease-count-scaling per-block work issue #51's
+//! own acceptance criteria rule out. "Streaming" instead means: the same
+//! evidence-gated settlement [`Pallet::complete_and_payout`] already performs
+//! once, performed **repeatedly**, each call paying out only the *new*
+//! period's verified usage and leaving the escrow open (`EscrowState::Funded`)
+//! for the next one, instead of closing it after a single call. Every call is
+//! pull-triggered by an event outside this pallet -- a metering-evidence
+//! submission ([`Pallet::stream_settle`]), a lease ending or being terminated
+//! early ([`Pallet::complete_and_payout`], now cumulative-aware, used as the
+//! final settlement), or a dispute ([`Pallet::dispute_escrow`] /
+//! [`Pallet::resolve_dispute`], unchanged in mechanism, generalized in
+//! arithmetic). No new trigger category is introduced beyond these three --
+//! there is no separate "explicit claim" extrinsic, because
+//! [`Pallet::stream_settle`] already *is* the pull-based claim: any relayer
+//! holding the next signed [`MeteringSummary`] may submit it, exactly like
+//! `complete_and_payout` already works (ADR-029 Sec4.2/Sec9).
+//!
+//! **Design choice: extend `pallet-escrow`, not a new pallet.** ADR-029
+//! Sec11 explicitly deferred this ("this design is lease-scoped, one
+//! lump-sum charge at completion, not a payment stream"), so a decision is
+//! owed here, not assumed. A new pallet was considered and rejected: the
+//! reserved balance this design releases incrementally is the exact same
+//! `T::Currency::reserve` call `fund_escrow` already makes, against the same
+//! untagged, per-account reserved balance this module's own "reserve-balance
+//! contamination fix" section above already had to reason carefully about.
+//! A second pallet reserving against that same shared balance would
+//! reintroduce a variant of the exact contamination class that fix closed,
+//! for no benefit -- streaming is not a new custody model, it is the
+//! existing one's `max_charge` reservation released in more than one step.
+//! Reusing `EscrowRecord`, the dispute/pause/fee machinery, the replay
+//! protection, and `compute_charge`/`split_fee` unchanged is a strictly
+//! smaller, safer footprint than re-deriving all of it in a sibling pallet
+//! that would still need a narrow trait back into this one to avoid
+//! duplicating custody.
+//!
+//! **What generalizes and what stays exactly as it was.** Every existing,
+//! already-tested behavior for a *non-streamed* escrow is unchanged: all
+//! new arithmetic below is expressed in terms of `escrow.cumulative_charged`
+//! (new field, defaults to zero at `fund_escrow`), and every formula reduces
+//! algebraically to the pre-streaming one when `cumulative_charged == 0`
+//! (e.g. `complete_and_payout`'s cap check becomes `cumulative_charged +
+//! charged_amount <= max_charge`, identical to `charged_amount <= max_charge`
+//! when nothing has streamed yet). No pre-existing test in this module's
+//! `complete_and_payout`/`refund_escrow`/`dispute_escrow`/`resolve_dispute`
+//! suites needed to change for this reason -- confirmed by running them
+//! unmodified against the generalized code.
+//!
+//! **Period accounting: increments, never cumulative-since-start.** Each
+//! [`MeteringSummary`] already carries its own `period_start`/`period_end`
+//! (ADR-029 Sec6) bounded by `MaxMeteringPeriodSeconds` -- a bound that only
+//! makes sense if a period is a short, incremental window, not "usage since
+//! the lease began" (which would keep growing across a long-running lease
+//! until it *always* exceeded the bound). Streaming leans on this: each
+//! evidence submission reports usage for its own window only, and a new
+//! `escrow.last_period_end` field (defaults to zero at funding) requires
+//! `evidence.period_start >= escrow.last_period_end`
+//! ([`Error::MeteringPeriodOverlap`]) -- closing a real double-accrual vector
+//! the pre-existing `sequence > last_evidence_sequence` replay check does
+//! *not* close on its own: `sequence` only has to increase, it says nothing
+//! about which period range a given sequence number covers, so a forged
+//! evidence record could otherwise re-claim an already-paid period under a
+//! fresh, higher sequence number and be paid for it twice.
+//!
+//! **Explicit degradation, not silent unpayable debt.** [`Pallet::stream_settle`]
+//! deliberately diverges from `complete_and_payout`'s fail-closed convention
+//! (`ChargedAmountExceedsCap`, an outright error) for exactly one case: a
+//! period whose verified, computed charge would exceed what remains of
+//! `max_charge`. Erroring the whole call there would discard real, already
+//! cryptographically verified usage the payer *could* still afford up to the
+//! cap -- a lost-accrual outcome issue #51 explicitly rules out. Instead,
+//! the payout is capped at the remaining balance, the escrow moves to the
+//! new terminal `EscrowState::Degraded` (distinct from a plain `Completed`,
+//! which is reserved for the case where every dimension of the requested
+//! charge was fully honored, cap or no cap -- see [`EscrowState`]'s own doc
+//! comment for the exact line between the two), and [`Event::EscrowDegraded`]
+//! fires alongside [`Event::EscrowStreamed`] so any off-chain consumer (the
+//! orchestrator, most obviously) has an unambiguous, on-chain signal to stop
+//! serving a tenant who is now known to be unable to pay for further usage
+//! -- never a silent negative balance, never an unchecked subtraction, and
+//! never a further `stream_settle` call against that escrow (`Degraded`
+//! fails the same `state == Funded` guard `Completed`/`Refunded` already
+//! fail).
+//!
+//! **Liveness for self-service refund.** `refund_escrow`'s window (ADR-029
+//! Sec4.3) generalizes from "elapsed since `funded_at`" to "elapsed since
+//! `last_streamed_at`, or `funded_at` if nothing has streamed yet" -- an
+//! actively-streamed lease keeps resetting its own liveness clock with every
+//! accepted evidence submission, so a payer cannot self-refund out from
+//! under a provider who is genuinely, verifiably still delivering service.
+//! Only a stream that has gone silent for a full `RefundWindow` becomes
+//! self-service refundable, and only for the *unstreamed remainder*
+//! (`max_charge - cumulative_charged`) -- what has already been paid out on
+//! verified evidence is gone from this escrow's reservation and cannot be
+//! reclaimed by a refund, matching the "settles exactly once, no double
+//! payment" requirement precisely: money that already left the reservation
+//! is not double-counted as still-refundable.
+//!
+//! **Dispute mid-stream.** No new mechanism: because a streaming escrow
+//! stays in `EscrowState::Funded` between calls, [`Pallet::dispute_escrow`]'s
+//! existing "disputable from `Funded` at any time" arm already covers it
+//! unchanged. [`Pallet::resolve_dispute`]'s `PayProvider`/`RefundPayer`
+//! arithmetic is generalized the same way `complete_and_payout` is: bounded
+//! by `max_charge - cumulative_charged` (the genuinely still-reserved
+//! remainder) rather than `max_charge`, and a `PayProvider(amount)` may not
+//! adjudicate a total below what has already been irreversibly streamed
+//! ([`Error::PayoutBelowAlreadyStreamed`]) -- governance can redirect the
+//! *remaining* reservation, never claw back a payment this pallet already
+//! made on cryptographically verified evidence.
+//!
+//! **The slashing seam (issue #52), explicit and undecided by design.**
+//! Issue #52 (provider stake slashing) is not implemented anywhere in this
+//! codebase and is blocked on its own not-yet-accepted ADR (ADR-018 Sec5);
+//! nothing here calls into it or assumes its shape. The seam this pallet
+//! *does* commit to: once a period's charge has been repatriated to the
+//! provider via [`Pallet::stream_settle`] or `complete_and_payout`, those
+//! funds have left this escrow's reservation and this pallet has no
+//! mechanism -- today or seamed in for later -- to pull them back from the
+//! provider's free balance. This is not a gap specific to streaming: it is
+//! the exact same boundary [`Pallet::resolve_dispute`]'s existing
+//! `funds_still_reserved` branch already enforces for a single-shot escrow
+//! disputed after it completed (ADR-029 Sec4.4) -- "already paid" has always
+//! meant "outside this pallet's reach" here, streaming just creates more
+//! opportunities to reach that state mid-lease instead of only at the end.
+//! If a future, separately-ADR'd slashing mechanism needs to claw back a
+//! specific period's payout after the fact, it must act on the provider's
+//! own bonded stake (which does not exist yet either -- ADR-029 Sec5's
+//! finding that `pallet-provider-registry` has no `Currency`/bonding
+//! association still holds), not on this escrow's already-released
+//! reservation. `evidence_hash` in [`Event::EscrowStreamed`] is deliberately
+//! carried through unchanged from `EscrowSettled`'s existing shape so that a
+//! later slashing mechanism has the same hash-correlated handle into #20's
+//! off-chain evidence archive that dispute resolution already relies on.
+//!
+//! **Bounded per-block work, restated.** No `on_initialize`/`on_finalize`
+//! hook is added by this section. `stream_settle`'s cost is one extrinsic's
+//! worth of work, identical in shape to `complete_and_payout`'s existing
+//! cost, independent of how many other escrows exist -- the same "bounded,
+//! doesn't scale with lease count" property `complete_and_payout` already
+//! had, now exercised N times per escrow instead of once.
 
 extern crate alloc;
 
@@ -176,6 +321,7 @@ pub trait WeightInfo {
     fn set_paused() -> Weight;
     fn set_fee_basis_points() -> Weight;
     fn set_treasury_account() -> Weight;
+    fn stream_settle() -> Weight;
 }
 
 impl WeightInfo for () {
@@ -201,6 +347,9 @@ impl WeightInfo for () {
         Weight::from_parts(10_000, 0)
     }
     fn set_treasury_account() -> Weight {
+        Weight::from_parts(10_000, 0)
+    }
+    fn stream_settle() -> Weight {
         Weight::from_parts(10_000, 0)
     }
 }
@@ -334,9 +483,30 @@ pub mod pallet {
     )]
     pub enum EscrowState {
         Funded,
+        /// Fully settled with every requested/verified charge honored in
+        /// full -- either the original single-shot `complete_and_payout`
+        /// path (ADR-029), or a streaming escrow whose final period's
+        /// charge exactly used up the remaining `max_charge` without ever
+        /// needing to be capped (see [`Pallet::stream_settle`]'s doc
+        /// comment). Terminal, same as before this pallet gained streaming.
         Completed,
         Refunded,
         Disputed,
+        /// Terminal, streaming-only: a [`Pallet::stream_settle`] call's
+        /// verified charge for its period exceeded what remained of
+        /// `max_charge`, so the payout was capped at the remainder instead
+        /// of erroring the call outright (issue #51's "degrades explicitly,
+        /// never silently accrues unpayable debt" requirement). Distinct
+        /// from `Completed` specifically so an off-chain consumer (the
+        /// orchestrator, most obviously) can tell "this lease was cut short
+        /// because the payer's authorized funds ran out" apart from "this
+        /// lease's usage was fully honored to the end" without inspecting
+        /// event history. No further `stream_settle`/`complete_and_payout`
+        /// call succeeds against a `Degraded` escrow (same `state ==
+        /// Funded` guard `Completed`/`Refunded` already fail); it remains
+        /// disputable within `DisputeWindow`, exactly like `Completed`/
+        /// `Refunded`.
+        Degraded,
     }
 
     #[derive(
@@ -374,6 +544,37 @@ pub mod pallet {
         /// already-adjudicated escrow be disputed and re-resolved without
         /// bound (see the module doc comment's fix-history note).
         pub disputed_once: bool,
+        /// Streaming settlement (issue #51): the sum of every period charge
+        /// already repatriated out of this escrow's reservation, whether by
+        /// [`Pallet::stream_settle`] or (for the final period) by
+        /// `complete_and_payout`. Defaults to zero at [`Pallet::fund_escrow`]
+        /// time. `max_charge - cumulative_charged` is always the amount
+        /// still genuinely reserved for this escrow specifically -- every
+        /// cap check and remainder computation in this pallet is expressed
+        /// relative to this field so a non-streamed escrow (which never
+        /// moves it off zero) sees byte-for-byte the same arithmetic this
+        /// pallet always used. See the module doc comment's "Streaming
+        /// settlement" section for the full design.
+        pub cumulative_charged: BalanceOf<T>,
+        /// Streaming settlement: the `period_end` of the last evidence
+        /// record this escrow has accepted (via `stream_settle` or
+        /// `complete_and_payout`), defaulting to zero at funding time. A
+        /// later call's `evidence.period_start` must be `>=` this value
+        /// ([`Error::MeteringPeriodOverlap`]) -- closes a double-accrual
+        /// vector the `sequence` replay check alone does not: `sequence`
+        /// only has to increase, it does not police *which* period range a
+        /// given sequence number claims, so without this check a forged
+        /// record could re-claim an already-paid period under a fresh,
+        /// higher sequence and be paid twice for the same usage window.
+        pub last_period_end: BlockNumberFor<T>,
+        /// Streaming settlement: the block of the most recent successful
+        /// `stream_settle` call, if any. `None` means streaming has never
+        /// been used for this escrow. Backs `refund_escrow`'s liveness
+        /// window: an actively-streamed escrow resets its own refund
+        /// eligibility clock with every accepted period, so a payer cannot
+        /// self-refund out from under a provider who is verifiably still
+        /// delivering service (see the module doc comment).
+        pub last_streamed_at: Option<BlockNumberFor<T>>,
     }
 
     /// Signed, hashed, bounded, replay-resistant usage evidence (ADR-029
@@ -584,6 +785,39 @@ pub mod pallet {
             fee_amount: BalanceOf<T>,
             treasury_account: T::AccountId,
         },
+        /// Streaming settlement (issue #51): one [`Pallet::stream_settle`]
+        /// call accepted and paid out a period's verified usage without
+        /// closing the escrow. `period_charged` is what this specific call
+        /// moved (net of nothing -- this is the gross charge before the
+        /// ADR-030 fee split, matching `EscrowSettled.charged_amount`'s own
+        /// convention of reporting the payer's charge, not the provider's
+        /// net receipt); `cumulative_charged` is the running total across
+        /// every period this escrow has ever streamed, so a consumer does
+        /// not need to replay every prior event to know how much of
+        /// `max_charge` remains. Emitted whether or not this call also
+        /// triggered [`Event::EscrowDegraded`] below.
+        EscrowStreamed {
+            lease_id: LeaseId,
+            provider: T::AccountId,
+            period_charged: BalanceOf<T>,
+            cumulative_charged: BalanceOf<T>,
+            evidence_hash: [u8; 32],
+        },
+        /// Streaming settlement: a [`Pallet::stream_settle`] call's
+        /// verified, computed charge for its period exceeded what remained
+        /// of `max_charge`; the payout was capped at the remainder
+        /// (`capped_amount`) instead of erroring the call outright, and the
+        /// escrow moved to the terminal `EscrowState::Degraded`.
+        /// `requested_amount` is the full charge the evidence computed to
+        /// (informational only -- it was never owed beyond `capped_amount`,
+        /// and no debt or further accrual attempt follows this event). See
+        /// the module doc comment's "Explicit degradation" section.
+        EscrowDegraded {
+            lease_id: LeaseId,
+            provider: T::AccountId,
+            capped_amount: BalanceOf<T>,
+            requested_amount: BalanceOf<T>,
+        },
     }
 
     #[pallet::error]
@@ -669,6 +903,20 @@ pub mod pallet {
         /// `TreasuryAccount` configured. Fails closed rather than silently
         /// skipping the fee or crediting it nowhere (ADR-030 Sec3).
         TreasuryAccountNotConfigured,
+        /// Streaming settlement (issue #51): `evidence.period_start` is
+        /// strictly less than `escrow.last_period_end` -- this evidence
+        /// record claims to (at least partially) re-bill a period this
+        /// escrow has already paid for. Closes a double-accrual vector the
+        /// `sequence` replay check does not: `sequence` only has to
+        /// increase, it says nothing about which period range it covers.
+        MeteringPeriodOverlap,
+        /// Streaming settlement: `resolve_dispute`'s `PayProvider(amount)`
+        /// named a total lower than `escrow.cumulative_charged` --
+        /// governance cannot adjudicate a lifetime total below what this
+        /// escrow has already irreversibly streamed to the provider on
+        /// verified evidence. Redirect only the still-reserved remainder
+        /// instead.
+        PayoutBelowAlreadyStreamed,
     }
 
     #[pallet::call]
@@ -730,6 +978,9 @@ pub mod pallet {
                     funded_at,
                     settled_at: None,
                     disputed_once: false,
+                    cumulative_charged: Zero::zero(),
+                    last_period_end: Zero::zero(),
+                    last_streamed_at: None,
                 },
             );
             PayerOpenEscrowCount::<T>::mutate(&payer, |count| *count = count.saturating_add(1));
@@ -765,38 +1016,18 @@ pub mod pallet {
                 escrow.state == EscrowState::Funded,
                 Error::<T>::EscrowNotFunded
             );
-            ensure!(
-                evidence.metering_schema_version == escrow.metering_schema_version,
-                Error::<T>::MeteringSchemaVersionMismatch
-            );
 
-            let public_key = T::ProviderKeyLookup::public_key(&escrow.provider)
-                .ok_or(Error::<T>::ProviderKeyNotFound)?;
-            let message = Self::metering_signing_payload(&evidence);
-            let signature = sp_core::ed25519::Signature::from_raw(evidence.signature);
-            let public = sp_core::ed25519::Public::from_raw(public_key);
+            // Shared with `stream_settle`: schema check, signature
+            // verification, sequence-replay and period-bound/overlap
+            // checks, and `compute_charge` -- see `verify_and_charge`'s own
+            // doc comment. Streaming (issue #51): this cap is expressed
+            // relative to `cumulative_charged`, which stays zero for a
+            // non-streamed escrow, so this reduces to exactly the
+            // pre-streaming `charged_amount <= escrow.max_charge` check.
+            let charged_amount = Self::verify_and_charge(&escrow, &evidence)?;
+            let remaining_cap = escrow.max_charge.saturating_sub(escrow.cumulative_charged);
             ensure!(
-                sp_io::crypto::ed25519_verify(&signature, &message, &public),
-                Error::<T>::InvalidSignature
-            );
-
-            ensure!(
-                evidence.sequence > escrow.last_evidence_sequence,
-                Error::<T>::EvidenceSequenceReplay
-            );
-            ensure!(
-                evidence.period_end >= evidence.period_start,
-                Error::<T>::InvalidMeteringPeriod
-            );
-            let period_len = evidence.period_end.saturating_sub(evidence.period_start);
-            ensure!(
-                period_len <= T::MaxMeteringPeriodSeconds::get(),
-                Error::<T>::MeteringPeriodTooLong
-            );
-
-            let charged_amount = Self::compute_charge(&escrow.price, &evidence)?;
-            ensure!(
-                charged_amount <= escrow.max_charge,
+                charged_amount <= remaining_cap,
                 Error::<T>::ChargedAmountExceedsCap
             );
 
@@ -836,7 +1067,13 @@ pub mod pallet {
                     treasury_account: treasury,
                 });
             }
-            let remainder = escrow.max_charge.saturating_sub(charged_amount);
+            // Streaming: the remainder returned to the payer is measured
+            // against `remaining_cap`, not the escrow's full `max_charge`
+            // -- what was already streamed in earlier periods has already
+            // left this escrow's reservation and must not be counted here
+            // a second time. Reduces to the original `max_charge -
+            // charged_amount` when `cumulative_charged == 0`.
+            let remainder = remaining_cap.saturating_sub(charged_amount);
             if !remainder.is_zero() {
                 let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
                 ensure!(
@@ -848,6 +1085,8 @@ pub mod pallet {
             let evidence_hash = evidence.blake2_256();
             escrow.state = EscrowState::Completed;
             escrow.last_evidence_sequence = evidence.sequence;
+            escrow.last_period_end = evidence.period_end;
+            escrow.cumulative_charged = escrow.cumulative_charged.saturating_add(charged_amount);
             let now = frame_system::Pallet::<T>::block_number();
             escrow.settled_at = Some(now);
             let provider = escrow.provider.clone();
@@ -880,18 +1119,37 @@ pub mod pallet {
                 Error::<T>::EscrowNotFunded
             );
             let now = frame_system::Pallet::<T>::block_number();
-            let unlock_at = escrow.funded_at.saturating_add(T::RefundWindow::get());
+            // Streaming (issue #51): the liveness anchor is the last
+            // accepted `stream_settle` call, not `funded_at`, whenever
+            // streaming has actually happened -- an actively-streamed
+            // escrow keeps resetting its own refund-eligibility clock, so a
+            // payer cannot self-refund out from under a provider who is
+            // verifiably still delivering service. Falls back to
+            // `funded_at` when `last_streamed_at` is `None`, i.e. identical
+            // to the pre-streaming behavior for an escrow that never
+            // streamed.
+            let liveness_anchor = escrow.last_streamed_at.unwrap_or(escrow.funded_at);
+            let unlock_at = liveness_anchor.saturating_add(T::RefundWindow::get());
             ensure!(now >= unlock_at, Error::<T>::RefundWindowNotElapsed);
 
-            let unreleased = T::Currency::unreserve(&escrow.payer, escrow.max_charge);
-            ensure!(
-                unreleased.is_zero(),
-                Error::<T>::ReserveAccountingInconsistent
-            );
+            // Streaming: only the unstreamed remainder is still genuinely
+            // reserved for this escrow -- `cumulative_charged` has already
+            // left the reservation via `stream_settle` and cannot be
+            // reclaimed by a refund (settles exactly once, no double
+            // payment; see the module doc comment). Reduces to the
+            // original `max_charge` when nothing has streamed.
+            let remaining = escrow.max_charge.saturating_sub(escrow.cumulative_charged);
+            if !remaining.is_zero() {
+                let unreleased = T::Currency::unreserve(&escrow.payer, remaining);
+                ensure!(
+                    unreleased.is_zero(),
+                    Error::<T>::ReserveAccountingInconsistent
+                );
+            }
 
             escrow.state = EscrowState::Refunded;
             escrow.settled_at = Some(now);
-            let amount = escrow.max_charge;
+            let amount = remaining;
             let payer = escrow.payer.clone();
             Self::decrement_payer_open_count(&escrow.payer);
             Escrows::<T>::insert(lease_id, escrow);
@@ -930,13 +1188,18 @@ pub mod pallet {
 
             match escrow.state {
                 EscrowState::Funded => {}
-                EscrowState::Completed | EscrowState::Refunded => {
+                EscrowState::Completed | EscrowState::Refunded | EscrowState::Degraded => {
                     // Root-cause fix for the dispute re-arming finding: a
                     // second dispute of an escrow that already used its one
                     // lifetime dispute opportunity must be rejected
                     // outright, before even looking at timing -- otherwise
                     // `resolve_dispute` resetting `settled_at` on every
                     // resolution would re-open this window indefinitely.
+                    // `Degraded` (streaming, issue #51) is treated exactly
+                    // like `Completed`/`Refunded` here: it is just as
+                    // terminal, and disputing "the cap-cutoff was unfair"
+                    // deserves the same one-shot post-settlement window as
+                    // any other settled outcome.
                     ensure!(!escrow.disputed_once, Error::<T>::EscrowAlreadyDisputedOnce);
                     let settled_at = escrow.settled_at.unwrap_or(escrow.funded_at);
                     let now = frame_system::Pallet::<T>::block_number();
@@ -985,6 +1248,13 @@ pub mod pallet {
             // for it here.
             let funds_still_reserved = escrow.settled_at.is_none();
             let max_charge = escrow.max_charge;
+            // Streaming (issue #51): what genuinely remains reserved for
+            // *this* escrow, net of every period already paid out via
+            // `stream_settle`/`complete_and_payout`. Zero when nothing has
+            // streamed, so every formula below that uses this instead of
+            // `max_charge` reduces to the pre-streaming one exactly as
+            // `complete_and_payout`'s own generalization does.
+            let remaining_cap = max_charge.saturating_sub(escrow.cumulative_charged);
 
             // Fail-safe for a confirmed, irrecoverable reserve shortfall
             // (see the PR description for the mechanism): unlike
@@ -1007,6 +1277,19 @@ pub mod pallet {
             let (provider_amount, payer_amount, final_state, shortfall) = match outcome {
                 DisputeOutcome::PayProvider(amount) => {
                     ensure!(amount <= max_charge, Error::<T>::PayoutExceedsCap);
+                    // Streaming: governance adjudicates a *lifetime* total
+                    // for the provider (same meaning `amount` always had),
+                    // but may never adjudicate below what this escrow has
+                    // already irreversibly streamed on verified evidence --
+                    // that money already left this pallet's reach (see the
+                    // module doc comment's slashing-seam section). Only the
+                    // still-reserved `remaining_cap` is ever actually
+                    // movable by this call.
+                    ensure!(
+                        amount >= escrow.cumulative_charged,
+                        Error::<T>::PayoutBelowAlreadyStreamed
+                    );
+                    let incremental = amount.saturating_sub(escrow.cumulative_charged);
                     // Escrow-scoped fix for the account-level shortfall
                     // finding: if this escrow's funds were *already*
                     // released before this dispute was even raised (it
@@ -1035,26 +1318,31 @@ pub mod pallet {
                             EscrowState::Completed,
                             max_charge,
                         )
-                    } else if T::Currency::reserved_balance(&escrow.payer) < max_charge {
+                    } else if T::Currency::reserved_balance(&escrow.payer) < remaining_cap {
                         // Fail-safe path: confirmed shortfall. No protocol
                         // fee is taken; whatever is actually available is
                         // paid to the provider first, exactly as this
-                        // fail-safe behaved before ADR-030 existed.
+                        // fail-safe behaved before ADR-030 existed. Bounded
+                        // by `remaining_cap`/`incremental` (streaming,
+                        // issue #51), not the escrow's full `max_charge`/
+                        // `amount` -- anything already streamed has already
+                        // left the reservation and is not part of what this
+                        // call could possibly still be short on.
                         let unmoved = T::Currency::repatriate_reserved(
                             &escrow.payer,
                             &escrow.provider,
-                            amount,
+                            incremental,
                             BalanceStatus::Free,
                         )
                         .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
-                        let paid = amount.saturating_sub(unmoved);
-                        let remainder = max_charge.saturating_sub(amount);
+                        let paid = incremental.saturating_sub(unmoved);
+                        let remainder = remaining_cap.saturating_sub(incremental);
                         let mut returned = Zero::zero();
                         if !remainder.is_zero() {
                             let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
                             returned = remainder.saturating_sub(unreleased);
                         }
-                        let shortfall = max_charge.saturating_sub(paid.saturating_add(returned));
+                        let shortfall = remaining_cap.saturating_sub(paid.saturating_add(returned));
                         (paid, returned, EscrowState::Completed, shortfall)
                     } else {
                         // Normal path: reserved funds are fully intact, so
@@ -1064,9 +1352,14 @@ pub mod pallet {
                         // governance affirming delivery is the same "value
                         // was actually delivered" condition as on-chain
                         // verified completion, so the same split applies
-                        // to the adjudicated `amount`.
+                        // to the adjudicated amount. Applied to
+                        // `incremental`, not the full lifetime `amount`:
+                        // any portion already streamed already paid its fee
+                        // at the time it streamed (`stream_settle`'s own
+                        // `split_fee` call) -- taxing it again here would
+                        // double-charge the fee on that portion.
                         let (paid_to_provider, fee_amount, treasury_account) =
-                            Self::split_fee(amount)?;
+                            Self::split_fee(incremental)?;
                         if !paid_to_provider.is_zero() {
                             let shortfall = T::Currency::repatriate_reserved(
                                 &escrow.payer,
@@ -1100,7 +1393,13 @@ pub mod pallet {
                                 treasury_account: treasury,
                             });
                         }
-                        let remainder = max_charge.saturating_sub(amount);
+                        // Equal to `max_charge.saturating_sub(amount)` --
+                        // `remaining_cap - incremental == (max_charge -
+                        // cumulative_charged) - (amount - cumulative_charged)
+                        // == max_charge - amount` -- expressed this way so
+                        // it visibly shares the same `remaining_cap`/
+                        // `incremental` pair the two branches above use.
+                        let remainder = remaining_cap.saturating_sub(incremental);
                         if !remainder.is_zero() {
                             let unreleased = T::Currency::unreserve(&escrow.payer, remainder);
                             ensure!(
@@ -1148,8 +1447,14 @@ pub mod pallet {
                             max_charge,
                         )
                     } else {
-                        let unreleased = T::Currency::unreserve(&escrow.payer, max_charge);
-                        let returned = max_charge.saturating_sub(unreleased);
+                        // Streaming: only the unstreamed remainder is
+                        // returned -- what already streamed to the
+                        // provider on verified evidence cannot be clawed
+                        // back by a `RefundPayer` finding (same boundary as
+                        // the `PayProvider` arm above; see the module doc
+                        // comment's slashing-seam section).
+                        let unreleased = T::Currency::unreserve(&escrow.payer, remaining_cap);
+                        let returned = remaining_cap.saturating_sub(unreleased);
                         (Zero::zero(), returned, EscrowState::Refunded, unreleased)
                     }
                 }
@@ -1158,6 +1463,12 @@ pub mod pallet {
             escrow.state = final_state;
             let now = frame_system::Pallet::<T>::block_number();
             escrow.settled_at = Some(now);
+            // This call always fully terminates the escrow's fund
+            // lifecycle (paid, refunded, or honestly written off) --
+            // `cumulative_charged` is set to `max_charge` so
+            // `max_charge - cumulative_charged` reads as zero for any
+            // future observer, matching every other terminal exit path.
+            escrow.cumulative_charged = max_charge;
             if funds_still_reserved {
                 Self::decrement_payer_open_count(&escrow.payer);
             }
@@ -1235,6 +1546,126 @@ pub mod pallet {
             });
             Ok(())
         }
+
+        /// Streaming settlement (issue #51): verify a provider-signed
+        /// [`MeteringSummary`] on-chain exactly like `complete_and_payout`
+        /// does, and pay out that period's charge -- but, unlike
+        /// `complete_and_payout`, **without** closing the escrow: it stays
+        /// `Funded` and may accept another period next time this is called.
+        /// Permissionless, same trust model as `complete_and_payout`
+        /// (ADR-029 Sec4.2/Sec9). See the module doc comment's "Streaming
+        /// settlement" section for the full design, including why this is
+        /// a distinct call rather than a flag on `complete_and_payout`
+        /// (this call caps-and-degrades on an over-cap period instead of
+        /// erroring the whole call, a deliberate divergence from
+        /// `complete_and_payout`'s fail-closed convention -- see
+        /// [`Error::ChargedAmountExceedsCap`] vs [`EscrowState::Degraded`]).
+        #[pallet::call_index(8)]
+        #[pallet::weight(T::WeightInfo::stream_settle())]
+        pub fn stream_settle(
+            origin: OriginFor<T>,
+            lease_id: LeaseId,
+            evidence: MeteringSummary<BlockNumberFor<T>>,
+        ) -> DispatchResult {
+            let _submitter = ensure_signed(origin)?;
+            ensure!(!EscrowPaused::<T>::get(), Error::<T>::Paused);
+            ensure!(evidence.lease_id == lease_id, Error::<T>::LeaseIdMismatch);
+
+            let mut escrow = Escrows::<T>::get(lease_id).ok_or(Error::<T>::EscrowNotFound)?;
+            ensure!(
+                escrow.state == EscrowState::Funded,
+                Error::<T>::EscrowNotFunded
+            );
+
+            let period_charge = Self::verify_and_charge(&escrow, &evidence)?;
+            let remaining_cap = escrow.max_charge.saturating_sub(escrow.cumulative_charged);
+
+            // Explicit degradation (module doc comment): cap the payout at
+            // what remains instead of erroring the whole call, so verified
+            // usage that *is* affordable is never lost. Only strictly
+            // exceeding the cap counts as degraded -- a period that exactly
+            // exhausts `remaining_cap` is a full, honored payout, handled
+            // identically to `complete_and_payout`'s own "exact max_charge"
+            // case (`EscrowState::Completed`, not `Degraded`).
+            let (this_charge, capped) = if period_charge > remaining_cap {
+                (remaining_cap, true)
+            } else {
+                (period_charge, false)
+            };
+
+            let (provider_amount, fee_amount, treasury_account) = Self::split_fee(this_charge)?;
+            if !provider_amount.is_zero() {
+                let shortfall = T::Currency::repatriate_reserved(
+                    &escrow.payer,
+                    &escrow.provider,
+                    provider_amount,
+                    BalanceStatus::Free,
+                )
+                .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                ensure!(
+                    shortfall.is_zero(),
+                    Error::<T>::ReserveAccountingInconsistent
+                );
+            }
+            if !fee_amount.is_zero() {
+                let treasury = treasury_account.ok_or(Error::<T>::TreasuryAccountNotConfigured)?;
+                let shortfall = T::Currency::repatriate_reserved(
+                    &escrow.payer,
+                    &treasury,
+                    fee_amount,
+                    BalanceStatus::Free,
+                )
+                .map_err(|_| Error::<T>::ReserveAccountingInconsistent)?;
+                ensure!(
+                    shortfall.is_zero(),
+                    Error::<T>::ReserveAccountingInconsistent
+                );
+                Self::deposit_event(Event::ProtocolFeeCollected {
+                    lease_id,
+                    fee_amount,
+                    treasury_account: treasury,
+                });
+            }
+
+            let evidence_hash = evidence.blake2_256();
+            let now = frame_system::Pallet::<T>::block_number();
+            escrow.cumulative_charged = escrow.cumulative_charged.saturating_add(this_charge);
+            escrow.last_evidence_sequence = evidence.sequence;
+            escrow.last_period_end = evidence.period_end;
+            escrow.last_streamed_at = Some(now);
+            let provider = escrow.provider.clone();
+            let cumulative_charged = escrow.cumulative_charged;
+            let exhausted = cumulative_charged == escrow.max_charge;
+            if capped {
+                escrow.state = EscrowState::Degraded;
+                escrow.settled_at = Some(now);
+                Self::decrement_payer_open_count(&escrow.payer);
+            } else if exhausted {
+                escrow.state = EscrowState::Completed;
+                escrow.settled_at = Some(now);
+                Self::decrement_payer_open_count(&escrow.payer);
+            }
+            // Otherwise the escrow stays `Funded`: no `settled_at`, still
+            // counted as an open escrow for `PayerOpenEscrowCount`.
+            Escrows::<T>::insert(lease_id, escrow);
+
+            Self::deposit_event(Event::EscrowStreamed {
+                lease_id,
+                provider: provider.clone(),
+                period_charged: this_charge,
+                cumulative_charged,
+                evidence_hash,
+            });
+            if capped {
+                Self::deposit_event(Event::EscrowDegraded {
+                    lease_id,
+                    provider,
+                    capped_amount: this_charge,
+                    requested_amount: period_charge,
+                });
+            }
+            Ok(())
+        }
     }
 
     impl<T: Config> Pallet<T> {
@@ -1261,6 +1692,58 @@ pub mod pallet {
                 evidence.metering_schema_version,
             )
                 .encode()
+        }
+
+        /// Shared verification pipeline for `complete_and_payout` and
+        /// `stream_settle` (issue #51): schema-version match, on-chain
+        /// Ed25519 signature verification against the provider's
+        /// registered key, sequence-replay protection, period-bound
+        /// checks, and the new period-overlap check (see
+        /// [`Error::MeteringPeriodOverlap`]'s doc comment), ending with
+        /// [`Self::compute_charge`]. Returns the *period's own* charge,
+        /// uncapped by anything escrow-specific -- callers apply their own
+        /// cap semantics (`complete_and_payout` errors on over-cap,
+        /// `stream_settle` caps-and-degrades; see the module doc comment).
+        /// One source of truth for every check both extrinsics must apply
+        /// identically, so they cannot silently drift apart.
+        fn verify_and_charge(
+            escrow: &EscrowRecord<T>,
+            evidence: &MeteringSummary<BlockNumberFor<T>>,
+        ) -> Result<BalanceOf<T>, DispatchError> {
+            ensure!(
+                evidence.metering_schema_version == escrow.metering_schema_version,
+                Error::<T>::MeteringSchemaVersionMismatch
+            );
+
+            let public_key = T::ProviderKeyLookup::public_key(&escrow.provider)
+                .ok_or(Error::<T>::ProviderKeyNotFound)?;
+            let message = Self::metering_signing_payload(evidence);
+            let signature = sp_core::ed25519::Signature::from_raw(evidence.signature);
+            let public = sp_core::ed25519::Public::from_raw(public_key);
+            ensure!(
+                sp_io::crypto::ed25519_verify(&signature, &message, &public),
+                Error::<T>::InvalidSignature
+            );
+
+            ensure!(
+                evidence.sequence > escrow.last_evidence_sequence,
+                Error::<T>::EvidenceSequenceReplay
+            );
+            ensure!(
+                evidence.period_end >= evidence.period_start,
+                Error::<T>::InvalidMeteringPeriod
+            );
+            let period_len = evidence.period_end.saturating_sub(evidence.period_start);
+            ensure!(
+                period_len <= T::MaxMeteringPeriodSeconds::get(),
+                Error::<T>::MeteringPeriodTooLong
+            );
+            ensure!(
+                evidence.period_start >= escrow.last_period_end,
+                Error::<T>::MeteringPeriodOverlap
+            );
+
+            Self::compute_charge(&escrow.price, evidence)
         }
 
         /// `cpu_core_seconds * price.cpu_core_second + ram_mb_seconds *

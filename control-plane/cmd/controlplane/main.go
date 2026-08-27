@@ -20,8 +20,10 @@ import (
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/dashboard"
+	"github.com/openinfra/network/internal/openstackapi"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/pki"
+	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/providerjoin"
 	"github.com/openinfra/network/internal/ratelimit"
 	"github.com/openinfra/network/internal/resourcemarket"
@@ -173,6 +175,18 @@ func run() error {
 	// validation/hashing/persistence path a `workloadctl submit` gRPC
 	// call would.
 	workloadService := workloadapi.NewService(workloadRepository)
+	// ADR-033 §7: the operator-configured, narrow guest-image allowlist a
+	// VM workload's image URL must match -- comma-separated host/path
+	// prefixes (e.g. "https://cloud-images.ubuntu.com/,https://cloud.debian.org/images/cloud/"),
+	// matching this file's existing envOrDefault convention for
+	// operator tunables. Deliberately defaults to empty, not a built-in
+	// guess at "known-good" URLs this repository cannot actually vet on
+	// an operator's behalf -- an empty/unset allowlist means every VM
+	// workload submission is rejected (see Service.vmImageAllowlist's own
+	// doc comment), the same fail-closed default agent-core's
+	// `max_vm_workloads`/`vm_enabled` already use on the Agent side of
+	// this same ADR.
+	workloadService.SetVMImageAllowlist(splitNonEmpty(envOrDefault("VM_IMAGE_ALLOWLIST", "")))
 	providerRepository := providerjoin.NewPostgresRepository(pool)
 	service := providerjoin.NewService(providerRepository, providerjoin.NewRedisHeartbeatStore(redisClient), registrar)
 	service.SetWorkloadService(workloadService)
@@ -264,7 +278,34 @@ func run() error {
 		MaxHeaderBytes:    16 << 10,
 	}
 
-	serveError := make(chan error, 2)
+	// ADR-031 §2: a third HTTP surface, OpenStack-shaped REST/JSON, on
+	// its own listener -- issue #23's Keystone token bridge today,
+	// #24/#25/#26's Nova/Neutron/Glance/Cinder route groups extending the
+	// same internal/openstackapi.Server.Handler() in their own PRs.
+	// A separate listener (not merged into httpServer above), because
+	// the ADR is explicit this is its own wire surface and a JSON-only
+	// API has no business sharing internal/dashboard's HTML-serving
+	// CSP/asset routes.
+	openstackAPIAddress := envOrDefault("OPENSTACK_API_HTTP_ADDR", "127.0.0.1:8087")
+	openstackAPIListener, err := loopbackHTTPListener(openstackAPIAddress, "OPENINFRA_DEV_OPENSTACK_API_INSECURE",
+		"OpenStack API surface must bind to loopback; local Compose may explicitly set OPENINFRA_DEV_OPENSTACK_API_INSECURE=true")
+	if err != nil {
+		return err
+	}
+	defer openstackAPIListener.Close()
+	openstackAPIBaseURL := envOrDefault("OPENSTACK_API_BASE_URL", "http://"+openstackAPIAddress)
+	openstackTokenRateLimit := envIntOrDefault("OPENSTACK_TOKEN_RATE_LIMIT_PER_MINUTE", 30)
+	openstackTokenLimiter := ratelimit.NewRedisLimiter(redisClient, openstackTokenRateLimit, 60)
+	openstackAPIServer := &http.Server{
+		Handler:           openstackapi.New(pool, userRepository, projects.NewPostgresRepository(pool), workloadService, workloadRepository, directory, openstackAPIBaseURL, openstackTokenLimiter).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+
+	serveError := make(chan error, 3)
 	go func() {
 		slog.Info("Control Plane gRPC listening", "address", address)
 		serveError <- server.Serve(listener)
@@ -272,6 +313,10 @@ func run() error {
 	go func() {
 		slog.Info("Control Plane dashboard listening", "address", httpAddress)
 		serveError <- httpServer.Serve(httpListener)
+	}()
+	go func() {
+		slog.Info("Control Plane OpenStack API listening", "address", openstackAPIAddress)
+		serveError <- openstackAPIServer.Serve(openstackAPIListener)
 	}()
 
 	select {
@@ -284,6 +329,9 @@ func run() error {
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutdown dashboard: %w", err)
 		}
+		if err := openstackAPIServer.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shutdown OpenStack API: %w", err)
+		}
 		return nil
 	case err := <-serveError:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -294,17 +342,29 @@ func run() error {
 }
 
 func safeHTTPListener(address string) (net.Listener, error) {
+	return loopbackHTTPListener(address, "OPENINFRA_DEV_DASHBOARD_INSECURE",
+		"dashboard without authentication must bind to loopback; local Compose may explicitly set OPENINFRA_DEV_DASHBOARD_INSECURE=true")
+}
+
+// loopbackHTTPListener is safeHTTPListener's general form, reused by
+// internal/openstackapi's listener (below) so a second unauthenticated-
+// by-default HTTP surface gets the exact same loopback-by-default
+// posture with its own dedicated escape-hatch env var, rather than
+// silently reusing the dashboard's flag (which would let one insecure
+// flag quietly widen two different surfaces at once) or duplicating this
+// function's logic a second time.
+func loopbackHTTPListener(address, insecureEnvVar, insecureMessage string) (net.Listener, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, fmt.Errorf("parse dashboard address: %w", err)
+		return nil, fmt.Errorf("parse listen address: %w", err)
 	}
 	ip := net.ParseIP(host)
-	if (ip == nil || !ip.IsLoopback()) && !strings.EqualFold(os.Getenv("OPENINFRA_DEV_DASHBOARD_INSECURE"), "true") {
-		return nil, errors.New("dashboard without authentication must bind to loopback; local Compose may explicitly set OPENINFRA_DEV_DASHBOARD_INSECURE=true")
+	if (ip == nil || !ip.IsLoopback()) && !strings.EqualFold(os.Getenv(insecureEnvVar), "true") {
+		return nil, errors.New(insecureMessage)
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		return nil, fmt.Errorf("listen dashboard on %s: %w", address, err)
+		return nil, fmt.Errorf("listen on %s: %w", address, err)
 	}
 	return listener, nil
 }
@@ -408,6 +468,28 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// splitNonEmpty splits a comma-separated operator-supplied list (e.g.
+// VM_IMAGE_ALLOWLIST), trims whitespace around each entry, and drops empty
+// entries (a leading/trailing/doubled comma must not silently become an
+// empty-string allowlist entry that then matches nothing forever, nor -- if
+// a caller ever treated empty specially -- something unintended). An empty
+// or unset input yields an empty (fail-closed) slice, not a slice
+// containing one empty string.
+func splitNonEmpty(csv string) []string {
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }
 
 func envIntOrDefault(name string, fallback int) int {

@@ -135,6 +135,114 @@ func TestDeployRequestCarriesLeaseEnd(t *testing.T) {
 	}
 }
 
+// TestDeployRequestCarriesVmRuntimeSelectorAndSpec is ADR-033 §9's
+// contract-conformance case (issue #168): DeployRequest.runtime (field 6)
+// and DeployRequest.vm (field 7) round-trip through the wire unchanged
+// and land on the exact field numbers this implementation settled on --
+// pinning the wire contract the same way TestDeployRequestCarriesLeaseEnd
+// above pins ADR-028's lease_end field. Also pins RUNTIME_UNSPECIFIED = 0
+// (proto3's zero value), the backward-compatibility property the whole
+// routing design (agent-executor's RoutingExecutor) depends on: any
+// DeployRequest built before this field existed decodes with runtime == 0
+// and must be treated identically to RUNTIME_CONTAINER.
+func TestDeployRequestCarriesVmRuntimeSelectorAndSpec(t *testing.T) {
+	if agentv1.Runtime_RUNTIME_UNSPECIFIED != 0 {
+		t.Fatal("Runtime's zero value must stay RUNTIME_UNSPECIFIED for backward compatibility")
+	}
+	request := &agentv1.DeployRequest{
+		WorkloadId: "workload-1",
+		Runtime:    agentv1.Runtime_RUNTIME_VM,
+		Vm:         &agentv1.VmSpec{VmImageUrl: "https://example.com/image.qcow2", VmImageSha256: "aa"},
+	}
+	encoded, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal DeployRequest: %v", err)
+	}
+	var decoded agentv1.DeployRequest
+	if err := proto.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal DeployRequest: %v", err)
+	}
+	if decoded.Runtime != agentv1.Runtime_RUNTIME_VM {
+		t.Fatalf("DeployRequest.Runtime round-trip = %v, want RUNTIME_VM", decoded.Runtime)
+	}
+	if decoded.Vm == nil || decoded.Vm.VmImageUrl != "https://example.com/image.qcow2" || decoded.Vm.VmImageSha256 != "aa" {
+		t.Fatalf("DeployRequest.Vm round-trip = %+v, want the original VmSpec", decoded.Vm)
+	}
+	fields := agentv1.File_openinfra_agent_v1_agent_proto.Messages().ByName("DeployRequest").Fields()
+	if field := fields.ByName("runtime"); field == nil || field.Number() != 6 {
+		t.Fatalf("DeployRequest.runtime must be field 6, got %+v", field)
+	}
+	if field := fields.ByName("vm"); field == nil || field.Number() != 7 {
+		t.Fatalf("DeployRequest.vm must be field 7, got %+v", field)
+	}
+}
+
+// TestWorkloadConstraintsCarriesRequiresVm is ADR-033 §7's
+// contract-conformance case (issue #166): WorkloadConstraints.requires_vm
+// (field 5) round-trips, and SubmitWorkloadRequest.vm_image_sha256
+// (field 4) round-trips alongside it -- the two fields the scheduler's
+// fail-closed VM-capability gate and workloadapi's VM image validation
+// both depend on.
+func TestWorkloadConstraintsCarriesRequiresVm(t *testing.T) {
+	constraints := &sharedv1.WorkloadConstraints{RequiresVm: true}
+	constraintsBytes, err := proto.Marshal(constraints)
+	if err != nil {
+		t.Fatalf("marshal WorkloadConstraints: %v", err)
+	}
+	var decodedConstraints sharedv1.WorkloadConstraints
+	if err := proto.Unmarshal(constraintsBytes, &decodedConstraints); err != nil {
+		t.Fatalf("unmarshal WorkloadConstraints: %v", err)
+	}
+	if !decodedConstraints.RequiresVm {
+		t.Fatal("WorkloadConstraints.RequiresVm did not round-trip as true")
+	}
+	constraintsFields := sharedv1.File_openinfra_shared_v1_shared_proto.Messages().ByName("WorkloadConstraints").Fields()
+	if field := constraintsFields.ByName("requires_vm"); field == nil || field.Number() != 5 {
+		t.Fatalf("WorkloadConstraints.requires_vm must be field 5, got %+v", field)
+	}
+
+	submit := &controlplanev1.SubmitWorkloadRequest{VmImageSha256: "aa"}
+	submitBytes, err := proto.Marshal(submit)
+	if err != nil {
+		t.Fatalf("marshal SubmitWorkloadRequest: %v", err)
+	}
+	var decodedSubmit controlplanev1.SubmitWorkloadRequest
+	if err := proto.Unmarshal(submitBytes, &decodedSubmit); err != nil {
+		t.Fatalf("unmarshal SubmitWorkloadRequest: %v", err)
+	}
+	if decodedSubmit.VmImageSha256 != "aa" {
+		t.Fatalf("SubmitWorkloadRequest.VmImageSha256 round-trip = %q, want %q", decodedSubmit.VmImageSha256, "aa")
+	}
+	submitFields := controlplanev1.File_openinfra_controlplane_v1_control_plane_proto.Messages().ByName("SubmitWorkloadRequest").Fields()
+	if field := submitFields.ByName("vm_image_sha256"); field == nil || field.Number() != 4 {
+		t.Fatalf("SubmitWorkloadRequest.vm_image_sha256 must be field 4, got %+v", field)
+	}
+}
+
+// TestResourceCapabilityCarriesVirtualizationCapable is ADR-033 §7's
+// contract-conformance case for the Agent-to-Control-Plane half: the
+// field predates this PR (PR #169) but the scheduler's fail-closed gate
+// added here is the field's first real consumer, so pinning its wire
+// shape belongs with the rest of this PR's contract tests.
+func TestResourceCapabilityCarriesVirtualizationCapable(t *testing.T) {
+	capability := &sharedv1.ResourceCapability{VirtualizationCapable: true}
+	encoded, err := proto.Marshal(capability)
+	if err != nil {
+		t.Fatalf("marshal ResourceCapability: %v", err)
+	}
+	var decoded sharedv1.ResourceCapability
+	if err := proto.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal ResourceCapability: %v", err)
+	}
+	if !decoded.VirtualizationCapable {
+		t.Fatal("ResourceCapability.VirtualizationCapable did not round-trip as true")
+	}
+	fields := sharedv1.File_openinfra_shared_v1_shared_proto.Messages().ByName("ResourceCapability").Fields()
+	if field := fields.ByName("virtualization_capable"); field == nil || field.Number() != 10 {
+		t.Fatalf("ResourceCapability.virtualization_capable must be field 10, got %+v", field)
+	}
+}
+
 // TestHeartbeatPayloadCarriesWorkloadStatus is ADR-028 §4's
 // contract-conformance case: HeartbeatSigningPayload.workload_status
 // (field 7) round-trips, and AgentWorkloadPhase is a distinct enum from

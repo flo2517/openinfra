@@ -18,7 +18,7 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 }
 
 func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload) (Workload, error) {
-	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, owner_id, request_hash, definition, image, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, reserved_ingress_mbps, reserved_egress_mbps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.OwnerID, candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB, candidate.ReservedIngressMbps, candidate.ReservedEgressMbps)
+	command, err := r.pool.Exec(ctx, `INSERT INTO workloads (workload_id, request_id, owner_id, project_id, request_hash, definition, image, vm_image_sha256, state, created_at, updated_at, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, reserved_ingress_mbps, reserved_egress_mbps) VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT DO NOTHING`, candidate.WorkloadID, candidate.RequestID, candidate.OwnerID, nullableID(candidate.ProjectID), candidate.RequestHash[:], candidate.Definition, candidate.Image, candidate.VmImageSha256, candidate.State, candidate.CreatedAt, candidate.UpdatedAt, candidate.ReservedCPUMillicores, candidate.ReservedRAMMB, candidate.ReservedStorageGB, candidate.ReservedIngressMbps, candidate.ReservedEgressMbps)
 	if err != nil {
 		return Workload{}, err
 	}
@@ -32,19 +32,82 @@ func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload
 	if err != nil {
 		return Workload{}, err
 	}
-	// The owner_id comparison matters as much as the others: request_id is
-	// globally unique, not per-tenant, so without it a second tenant who
-	// happens to reuse (or guess) another tenant's request_id would be
-	// handed back that tenant's workload_id/definition/image as if it were
-	// an idempotent replay of their own call.
-	if stored.RequestHash != candidate.RequestHash || stored.WorkloadID != candidate.WorkloadID || stored.OwnerID != candidate.OwnerID || !bytes.Equal(stored.Definition, candidate.Definition) || stored.Image != candidate.Image {
+	// The owner_id/project_id comparisons matter as much as the others:
+	// request_id is globally unique, not per-tenant, so without them a
+	// second tenant (or a second project) who happens to reuse (or guess)
+	// another tenant's request_id would be handed back that tenant's
+	// workload_id/definition/image as if it were an idempotent replay of
+	// their own call.
+	if stored.RequestHash != candidate.RequestHash || stored.WorkloadID != candidate.WorkloadID || stored.OwnerID != candidate.OwnerID || stored.ProjectID != candidate.ProjectID || !bytes.Equal(stored.Definition, candidate.Definition) || stored.Image != candidate.Image || stored.VmImageSha256 != candidate.VmImageSha256 {
 		return Workload{}, ErrConflict
 	}
 	return stored, nil
 }
 
+// nullableID converts an empty-string ID (this package's convention for
+// "absent", e.g. Workload.ProjectID when a workload was not created
+// through the OpenStack surface) into a genuine SQL NULL, so it can be
+// bound against a nullable `uuid` column -- passing "" directly would fail
+// uuid parsing instead of storing NULL.
+func nullableID(id string) *string {
+	if id == "" {
+		return nil
+	}
+	return &id
+}
+
 func (r *PostgresRepository) Get(ctx context.Context, workloadID, ownerID string) (Workload, error) {
 	return scanWorkload(r.pool.QueryRow(ctx, selectWorkload+` WHERE workload_id=$1 AND owner_id=$2`, workloadID, ownerID))
+}
+
+// GetByProject is Get's project-scoped counterpart, for
+// internal/openstackapi/nova (ADR-031 §3's "every OpenStack-facing query
+// scopes by project_id the same literal way internal/workloadapi already
+// scopes by owner_id"). A workload belonging to a different project (or
+// not created through the OpenStack surface at all, ProjectID = "") is
+// indistinguishable from a nonexistent one -- the same no-existence-oracle
+// posture Get's owner_id scoping already provides for OwnerID.
+func (r *PostgresRepository) GetByProject(ctx context.Context, workloadID, projectID string) (Workload, error) {
+	return scanWorkload(r.pool.QueryRow(ctx, selectWorkload+` WHERE workload_id=$1 AND project_id=$2`, workloadID, projectID))
+}
+
+// ListByProject lists every workload scoped to projectID, most recent
+// first -- the project-scoped counterpart to internal/dashboard's own
+// owner-scoped `myWorkloads` query, backing GET
+// /v2.1/{project_id}/servers.
+func (r *PostgresRepository) ListByProject(ctx context.Context, projectID string) ([]Workload, error) {
+	rows, err := r.pool.Query(ctx, selectWorkload+` WHERE project_id=$1 ORDER BY created_at DESC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var workloads []Workload
+	for rows.Next() {
+		workload, err := scanWorkload(rows)
+		if err != nil {
+			return nil, err
+		}
+		workloads = append(workloads, workload)
+	}
+	return workloads, rows.Err()
+}
+
+// ProviderReservedTotals sums reserved_cpu_millicores/ram_mb/storage_gb/
+// ingress_mbps/egress_mbps across every currently-open workload assigned
+// to providerID -- the exact aggregate AssignLease's own atomic capacity
+// check already computes inline (see that method's doc comment). Exported
+// as a read-only helper so a caller outside the commit path (e.g.
+// internal/openstackapi/nova's Placement-shaped "resource provider usage"
+// endpoint) can report the same "how much is committed against this
+// provider" figure without duplicating or drifting from that query.
+func (r *PostgresRepository) ProviderReservedTotals(ctx context.Context, providerID string) (cpuMillicores, ramMB, storageGB, ingressMbps, egressMbps int64, err error) {
+	err = r.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(reserved_cpu_millicores), 0), COALESCE(SUM(reserved_ram_mb), 0), COALESCE(SUM(reserved_storage_gb), 0),
+		       COALESCE(SUM(reserved_ingress_mbps), 0), COALESCE(SUM(reserved_egress_mbps), 0)
+		FROM workloads
+		WHERE provider_id = $1 AND state IN ('LEASE_PENDING', 'LEASED', 'DEPLOYING', 'RUNNING')`,
+		providerID).Scan(&cpuMillicores, &ramMB, &storageGB, &ingressMbps, &egressMbps)
+	return
 }
 
 func (r *PostgresRepository) RequestStop(ctx context.Context, workloadID, requestID, ownerID string, now time.Time) (Workload, error) {
@@ -92,6 +155,56 @@ func (r *PostgresRepository) RequestStop(ctx context.Context, workloadID, reques
 	}
 	return stored, nil
 }
+
+// RequestStopByProject is RequestStop's project-scoped counterpart, for
+// internal/openstackapi/nova's DELETE /v2.1/{project_id}/servers/{id} --
+// identical logic, just scoped by project_id instead of owner_id (see
+// GetByProject's doc comment for why that is the correct substitution,
+// not an addition alongside owner_id: a Nova server's caller is
+// identified by which project their token is scoped to, not by which
+// individual user created it -- any member of the project may stop it).
+func (r *PostgresRepository) RequestStopByProject(ctx context.Context, workloadID, requestID, projectID string, now time.Time) (Workload, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return Workload{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	stored, err := scanWorkload(tx.QueryRow(ctx, selectWorkload+` WHERE workload_id=$1 AND project_id=$2 FOR UPDATE`, workloadID, projectID))
+	if err != nil {
+		return Workload{}, err
+	}
+	if stored.StopRequestID != "" && stored.StopRequestID != requestID {
+		return Workload{}, ErrConflict
+	}
+	if stored.StopRequestID == "" {
+		state := stored.State
+		switch state {
+		case "STOPPED", "COMPLETED", "FAILED":
+		default:
+			state = "STOPPING"
+		}
+		command, updateErr := tx.Exec(ctx, `UPDATE workloads SET stop_request_id=$2, stop_requested_at=$3, state=$4, version=version+1, updated_at=$3, next_attempt_at=NULL, error_code=NULL, last_error=NULL, worker_id=NULL, worker_lease_until=NULL WHERE workload_id=$1 AND stop_request_id IS NULL`, workloadID, requestID, now, state)
+		if updateErr != nil {
+			var postgresError *pgconn.PgError
+			if errors.As(updateErr, &postgresError) && postgresError.Code == "23505" {
+				return Workload{}, ErrConflict
+			}
+			return Workload{}, updateErr
+		}
+		if command.RowsAffected() != 1 {
+			return Workload{}, ErrConflict
+		}
+		stored.State = state
+		stored.StopRequestID = requestID
+		stored.UpdatedAt = now
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Workload{}, err
+	}
+	return stored, nil
+}
+
 func (r *PostgresRepository) byRequestID(ctx context.Context, requestID string) (Workload, error) {
 	return scanWorkload(r.pool.QueryRow(ctx, selectWorkload+` WHERE request_id=$1`, requestID))
 }
@@ -330,9 +443,9 @@ func (r *PostgresRepository) MarkFailed(ctx context.Context, item Workload, code
 	return nil
 }
 
-const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps`
+const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, COALESCE(vm_image_sha256,''), state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps, COALESCE(project_id::text,'')`
 const selectWorkload = `SELECT ` + workloadColumns + ` FROM workloads`
-const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps`
+const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, COALESCE(w.vm_image_sha256,''), w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps, COALESCE(w.project_id::text,'')`
 
 type scanner interface{ Scan(...any) error }
 
@@ -340,7 +453,7 @@ func scanWorkload(row scanner) (Workload, error) {
 	var w Workload
 	var hash, resourceHash []byte
 	var workerLeaseUntil *time.Time
-	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID, &w.ReservedIngressMbps, &w.ReservedEgressMbps)
+	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.VmImageSha256, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID, &w.ReservedIngressMbps, &w.ReservedEgressMbps, &w.ProjectID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Workload{}, ErrNotFound
 	}
