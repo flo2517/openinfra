@@ -150,7 +150,27 @@ func (m *Manager) Allocate(ctx context.Context, request Request) (Allocation, er
 // been finalized by the caller; this method performs the short-lived peer
 // allocation and namespace attachment atomically.
 func (m *Manager) Attach(ctx context.Context, workloadID, leaseID, containerID string, expiresAt time.Time) error {
-	_, err := m.Allocate(ctx, Request{WorkloadID: workloadID, LeaseID: leaseID, ContainerID: containerID, ExpiresAt: expiresAt, AllowedIPs: []string{overlayAddress(0)}})
+	return m.AttachWithAllowedIPs(ctx, workloadID, leaseID, containerID, expiresAt, nil)
+}
+
+// AttachWithAllowedIPs is Attach, extended for ADR-035 §1: when
+// allowedIPs is non-empty, it is passed straight through to Allocate as
+// the peer's WireGuard AllowedIPs, instead of the placeholder-derived
+// overlayAddress(0) Attach itself always uses. This is the "small,
+// mechanical change to one call site" ADR-035 §1 names -- a Neutron
+// port's IPAM-reserved fixed_ip, resolved by
+// internal/orchestrator.Worker at Deploy dispatch time
+// (internal/openstackapi/neutron.PortSecurityResolver.ResolveForWorkload),
+// takes the place of that placeholder for exactly the workloads bound to
+// one. A nil/empty allowedIPs preserves today's exact behavior
+// (overlayAddress(0)) unchanged -- every workload with no bound Neutron
+// port, including every workload that predates ADR-035, is completely
+// unaffected, matching that ADR's own backward-compatibility guarantee.
+func (m *Manager) AttachWithAllowedIPs(ctx context.Context, workloadID, leaseID, containerID string, expiresAt time.Time, allowedIPs []string) error {
+	if len(allowedIPs) == 0 {
+		allowedIPs = []string{overlayAddress(0)}
+	}
+	_, err := m.Allocate(ctx, Request{WorkloadID: workloadID, LeaseID: leaseID, ContainerID: containerID, ExpiresAt: expiresAt, AllowedIPs: allowedIPs})
 	return err
 }
 

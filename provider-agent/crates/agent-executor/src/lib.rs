@@ -1,12 +1,13 @@
 mod bandwidth;
 mod rate_limit;
+mod security_group;
 pub mod vm;
 
 use agent_api::proto::{get_workload_status_response::State, DeployRequest};
 use agent_api::{Executor, UsageSample, WorkloadStatus};
 use agent_core::local_state::{
-    LocalState, LocalStateError, Reservation, VolumeMount, WorkloadPhase, WorkloadRecord,
-    WorkloadRuntime,
+    LocalState, LocalStateError, Reservation, SecurityGroupDirection, SecurityGroupProtocol,
+    SecurityGroupRule, VolumeMount, WorkloadPhase, WorkloadRecord, WorkloadRuntime,
 };
 use agent_core::ExecutorSettings;
 use anyhow::Result;
@@ -21,6 +22,7 @@ use bollard::network::CreateNetworkOptions;
 use bollard::Docker;
 use futures_util::StreamExt;
 pub use rate_limit::{CommandRunner, RateLimiter, SystemCommandRunner};
+pub use security_group::SecurityGroupEnforcer;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
@@ -76,6 +78,16 @@ pub struct ContainerSpec {
     /// each entry's `volume_name` identifies (ADR-034 §6: "never a
     /// wildcard/glob path").
     pub volume_mounts: Vec<VolumeMount>,
+    /// ADR-035 §1/§3: this workload's Neutron security-group rule set, if
+    /// it is bound to a Neutron port at all -- mirrors
+    /// `WorkloadRecord::security_group_rules`'s own presence-is-the-signal
+    /// convention exactly (see that field's doc comment): `None` means no
+    /// enforcement is installed at all (backward compatible with every
+    /// pre-ADR-035 workload); `Some(rules)` (`rules` possibly empty, the
+    /// fail-closed default) means `create()` and `DockerExecutor::deploy`
+    /// must apply ADR-035 §3's nftables enforcement once the container is
+    /// running.
+    pub security_group_rules: Option<Vec<SecurityGroupRule>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +113,28 @@ pub trait ContainerEngine: Send + Sync {
     /// comment) -- `DockerExecutor::deploy` is the single call site and
     /// already guards on that.
     async fn rate_limit(&self, container_id: &str, egress_mbps: i32) -> Result<(), ExecutorError>;
+    /// ADR-035 §3: applies `rules` as a host-side nftables ruleset
+    /// against this workload's veth (see `security_group.rs` for the
+    /// full mechanism and its fail-closed-default reasoning). Callers
+    /// only invoke this when the workload has a bound Neutron port at
+    /// all -- `rules` may still be empty (the fail-closed default, not
+    /// "nothing to do"); `DockerExecutor::deploy`/`recover` are the only
+    /// call sites, already guarding on
+    /// `WorkloadRecord::security_group_rules` being `Some`. Default
+    /// implementation errs unsupported, the same "a future
+    /// `ContainerEngine` implementor is not forced to implement support
+    /// it never exercises" reasoning `ensure_volume`'s own doc comment
+    /// gives; `BollardEngine` overrides this with the real
+    /// implementation.
+    async fn apply_security_groups(
+        &self,
+        _container_id: &str,
+        _rules: &[SecurityGroupRule],
+    ) -> Result<(), ExecutorError> {
+        Err(ExecutorError::Engine(
+            "this engine does not support Neutron security groups".to_string(),
+        ))
+    }
     /// ADR-034 §1/§2: creates the named Docker volume if it does not
     /// already exist ("nothing is created on any provider host until
     /// the volume is first attached" -- this is that creation point),
@@ -151,6 +185,79 @@ pub fn docker_volume_name(volume_id: &str) -> String {
     format!("openinfra-volume-{volume_id}")
 }
 
+/// ADR-035 §3: validates and converts one wire `agent_api::proto::
+/// SecurityGroupRule` into this crate's own `SecurityGroupRule` --
+/// re-validated independently rather than trusted as-is, the same
+/// "never trust a wire string/value unvalidated" discipline `deployment`'s
+/// own `image`/`volumes[]` validation already applies, appropriate here
+/// specifically because this is security-relevant input crossing a
+/// process boundary. `port_range_min`/`max` use `-1` as their wire
+/// "not applicable" sentinel (agent.proto's own documented convention,
+/// matching `internal/openstackapi/neutron`'s identical CHECK-constraint
+/// shape on the Control-Plane side) rather than proto3 `optional`.
+fn parse_security_group_rule(
+    rule: &agent_api::proto::SecurityGroupRule,
+) -> Result<SecurityGroupRule, ExecutorError> {
+    let direction = match rule.direction.as_str() {
+        "ingress" => SecurityGroupDirection::Ingress,
+        "egress" => SecurityGroupDirection::Egress,
+        other => {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "security_context.rules[].direction {other:?} must be \"ingress\" or \"egress\""
+            )))
+        }
+    };
+    let protocol = match rule.protocol.as_str() {
+        "tcp" => SecurityGroupProtocol::Tcp,
+        "udp" => SecurityGroupProtocol::Udp,
+        "icmp" => SecurityGroupProtocol::Icmp,
+        "any" => SecurityGroupProtocol::Any,
+        other => {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "security_context.rules[].protocol {other:?} must be \"tcp\", \"udp\", \"icmp\", or \"any\""
+            )))
+        }
+    };
+    let (port_range_min, port_range_max) = match protocol {
+        SecurityGroupProtocol::Tcp | SecurityGroupProtocol::Udp => {
+            if rule.port_range_min < 0
+                || rule.port_range_min > 65535
+                || rule.port_range_max < 0
+                || rule.port_range_max > 65535
+                || rule.port_range_min > rule.port_range_max
+            {
+                return Err(ExecutorError::InvalidRequest(
+                    "security_context.rules[].port_range_min/max must be a valid, ordered 0-65535 range for tcp/udp".to_string(),
+                ));
+            }
+            (
+                Some(rule.port_range_min as u16),
+                Some(rule.port_range_max as u16),
+            )
+        }
+        SecurityGroupProtocol::Icmp | SecurityGroupProtocol::Any => {
+            if rule.port_range_min != -1 || rule.port_range_max != -1 {
+                return Err(ExecutorError::InvalidRequest(
+                    "security_context.rules[].port_range_min/max must be -1 (not applicable) for icmp/any".to_string(),
+                ));
+            }
+            (None, None)
+        }
+    };
+    if rule.remote_ip_prefix.is_empty() || rule.remote_ip_prefix.len() > 64 {
+        return Err(ExecutorError::InvalidRequest(
+            "security_context.rules[].remote_ip_prefix must be a non-empty CIDR of at most 64 characters".to_string(),
+        ));
+    }
+    Ok(SecurityGroupRule {
+        direction,
+        protocol,
+        port_range_min,
+        port_range_max,
+        remote_ip_prefix: rule.remote_ip_prefix.clone(),
+    })
+}
+
 // Issue #17: `Docker::connect_with_local_defaults()` on Unix is a thin
 // wrapper over `connect_with_unix_defaults()` (bollard's own
 // docker.rs), which *only* honors `DOCKER_HOST` when it starts with the
@@ -184,6 +291,7 @@ fn connect_docker() -> Result<Docker, bollard::errors::Error> {
 pub struct BollardEngine {
     docker: Docker,
     rate_limiter: RateLimiter,
+    security_group_enforcer: SecurityGroupEnforcer,
 }
 
 impl BollardEngine {
@@ -191,6 +299,12 @@ impl BollardEngine {
         Ok(Self {
             docker: connect_docker().map_err(|error| ExecutorError::Engine(error.to_string()))?,
             rate_limiter: RateLimiter::new(Arc::new(SystemCommandRunner)),
+            // ADR-035 Consequences: reuses the same `CAP_NET_ADMIN` grant
+            // ADR-025 §3 already backs `rate_limiter` with -- a second
+            // `SystemCommandRunner` instance (shelling out via `nft`
+            // instead of `tc`), not a second privilege or a second
+            // command-execution abstraction.
+            security_group_enforcer: SecurityGroupEnforcer::new(Arc::new(SystemCommandRunner)),
         })
     }
 
@@ -482,6 +596,16 @@ impl ContainerEngine for BollardEngine {
         self.rate_limiter.apply(Path::new("/"), pid, egress_mbps)
     }
 
+    async fn apply_security_groups(
+        &self,
+        container_id: &str,
+        rules: &[SecurityGroupRule],
+    ) -> Result<(), ExecutorError> {
+        let pid = self.container_pid(container_id).await?;
+        self.security_group_enforcer
+            .apply(Path::new("/"), pid, rules)
+    }
+
     async fn ensure_volume(&self, name: &str) -> Result<(), ExecutorError> {
         // bollard::volume::create_volume is itself idempotent by name --
         // a `docker volume create` against an existing name simply
@@ -718,6 +842,111 @@ impl DockerExecutor {
         }
     }
 
+    /// ADR-035 §3: applies `record.security_group_rules`'s nftables
+    /// enforcement to `container_id`, called from `deploy()` only.
+    ///
+    /// **Deliberately the opposite failure posture from
+    /// `apply_rate_limit_if_needed` above, for a reasoned, ADR-035-
+    /// specific reason**: a missing `tc` ceiling is a fairness/QoS gap (no
+    /// security boundary was ever promised there); a missing
+    /// security-group ruleset is a security gap -- the container would
+    /// otherwise run, report `Running`, and be reachable exactly as if no
+    /// security group had ever been requested, silently defeating the
+    /// tenant's explicit fail-closed policy for as long as it keeps
+    /// running. Issue #25's `type:security` tag and this ADR's own
+    /// "narrows never widens" reasoning are both about the enforcement
+    /// actually being in place, not merely attempted -- so, unlike a rate
+    /// limit failure, this is fatal to `deploy()`: the container (already
+    /// confirmed running by the caller) is stopped and removed
+    /// best-effort, the workload is marked `Failed`, and the error
+    /// propagates so the caller never reports success. This does trade
+    /// away the capacity-accounting nuance `apply_rate_limit_if_needed`'s
+    /// own doc comment describes (marking `Failed` frees a capacity slot
+    /// for what was, briefly, still-running resource usage) -- accepted
+    /// deliberately here because an unenforced, indefinitely-running
+    /// security-group promise is judged strictly worse than a brief
+    /// capacity-accounting overcount for a container this method itself
+    /// is in the middle of tearing down.
+    ///
+    /// Idempotent: a `None` `security_group_rules` (no bound Neutron
+    /// port) or an already-`security_groups_applied` record returns `Ok`
+    /// immediately without calling the engine at all.
+    async fn apply_security_groups_or_fail(
+        &self,
+        record: &mut WorkloadRecord,
+        container_id: &str,
+    ) -> Result<(), ExecutorError> {
+        let Some(rules) = record.security_group_rules.clone() else {
+            return Ok(());
+        };
+        if record.security_groups_applied {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .engine
+            .apply_security_groups(container_id, &rules)
+            .await
+        {
+            error!(
+                workload_id = %record.workload_id,
+                %container_id,
+                %error,
+                "security-group enforcement could not be installed; stopping the workload rather than expose it unenforced"
+            );
+            if let Err(stop_error) = self.engine.stop(container_id).await {
+                error!(%container_id, %stop_error, "failed to stop workload after a security-group enforcement failure");
+            }
+            if let Err(remove_error) = self.engine.remove(container_id).await {
+                error!(%container_id, %remove_error, "failed to remove workload after a security-group enforcement failure");
+            }
+            return Err(error);
+        }
+        record.security_groups_applied = true;
+        Ok(())
+    }
+
+    /// The soft-failure counterpart to `apply_security_groups_or_fail`
+    /// above, used only by `recover()` -- mirrors
+    /// `apply_rate_limit_if_needed`'s log-and-retry-later posture exactly,
+    /// deliberately, because by the time `recover()` runs, `container_id`
+    /// has already been running (potentially for a long time, across an
+    /// Agent restart) with whatever nftables state the kernel already
+    /// held before this process restarted (ADR-035 §3 point 3: nftables
+    /// state, like `tc` qdiscs, is interface-scoped kernel state, not
+    /// Agent-process state). A failed reapplication attempt here is a
+    /// drift-reconciliation miss to retry next time, not evidence that a
+    /// previously-installed enforcement has disappeared -- so, unlike the
+    /// fresh-deploy path above, tearing down an already-running workload
+    /// on this failure would be a strictly worse outcome than leaving it
+    /// running with its last-known-good nftables state intact.
+    async fn apply_security_groups_if_needed(
+        &self,
+        record: &mut WorkloadRecord,
+        container_id: &str,
+    ) {
+        let Some(rules) = record.security_group_rules.clone() else {
+            return;
+        };
+        if record.security_groups_applied {
+            return;
+        }
+        match self
+            .engine
+            .apply_security_groups(container_id, &rules)
+            .await
+        {
+            Ok(()) => record.security_groups_applied = true,
+            Err(error) => {
+                warn!(
+                    workload_id = %record.workload_id,
+                    %container_id,
+                    %error,
+                    "security-group enforcement not applied for a running workload; will retry on the next recover() call"
+                );
+            }
+        }
+    }
+
     fn deployment(
         &self,
         request: &DeployRequest,
@@ -855,6 +1084,23 @@ impl DockerExecutor {
                 read_only: attachment.read_only,
             });
         }
+        // ADR-035 §3: `security_context`'s *presence*, not its content, is
+        // the signal -- see `DeployRequest.security_context`'s own doc
+        // comment in agent.proto for the full contract this mirrors.
+        // `Some(Vec::new())` (a bound port with no rules) is the
+        // fail-closed default and is deliberately distinct from `None`
+        // (no bound port at all, today's unaffected legacy path).
+        let security_group_rules = request
+            .security_context
+            .as_ref()
+            .map(|context| {
+                context
+                    .rules
+                    .iter()
+                    .map(parse_security_group_rule)
+                    .collect::<Result<Vec<_>, ExecutorError>>()
+            })
+            .transpose()?;
         Ok((
             WorkloadRecord {
                 workload_id: request.workload_id.clone(),
@@ -869,6 +1115,8 @@ impl DockerExecutor {
                 rate_limited: false,
                 lease_end: Some(lease_end_unix),
                 volume_mounts: volume_mounts.clone(),
+                security_group_rules: security_group_rules.clone(),
+                security_groups_applied: false,
             },
             ContainerSpec {
                 name: format!("openinfra-{}", request.workload_id),
@@ -879,6 +1127,7 @@ impl DockerExecutor {
                 pids_limit: self.settings.pids_limit,
                 egress_mbps: limits.egress_mbps,
                 volume_mounts,
+                security_group_rules,
             },
         ))
     }
@@ -908,6 +1157,15 @@ impl DockerExecutor {
                         // (borrowed from record) would conflict with.
                         let container_id = container_id.to_string();
                         self.apply_rate_limit_if_needed(&mut record, &container_id)
+                            .await;
+                        // ADR-035 §3: the identical drift-reconciliation
+                        // need as the rate limit immediately above, for
+                        // nftables state instead of a tc qdisc -- see
+                        // apply_security_groups_if_needed's own doc
+                        // comment for why recover() uses the soft
+                        // (log-and-retry) variant rather than
+                        // apply_security_groups_or_fail.
+                        self.apply_security_groups_if_needed(&mut record, &container_id)
                             .await;
                         record.phase = WorkloadPhase::Running;
                     } else if record.phase == WorkloadPhase::Stopping {
@@ -1125,6 +1383,20 @@ impl Executor for DockerExecutor {
                     // case, not just start()/create() idempotency.
                     self.apply_rate_limit_if_needed(&mut record, &container_id)
                         .await;
+                    // ADR-035 §3: reconciles a prior attempt that got this
+                    // far but failed to install its security-group
+                    // enforcement -- see apply_security_groups_or_fail's
+                    // doc comment for why this is fatal (unlike the rate
+                    // limit reconciliation immediately above) rather than
+                    // logged-and-retried.
+                    if let Err(error) = self
+                        .apply_security_groups_or_fail(&mut record, &container_id)
+                        .await
+                    {
+                        record.phase = WorkloadPhase::Failed;
+                        self.state.store_workload(&record)?;
+                        return Err(error.into());
+                    }
                     record.phase = WorkloadPhase::Running;
                     self.state.store_workload(&record)?;
                     return Ok(container_id);
@@ -1182,6 +1454,21 @@ impl Executor for DockerExecutor {
         // here does not fail deploy() or mark the workload Failed.
         self.apply_rate_limit_if_needed(&mut record, &container_id)
             .await;
+        // ADR-035 §3: installed at the same point, same ordering
+        // guarantee (container start + confirmed running observation) --
+        // "There is no window where the interface exists with an implicit
+        // allow" (ADR-035 §3 point 1). Unlike the rate limit immediately
+        // above, a failure here is fatal to this deploy() call -- see
+        // apply_security_groups_or_fail's own doc comment for the full
+        // reasoning.
+        if let Err(error) = self
+            .apply_security_groups_or_fail(&mut record, &container_id)
+            .await
+        {
+            record.phase = WorkloadPhase::Failed;
+            self.state.store_workload(&record)?;
+            return Err(error.into());
+        }
         record.phase = WorkloadPhase::Running;
         self.state.store_workload(&record)?;
         info!(workload_id = %record.workload_id, %container_id, "Docker confirmed workload running");
@@ -1475,6 +1762,14 @@ mod tests {
         // Per-container_id configured failure for rate_limit(); absent
         // means succeed.
         rate_limit_failures: StdMutex<HashMap<String, String>>,
+        // ADR-035 §3: every apply_security_groups() call this engine
+        // received, in order, as (container_id, rules) -- lets tests
+        // assert deploy() invoked it with exactly the right rule set (or
+        // not at all, for a legacy no-port workload).
+        security_group_calls: StdMutex<Vec<(String, Vec<SecurityGroupRule>)>>,
+        // Per-container_id configured failure for apply_security_groups();
+        // absent means succeed.
+        security_group_failures: StdMutex<HashMap<String, String>>,
         // ADR-034: every Docker volume this engine believes exists,
         // standing in for `bollard`'s real volume store.
         volumes: StdMutex<std::collections::HashSet<String>>,
@@ -1579,6 +1874,26 @@ mod tests {
                 .rate_limit_failures
                 .lock()
                 .expect("rate limit failures lock")
+                .get(container_id)
+            {
+                return Err(ExecutorError::Engine(reason.clone()));
+            }
+            Ok(())
+        }
+
+        async fn apply_security_groups(
+            &self,
+            container_id: &str,
+            rules: &[SecurityGroupRule],
+        ) -> Result<(), ExecutorError> {
+            self.security_group_calls
+                .lock()
+                .expect("security group calls lock")
+                .push((container_id.to_string(), rules.to_vec()));
+            if let Some(reason) = self
+                .security_group_failures
+                .lock()
+                .expect("security group failures lock")
                 .get(container_id)
             {
                 return Err(ExecutorError::Engine(reason.clone()));
@@ -1770,6 +2085,8 @@ mod tests {
             rate_limited: false,
             lease_end: None,
             volume_mounts: Vec::new(),
+            security_group_rules: None,
+            security_groups_applied: false,
         };
         // reserve_workload (not store_workload -- that requires an
         // existing row) is deploy()'s own first step: reserve the
@@ -2310,6 +2627,290 @@ mod tests {
         );
     }
 
+    // --- ADR-035 §3: security-group enforcement wiring through deploy()/
+    // recover(). security_group.rs's own tests cover nft command
+    // construction/idempotency/direction-mapping directly; these tests
+    // cover this file's own responsibility -- when apply_security_groups
+    // is (and is not) called, and deploy()'s fatal-on-failure posture.
+
+    fn request_with_security_context(
+        workload_id: Uuid,
+        lease_id: Uuid,
+        context: Option<agent_api::proto::PortSecurityContext>,
+    ) -> DeployRequest {
+        DeployRequest {
+            security_context: context,
+            ..request(workload_id, lease_id)
+        }
+    }
+
+    fn proto_rule(
+        direction: &str,
+        protocol: &str,
+        min: i32,
+        max: i32,
+        cidr: &str,
+    ) -> agent_api::proto::SecurityGroupRule {
+        agent_api::proto::SecurityGroupRule {
+            direction: direction.to_string(),
+            protocol: protocol.to_string(),
+            port_range_min: min,
+            port_range_max: max,
+            remote_ip_prefix: cidr.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_does_not_apply_security_groups_for_a_legacy_workload_with_no_bound_port() {
+        // ADR-035 §1's backward-compatibility guarantee: a DeployRequest
+        // with no security_context at all (every workload built before
+        // this field existed, and every workload today with no bound
+        // Neutron port) gets no nftables enforcement installed.
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request(Uuid::new_v4(), Uuid::new_v4());
+
+        executor.deploy(request).await.expect("deploy");
+
+        assert!(
+            engine
+                .security_group_calls
+                .lock()
+                .expect("security group calls lock")
+                .is_empty(),
+            "a legacy workload with no bound port must never trigger security-group enforcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_applies_the_fail_closed_default_for_a_bound_port_with_no_rules() {
+        // ADR-035 §3's central guarantee, exercised end-to-end through
+        // deploy(): a bound Neutron port with an empty rule set (no
+        // security group attached, or an attached group with zero rules)
+        // still triggers apply_security_groups -- with an empty slice,
+        // not skipped -- so the Agent-side default-drop chain actually
+        // gets installed.
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext { rules: vec![] }),
+        );
+
+        let container_id = executor.deploy(request).await.expect("deploy");
+
+        let calls = engine
+            .security_group_calls
+            .lock()
+            .expect("security group calls lock");
+        assert_eq!(
+            calls.as_slice(),
+            &[(container_id, Vec::new())],
+            "an empty-but-present security context must still call apply_security_groups with zero rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_applies_security_groups_with_the_exact_rule_set_carried_on_the_wire() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext {
+                rules: vec![
+                    proto_rule("ingress", "tcp", 443, 443, "0.0.0.0/0"),
+                    proto_rule("egress", "any", -1, -1, "10.0.0.0/8"),
+                ],
+            }),
+        );
+
+        let container_id = executor.deploy(request).await.expect("deploy");
+
+        let calls = engine
+            .security_group_calls
+            .lock()
+            .expect("security group calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, container_id);
+        assert_eq!(calls[0].1.len(), 2);
+        assert_eq!(calls[0].1[0].direction, SecurityGroupDirection::Ingress);
+        assert_eq!(calls[0].1[0].protocol, SecurityGroupProtocol::Tcp);
+        assert_eq!(calls[0].1[0].port_range_min, Some(443));
+        assert_eq!(calls[0].1[1].direction, SecurityGroupDirection::Egress);
+        assert_eq!(calls[0].1[1].protocol, SecurityGroupProtocol::Any);
+        assert_eq!(calls[0].1[1].port_range_min, None);
+    }
+
+    #[tokio::test]
+    async fn deploy_fails_and_stops_the_container_when_security_group_enforcement_fails() {
+        // The deliberate divergence from rate-limit failure handling
+        // (apply_security_groups_or_fail's own doc comment): unlike a
+        // missing tc ceiling, a missing security-group ruleset must never
+        // be silently left running -- deploy() fails, and the container
+        // Docker just started is stopped and removed rather than left
+        // running unenforced.
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        engine
+            .security_group_failures
+            .lock()
+            .expect("security group failures lock")
+            .insert(
+                "container-1".to_string(),
+                "nft: Operation not permitted".to_string(),
+            );
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext { rules: vec![] }),
+        );
+        let workload_id = request.workload_id.clone();
+
+        let result = executor.deploy(request).await;
+
+        assert!(
+            result.is_err(),
+            "a security-group enforcement failure must fail deploy(), unlike a rate-limit failure"
+        );
+        assert!(
+            engine
+                .stopped
+                .lock()
+                .expect("stopped lock")
+                .contains(&"container-1".to_string()),
+            "the unenforced container must be stopped rather than left running"
+        );
+        assert!(
+            engine
+                .removed
+                .lock()
+                .expect("removed lock")
+                .contains(&"container-1".to_string()),
+            "the unenforced container must be removed rather than left running"
+        );
+        let record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record after failed deploy");
+        assert_eq!(record.phase, WorkloadPhase::Failed);
+        assert!(!record.security_groups_applied);
+    }
+
+    #[tokio::test]
+    async fn deploy_retry_does_not_reapply_security_groups_once_already_applied() {
+        // Idempotency at the deploy()-wiring level (security_group.rs's
+        // own tests cover idempotency of the nft command sequence
+        // itself): once security_groups_applied is true, a retried
+        // deploy() for the same workload must not call the engine again.
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext { rules: vec![] }),
+        );
+
+        executor
+            .deploy(request.clone())
+            .await
+            .expect("first deploy");
+        executor.deploy(request).await.expect("retried deploy");
+
+        assert_eq!(
+            engine
+                .security_group_calls
+                .lock()
+                .expect("security group calls lock")
+                .len(),
+            1,
+            "a retry must not reapply security groups once already applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_reapplies_security_groups_without_failing_the_workload() {
+        // The soft-failure counterpart: recover() must reconcile a
+        // security-group application that never succeeded (e.g. an Agent
+        // restart between container start and apply_security_groups
+        // completing), but -- unlike deploy() -- a failed reapplication
+        // attempt here must not tear down an already-running workload
+        // (apply_security_groups_if_needed's own doc comment).
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        engine
+            .security_group_failures
+            .lock()
+            .expect("security group failures lock")
+            .insert(
+                "container-1".to_string(),
+                "nft: temporarily unavailable".to_string(),
+            );
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext { rules: vec![] }),
+        );
+        let workload_id = request.workload_id.clone();
+
+        // The first deploy() itself fails closed (fatal, per the test
+        // above) -- to reach recover() with a *Running* record whose
+        // security_groups_applied is false, this simulates the narrower
+        // real-world race the ADR names (Agent restart between the
+        // container being confirmed running and apply_security_groups
+        // completing) by writing that state directly rather than through
+        // deploy()'s own all-or-nothing path.
+        engine
+            .security_group_failures
+            .lock()
+            .expect("security group failures lock")
+            .remove("container-1");
+        let mut without_context = request.clone();
+        without_context.security_context = None;
+        executor
+            .deploy(without_context)
+            .await
+            .expect("deploy without a security context first");
+        let mut record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record");
+        record.security_group_rules = Some(vec![]);
+        record.security_groups_applied = false;
+        executor
+            .state
+            .store_workload(&record)
+            .expect("store record simulating the restart race");
+        engine
+            .security_group_failures
+            .lock()
+            .expect("security group failures lock")
+            .insert(
+                "container-1".to_string(),
+                "nft: temporarily unavailable".to_string(),
+            );
+
+        executor.recover().await.expect("recover");
+
+        let record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record after recover");
+        assert_eq!(
+            record.phase,
+            WorkloadPhase::Running,
+            "a failed reapplication attempt in recover() must not fail the workload"
+        );
+        assert!(!record.security_groups_applied);
+    }
+
     #[tokio::test]
     async fn deploy_rejects_negative_egress_mbps() {
         let directory = tempfile::tempdir().expect("directory");
@@ -2319,6 +2920,106 @@ mod tests {
         request.limits.as_mut().expect("limits").egress_mbps = -1;
 
         assert!(executor.deploy(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_security_context_rule_with_an_invalid_direction() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext {
+                rules: vec![proto_rule("sideways", "tcp", 1, 2, "10.0.0.0/8")],
+            }),
+        );
+
+        let error = executor
+            .deploy(request)
+            .await
+            .expect_err("an invalid direction must be rejected");
+        assert!(error.to_string().contains("direction"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_security_context_rule_with_an_invalid_protocol() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext {
+                rules: vec![proto_rule("ingress", "sctp", -1, -1, "10.0.0.0/8")],
+            }),
+        );
+
+        let error = executor
+            .deploy(request)
+            .await
+            .expect_err("an unsupported protocol must be rejected");
+        assert!(error.to_string().contains("protocol"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_tcp_rule_with_an_unordered_port_range() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext {
+                rules: vec![proto_rule("ingress", "tcp", 443, 80, "10.0.0.0/8")],
+            }),
+        );
+
+        let error = executor
+            .deploy(request)
+            .await
+            .expect_err("port_range_min > port_range_max must be rejected");
+        assert!(error.to_string().contains("port_range"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_an_icmp_rule_carrying_a_port_range() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext {
+                rules: vec![proto_rule("ingress", "icmp", 1, 2, "10.0.0.0/8")],
+            }),
+        );
+
+        let error = executor
+            .deploy(request)
+            .await
+            .expect_err("icmp must not carry a port range");
+        assert!(error.to_string().contains("port_range"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_security_context_rule_with_an_empty_remote_ip_prefix() {
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine, directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext {
+                rules: vec![proto_rule("ingress", "any", -1, -1, "")],
+            }),
+        );
+
+        let error = executor
+            .deploy(request)
+            .await
+            .expect_err("an empty remote_ip_prefix must be rejected");
+        assert!(error.to_string().contains("remote_ip_prefix"));
     }
 
     // --- ADR-028: disconnected mode / durable command reconciliation ---
@@ -3038,6 +3739,7 @@ mod tests {
             pids_limit: 32,
             egress_mbps: 0,
             volume_mounts: Vec::new(),
+            security_group_rules: None,
         };
         let container_id = engine
             .create(&spec)
@@ -3138,6 +3840,7 @@ mod routing_tests {
             runtime,
             vm: None,
             volumes: Vec::new(),
+            security_context: None,
         }
     }
 
@@ -3161,6 +3864,7 @@ mod routing_tests {
                 vm_image_sha256: "a".repeat(64),
             }),
             volumes: Vec::new(),
+            security_context: None,
         }
     }
 
@@ -3178,6 +3882,8 @@ mod routing_tests {
             rate_limited: false,
             lease_end: Some(4_102_444_800),
             volume_mounts: Vec::new(),
+            security_group_rules: None,
+            security_groups_applied: false,
         }
     }
 

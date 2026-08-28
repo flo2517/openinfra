@@ -178,3 +178,58 @@ func TestCommandBackendKeepsPrivateKeyOutOfArgumentsAndLogs(t *testing.T) {
 		t.Fatal("backend did not receive the private key through the protected file")
 	}
 }
+
+// --- ADR-035 §1: AttachWithAllowedIPs -- a Neutron port's fixed_ip
+// overrides Attach's own overlayAddress(0) placeholder.
+
+func TestAttachUsesThePlaceholderAddressUnchanged(t *testing.T) {
+	// Regression guard: Attach's exact pre-ADR-035 behavior (including its
+	// own overlayAddress(0) placeholder quirk, ADR-035 §1's own Context
+	// section) must be completely unaffected by AttachWithAllowedIPs
+	// existing at all.
+	b := &fakeBackend{}
+	m := manager(t, b)
+
+	if err := m.Attach(context.Background(), "workload-1", "42", "container-1", time.Unix(200, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(b.configured) != 1 {
+		t.Fatalf("expected exactly 1 Configure call, got %d", len(b.configured))
+	}
+	if got := b.configured[0].AllowedIPs; len(got) != 1 || got[0] != overlayAddress(0) {
+		t.Fatalf("Attach must keep using overlayAddress(0) unchanged, got %v", got)
+	}
+}
+
+func TestAttachWithAllowedIPsOverridesTheAddressWhenProvided(t *testing.T) {
+	b := &fakeBackend{}
+	m := manager(t, b)
+
+	if err := m.AttachWithAllowedIPs(context.Background(), "workload-1", "42", "container-1", time.Unix(200, 0), []string{"10.50.0.7/32"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(b.configured) != 1 {
+		t.Fatalf("expected exactly 1 Configure call, got %d", len(b.configured))
+	}
+	if got := b.configured[0].AllowedIPs; len(got) != 1 || got[0] != "10.50.0.7/32" {
+		t.Fatalf("expected AllowedIPs=[10.50.0.7/32], got %v", got)
+	}
+}
+
+func TestAttachWithAllowedIPsFallsBackToThePlaceholderWhenEmpty(t *testing.T) {
+	// A nil/empty allowedIPs must reproduce Attach's exact existing
+	// behavior -- the backward-compatibility guarantee for every
+	// workload with no bound Neutron port.
+	b := &fakeBackend{}
+	m := manager(t, b)
+
+	if err := m.AttachWithAllowedIPs(context.Background(), "workload-1", "42", "container-1", time.Unix(200, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := b.configured[0].AllowedIPs; len(got) != 1 || got[0] != overlayAddress(0) {
+		t.Fatalf("an empty override must fall back to overlayAddress(0), got %v", got)
+	}
+}

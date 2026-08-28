@@ -85,7 +85,8 @@ func newTestServer(t *testing.T, zones neutron.ZoneLister) (context.Context, tes
 	t.Helper()
 	ctx, pool := newTestPool(t)
 	users := userauth.NewPostgresRepository(pool)
-	server := neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), zones)
+	server := neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), zones,
+		neutron.NewPostgresNetworkRepository(pool), neutron.NewPostgresPortRepository(pool), neutron.NewPostgresSecurityGroupRepository(pool))
 	mux := http.NewServeMux()
 	server.Register(mux)
 	return ctx, testServer{handler: mux, pool: pool, users: users}
