@@ -34,7 +34,9 @@ async function loadSection(path, warningID, unavailableMessage, render) {
   const key = window.openinfraSession.key();
   if (!key) return;
   try {
-    const response = await fetch(path, { headers: { authorization: 'Bearer ' + key } });
+    // ADR-037 §2: routed through openinfraApiUrl (config.js) -- see
+    // tenant.js's authedFetch for why.
+    const response = await fetch(window.openinfraApiUrl(path), { headers: { authorization: 'Bearer ' + key } });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     render(await response.json());
   } catch (error) {
@@ -165,7 +167,7 @@ async function syncPanel() {
   }
   let identity;
   try {
-    const response = await fetch('/api/v1/me', { headers: { authorization: 'Bearer ' + key } });
+    const response = await fetch(window.openinfraApiUrl('/api/v1/me'), { headers: { authorization: 'Bearer ' + key } });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     identity = await response.json();
   } catch (error) {

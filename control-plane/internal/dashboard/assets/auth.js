@@ -146,7 +146,10 @@ function showAuthMessage(text) {
 async function login() {
   const key = await getOrCreateLocalKey();
 
-  const challengeResponse = await fetch('/api/v1/auth/challenge', { method: 'POST' });
+  // ADR-037 §2: routed through openinfraApiUrl (config.js) so a
+  // gateway-served copy of this bundle calls the real, canonical API
+  // origin instead of whatever gateway happens to be serving it.
+  const challengeResponse = await fetch(window.openinfraApiUrl('/api/v1/auth/challenge'), { method: 'POST' });
   if (!challengeResponse.ok) throw new Error(`challenge request failed: HTTP ${challengeResponse.status}`);
   const challenge = await challengeResponse.json();
   const nonce = fromHex(challenge.nonce);
@@ -155,7 +158,7 @@ async function login() {
   message.set(nonce, LOGIN_DOMAIN.length);
   const signature = await crypto.subtle.sign({ name: 'Ed25519' }, key.privateKey, message);
 
-  const loginResponse = await fetch('/api/v1/auth/login', {
+  const loginResponse = await fetch(window.openinfraApiUrl('/api/v1/auth/login'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -183,7 +186,7 @@ function logout() {
 async function issueAPIKey() {
   const sessionKey = sessionStorage.getItem(SESSION_KEY_STORAGE);
   if (!sessionKey) return;
-  const response = await fetch('/api/v1/auth/api-keys', {
+  const response = await fetch(window.openinfraApiUrl('/api/v1/auth/api-keys'), {
     method: 'POST',
     headers: { authorization: 'Bearer ' + sessionKey },
   });

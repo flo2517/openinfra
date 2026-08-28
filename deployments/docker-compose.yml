@@ -87,6 +87,47 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # ADR-037 §8: self-hosted kubo (the reference Go IPFS implementation),
+  # the canonical-tier storage/gateway for the dashboard's content-
+  # addressed static frontend release (ADR-037 §1/§3). Nothing in the
+  # default dev stack publishes to it yet -- that is
+  # control-plane/cmd/frontendrelease's job, run manually by whoever holds
+  # the release-signing key (ADR-037 §2) -- so this service can sit idle,
+  # healthy, with an empty blockstore, and nothing else in `make dev-up`
+  # depends on it (the direct-serve /dashboard/ path, ADR-037's own
+  # "additive, not a replacement" framing, is unaffected either way).
+  #
+  # API (5001) and gateway (8080 in-container, remapped to 8081 on the
+  # host since control-plane's own HTTP listener already claims
+  # 127.0.0.1:8080) both bound to 127.0.0.1 only, matching every other
+  # service's own host-port convention in this file. The P2P swarm port
+  # (4001) is deliberately left unpublished: this node's job in the dev
+  # stack is to be pinned-to and served-from directly (the canonical
+  # tier), not to peer with the wider public IPFS network -- ADR-037 §8's
+  # "external pinning redundancy" open question is exactly the case where
+  # that would change, not decided here.
+  ipfs:
+    image: ipfs/kubo:v0.35.0@sha256:6b59935acc23eed3181a0d4684e51e0d59597f028d593cdfe1cd1ed694d53fa6
+    ports:
+      - "127.0.0.1:${IPFS_API_PORT:-5001}:5001"
+      - "127.0.0.1:${IPFS_GATEWAY_PORT:-8081}:8080"
+    volumes:
+      - ipfs-data:/data/ipfs
+    healthcheck:
+      # `ipfs id` round-trips through the daemon's own API -- the same
+      # "the binary itself proves the service is live" shape
+      # docker-socket-proxy's wget-against-/_ping and control-plane's
+      # grpc-health-probe already use, without needing curl/wget inside
+      # this image at all.
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
   blockchain-node:
     build:
       context: ../blockchain
@@ -608,3 +649,4 @@ volumes:
   postgres-data:
   redis-data:
   substrate-data:
+  ipfs-data:
