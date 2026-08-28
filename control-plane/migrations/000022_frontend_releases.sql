@@ -20,10 +20,20 @@ CREATE TABLE IF NOT EXISTS frontend_releases (
     cid text NOT NULL CHECK (length(cid) > 0),
     manifest_sha256 text NOT NULL CHECK (manifest_sha256 ~ '^[0-9a-f]{64}$'),
     -- Hex-encoded Ed25519 signature (ADR-037 §2 step 4): 64 bytes = 128
-    -- hex characters, verified against the committed release-signing
-    -- public key (deployments/local/certs/frontend-release-public.hex in
-    -- dev; ADR-037's own "custody and rotation not decided here" open
-    -- question applies to where that key lives in production).
+    -- hex characters. This CHECK only enforces the hex/length shape, not
+    -- cryptographic validity -- Publish additionally verifies against
+    -- PostgresRepository.trustedPublicKey when one is configured
+    -- (internal/frontendrelease/postgres.go's WithTrustedPublicKey), and
+    -- the actual, load-bearing verification happens at read time: every
+    -- row this table holds is re-verified with frontendrelease.Verify
+    -- against cmd/controlplane/main.go's FRONTEND_RELEASE_PUBLIC_KEY (the
+    -- fixed, deploy-configured trust anchor read once at startup) before
+    -- GET /.well-known/openinfra-frontend serves it or the CORS allowlist
+    -- (internal/dashboard's cors.go) trusts its allowed_login_origins --
+    -- an unset FRONTEND_RELEASE_PUBLIC_KEY fails closed (nothing is ever
+    -- trusted) rather than skipping verification. ADR-037's own "custody
+    -- and rotation not decided here" open question still applies to where
+    -- the corresponding private key lives.
     signature text NOT NULL CHECK (signature ~ '^[0-9a-f]{128}$'),
     api_origin text NOT NULL,
     -- ADR-037 §4's phishing-resistance control: the exact origin list this

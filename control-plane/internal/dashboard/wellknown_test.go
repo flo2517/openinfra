@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +30,11 @@ func TestWellKnownFrontendReturns404WithNoRepositoryWired(t *testing.T) {
 // fully-revoked) release history also 404s -- distinct from "repository
 // unavailable," which must 503 instead (tested below).
 func TestWellKnownFrontendReturns404WithNoActiveRelease(t *testing.T) {
-	server := &Server{now: time.Now, releases: &fakeReleaseRepository{}}
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{now: time.Now, releases: &fakeReleaseRepository{}, releaseTrustedKey: pub}
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/.well-known/openinfra-frontend", nil)
 	server.wellKnownFrontend(recorder, request)
@@ -57,7 +62,7 @@ func TestWellKnownFrontendServesTheSignedManifestVerbatim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &Server{now: time.Now, releases: &fakeReleaseRepository{latest: frontendrelease.FromManifest(signed)}}
+	server := &Server{now: time.Now, releases: &fakeReleaseRepository{latest: frontendrelease.FromManifest(signed)}, releaseTrustedKey: pub}
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/.well-known/openinfra-frontend", nil)
@@ -81,5 +86,103 @@ func TestWellKnownFrontendServesTheSignedManifestVerbatim(t *testing.T) {
 	}
 	if got.CID != "bafy-current-release" {
 		t.Fatalf("cid = %q, want bafy-current-release", got.CID)
+	}
+}
+
+// TestWellKnownFrontendFailsClosedWhenSignedByAnAttackerKey is the
+// internal security review's own adversarial scenario: a release row
+// signed by a key other than the server's configured trusted key (e.g.
+// inserted by whoever had direct Postgres write access, or a
+// self-signed/attacker-controlled key) must never be served as the trust
+// root, even though it is a validly-formed, non-empty signature.
+func TestWellKnownFrontendFailsClosedWhenSignedByAnAttackerKey(t *testing.T) {
+	trusted, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, attackerPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned, err := frontendrelease.BuildManifest("bafy-attacker-cid", []frontendrelease.ManifestFile{
+		{Path: "index.html", SHA256: strings.Repeat("a", 64), Size: 1},
+	}, "https://api.example.org", []string{"https://evil.example.org"}, "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedByAttacker, err := frontendrelease.Sign(attackerPriv, unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{now: time.Now, releases: &fakeReleaseRepository{latest: frontendrelease.FromManifest(signedByAttacker)}, releaseTrustedKey: trusted}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/.well-known/openinfra-frontend", nil)
+	server.wellKnownFrontend(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (an attacker-signed release must never be served as the trust root)", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "bafy-attacker-cid") {
+		t.Fatal("response body leaked the unverified release's cid")
+	}
+}
+
+// TestWellKnownFrontendFailsClosedForUnsignedRelease proves an empty
+// signature (frontendrelease.PostgresRepository.Publish's own minimal
+// pre-ADR-037 check) is just as untrusted as a wrong-key signature -- the
+// finding's own literal "entirely unsigned-but-non-empty-string" case is
+// covered by the attacker-key test above; this covers a truly empty
+// Signature field.
+func TestWellKnownFrontendFailsClosedForUnsignedRelease(t *testing.T) {
+	trusted, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned, err := frontendrelease.BuildManifest("bafy-unsigned", []frontendrelease.ManifestFile{
+		{Path: "index.html", SHA256: strings.Repeat("a", 64), Size: 1},
+	}, "https://api.example.org", nil, "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{now: time.Now, releases: &fakeReleaseRepository{latest: frontendrelease.FromManifest(unsigned)}, releaseTrustedKey: trusted}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/.well-known/openinfra-frontend", nil)
+	server.wellKnownFrontend(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for an unsigned release", recorder.Code)
+	}
+}
+
+// TestWellKnownFrontendFailsClosedWithNoTrustedKeyConfigured proves an
+// absent FRONTEND_RELEASE_PUBLIC_KEY (server.releaseTrustedKey left
+// nil/zero) makes the trust root inert -- never silently "everything
+// verifies" -- even when a validly self-consistent, signed release
+// exists in the repository.
+func TestWellKnownFrontendFailsClosedWithNoTrustedKeyConfigured(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned, err := frontendrelease.BuildManifest("bafy-no-key-configured", []frontendrelease.ManifestFile{
+		{Path: "index.html", SHA256: strings.Repeat("a", 64), Size: 1},
+	}, "https://api.example.org", nil, "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := frontendrelease.Sign(priv, unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{now: time.Now, releases: &fakeReleaseRepository{latest: frontendrelease.FromManifest(signed)}}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/.well-known/openinfra-frontend", nil)
+	server.wellKnownFrontend(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when no trusted release-signing public key is configured", recorder.Code)
 	}
 }

@@ -2,6 +2,7 @@ package frontendrelease
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,15 +92,48 @@ type Repository interface {
 // PostgresRepository is Repository backed by the frontend_releases table.
 type PostgresRepository struct {
 	pool *pgxpool.Pool
+	// trustedPublicKey is optional write-time defense in depth (nil by
+	// default -- see WithTrustedPublicKey): when set, Publish refuses to
+	// insert any release that does not verify against it, independent of
+	// whatever key(s) a caller may already have checked with of its own
+	// accord (e.g. cmd/frontendrelease's `publish` subcommand's own
+	// -pubkey flag).
+	trustedPublicKey ed25519.PublicKey
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
 }
 
+// WithTrustedPublicKey enables Publish's write-time verification against
+// pub -- defense in depth on top of the runtime read-time verification
+// wellKnownFrontend/cors.go already apply (internal/dashboard's
+// Server.releaseTrustedKey). Not set by cmd/frontendrelease/main.go's own
+// `openRepository` deliberately: that CLI's `publish` subcommand already
+// calls frontendrelease.Verify against whatever -pubkey the operator
+// supplies before ever calling Publish, so leaving its repository's
+// trustedPublicKey nil preserves that flow exactly as it worked before
+// this method existed. cmd/controlplane/main.go wires this in for its own
+// PostgresRepository instance using the same FRONTEND_RELEASE_PUBLIC_KEY
+// the read paths trust, so a future write path reachable from that
+// process (none exists as of ADR-037) can never insert a row the read
+// paths would refuse to trust anyway. Leaving pub nil/wrong-length (the
+// default) preserves the pre-existing non-empty-signature-only check
+// below -- purely additive, never a stricter default for existing
+// callers/tests.
+func (r *PostgresRepository) WithTrustedPublicKey(pub ed25519.PublicKey) *PostgresRepository {
+	r.trustedPublicKey = pub
+	return r
+}
+
 func (r *PostgresRepository) Publish(ctx context.Context, release Release) error {
 	if release.Signature == "" {
 		return fmt.Errorf("frontendrelease: refusing to publish an unsigned release")
+	}
+	if len(r.trustedPublicKey) == ed25519.PublicKeySize {
+		if err := Verify(r.trustedPublicKey, release.Manifest); err != nil {
+			return fmt.Errorf("frontendrelease: refusing to publish a release that does not verify against the configured trusted public key: %w", err)
+		}
 	}
 	origins, err := json.Marshal(release.AllowedLoginOrigins)
 	if err != nil {

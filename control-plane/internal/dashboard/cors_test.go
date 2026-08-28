@@ -1,11 +1,34 @@
 package dashboard
 
 import (
+	"crypto/ed25519"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/openinfra/network/internal/frontendrelease"
 )
+
+// signedReleaseWithOrigins is releaseWithOrigins's signed counterpart --
+// the adversarial CORS tests below need a release that either does or
+// does not verify against a particular key, not just one with the right
+// AllowedLoginOrigins shape.
+func signedReleaseWithOrigins(t *testing.T, priv ed25519.PrivateKey, origins []string) frontendrelease.Release {
+	t.Helper()
+	unsigned, err := frontendrelease.BuildManifest("bafy-test-cid", []frontendrelease.ManifestFile{
+		{Path: "index.html", SHA256: strings.Repeat("a", 64), Size: 1},
+	}, "https://api.example.org", origins, "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := frontendrelease.Sign(priv, unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frontendrelease.FromManifest(signed)
+}
 
 func newCORSTestServer(allowedOrigins []string, releases *fakeReleaseRepository) *Server {
 	s := &Server{now: time.Now, allowedOrigins: allowedOrigins}
@@ -166,8 +189,13 @@ func TestCORSAllowlistRequestWithNoOriginHeaderAlwaysProceeds(t *testing.T) {
 // frontend release (not the static allowedOrigins config) is still
 // honored.
 func TestCORSAllowlistConsultsActiveReleaseOrigins(t *testing.T) {
-	releases := &fakeReleaseRepository{latest: releaseWithOrigins(t, []string{"https://gateway.example.org"})}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releases := &fakeReleaseRepository{latest: signedReleaseWithOrigins(t, priv, []string{"https://gateway.example.org"})}
 	server := newCORSTestServer(nil, releases)
+	server.releaseTrustedKey = pub
 	called := false
 	handler := server.corsAllowlist(recordingHandler(&called))
 
@@ -201,6 +229,98 @@ func TestCORSAllowlistFailsClosedWhenNoActiveRelease(t *testing.T) {
 
 	if called {
 		t.Fatal("an origin was trusted with no active release published at all")
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+}
+
+// TestCORSAllowlistDoesNotTrustOriginsSignedByAnAttackerKey is the
+// internal security review's own adversarial scenario applied to the
+// CORS allowlist: a release row whose signature does not verify against
+// the server's configured trusted key (e.g. inserted by whoever had
+// direct Postgres write access, self-signed with an attacker-controlled
+// key) must never grant its allowed_login_origins trust, even though the
+// signature field is well-formed and non-empty.
+func TestCORSAllowlistDoesNotTrustOriginsSignedByAnAttackerKey(t *testing.T) {
+	trusted, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, attackerPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releases := &fakeReleaseRepository{latest: signedReleaseWithOrigins(t, attackerPriv, []string{"https://evil-gateway.example.org"})}
+	server := newCORSTestServer(nil, releases)
+	server.releaseTrustedKey = trusted
+	called := false
+	handler := server.corsAllowlist(recordingHandler(&called))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	request.Header.Set("Origin", "https://evil-gateway.example.org")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if called {
+		t.Fatal("an origin from an attacker-signed release reached the wrapped handler")
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+	if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want unset for an attacker-signed release's origin", got)
+	}
+}
+
+// TestCORSAllowlistDoesNotTrustOriginsWithNoTrustedKeyConfigured proves
+// an absent FRONTEND_RELEASE_PUBLIC_KEY (server.releaseTrustedKey left
+// nil/zero) makes the dynamic half of the allowlist inert -- never
+// silently "everything verifies" -- even when a validly self-consistent,
+// signed release exists in the repository.
+func TestCORSAllowlistDoesNotTrustOriginsWithNoTrustedKeyConfigured(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releases := &fakeReleaseRepository{latest: signedReleaseWithOrigins(t, priv, []string{"https://gateway.example.org"})}
+	server := newCORSTestServer(nil, releases)
+	called := false
+	handler := server.corsAllowlist(recordingHandler(&called))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	request.Header.Set("Origin", "https://gateway.example.org")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if called {
+		t.Fatal("an origin was trusted with no trusted release-signing public key configured at all")
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+}
+
+// TestCORSAllowlistDoesNotTrustOriginsFromAnUnsignedRelease covers a
+// truly empty Signature field, distinct from the wrong-key case above.
+func TestCORSAllowlistDoesNotTrustOriginsFromAnUnsignedRelease(t *testing.T) {
+	trusted, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releases := &fakeReleaseRepository{latest: releaseWithOrigins(t, []string{"https://unsigned.example.org"})}
+	server := newCORSTestServer(nil, releases)
+	server.releaseTrustedKey = trusted
+	called := false
+	handler := server.corsAllowlist(recordingHandler(&called))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	request.Header.Set("Origin", "https://unsigned.example.org")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if called {
+		t.Fatal("an origin from an unsigned release reached the wrapped handler")
 	}
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", recorder.Code)

@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"crypto/ed25519"
 	"net/http"
 	"strings"
 	"time"
@@ -140,20 +141,34 @@ func (s *Server) originAllowed(ctx context.Context, origin string) bool {
 
 // activeReleaseOrigins returns the latest non-revoked release's
 // allowed_login_origins, refreshing from s.releases at most once per
-// originAllowlistTTL. A read failure (or no active release at all) is
+// originAllowlistTTL, but only once that release verifies against
+// s.releaseTrustedKey (frontendrelease.Verify). A read failure, a
+// release that fails to verify, or no trusted key configured at all is
 // treated as "no additional origins trusted right now" -- fail-closed,
 // consistent with every other trust decision in this package -- rather
 // than falling back to a stale cache indefinitely or, worse, allowing
-// everything.
+// everything. This is the fix for the internal security review's finding
+// that this method used to read release.AllowedLoginOrigins straight off
+// the newest non-revoked row with no frontendrelease.Verify call at all.
 func (s *Server) activeReleaseOrigins(ctx context.Context) []string {
 	s.releaseOriginsMu.Lock()
 	defer s.releaseOriginsMu.Unlock()
 	if s.now().Sub(s.releaseOriginsAt) < originAllowlistTTL {
 		return s.releaseOriginsCache
 	}
-	release, err := s.releases.Latest(ctx)
 	s.releaseOriginsAt = s.now()
+	if len(s.releaseTrustedKey) != ed25519.PublicKeySize {
+		// Fail closed: an absent FRONTEND_RELEASE_PUBLIC_KEY must never be
+		// read as "everything verifies" -- see Server.releaseTrustedKey.
+		s.releaseOriginsCache = nil
+		return nil
+	}
+	release, err := s.releases.Latest(ctx)
 	if err != nil {
+		s.releaseOriginsCache = nil
+		return nil
+	}
+	if verifyErr := frontendrelease.Verify(s.releaseTrustedKey, release.Manifest); verifyErr != nil {
 		s.releaseOriginsCache = nil
 		return nil
 	}

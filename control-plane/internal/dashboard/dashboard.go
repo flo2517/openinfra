@@ -69,6 +69,19 @@ type Server struct {
 	// cmd/controlplane/main.go once a frontendrelease.PostgresRepository
 	// exists.
 	releases frontendrelease.Repository
+	// releaseTrustedKey is the fixed, deploy-configured Ed25519
+	// release-signing public key (cmd/controlplane/main.go's
+	// FRONTEND_RELEASE_PUBLIC_KEY, read once at startup) every release
+	// read off releases must verify against before wellKnownFrontend
+	// serves its manifest or corsAllowlist trusts its
+	// allowed_login_origins -- the fix for the internal security review's
+	// finding that neither runtime read path ever called
+	// frontendrelease.Verify against a real key. Nil/empty (the
+	// FRONTEND_RELEASE_PUBLIC_KEY-unset default) means the whole
+	// content-addressed-frontend trust root stays inert: wellKnownFrontend
+	// always 503s and corsAllowlist never trusts any release's origins,
+	// deliberately never treated as "everything verifies."
+	releaseTrustedKey ed25519.PublicKey
 
 	releaseOriginsMu    sync.Mutex
 	releaseOriginsAt    time.Time
@@ -241,6 +254,18 @@ func New(pool *pgxpool.Pool, redisClient redis.UniversalClient, chain *blockchai
 // (including every test in this package) is unaffected.
 func (s *Server) WithFrontendReleases(releases frontendrelease.Repository) *Server {
 	s.releases = releases
+	return s
+}
+
+// WithFrontendReleaseTrustKey sets the fixed Ed25519 public key
+// wellKnownFrontend and corsAllowlist verify every release against before
+// trusting it -- see the Server.releaseTrustedKey field comment. A nil or
+// wrong-length key (including never calling this method at all) leaves the
+// trust root inert rather than silently trusting unverified releases,
+// matching WithFrontendReleases/WithAllowedOrigins's own separate-method
+// convention.
+func (s *Server) WithFrontendReleaseTrustKey(pub ed25519.PublicKey) *Server {
+	s.releaseTrustedKey = pub
 	return s
 }
 

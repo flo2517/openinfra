@@ -149,6 +149,66 @@ func TestPostgresRepositoryRevokeUnknownReleaseReturnsErrNotFound(t *testing.T) 
 	}
 }
 
+// TestPostgresRepositoryPublishWithTrustedPublicKeyAcceptsMatchingSignature
+// proves WithTrustedPublicKey's write-time defense-in-depth check accepts
+// a release genuinely signed by the same key it was configured with.
+func TestPostgresRepositoryPublishWithTrustedPublicKeyAcceptsMatchingSignature(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	release, pub := signedRelease(t, "https://api.example.org", []string{"https://dashboard.example.org"}, time.Now().UTC())
+	repo := frontendrelease.NewPostgresRepository(pool).WithTrustedPublicKey(pub)
+
+	if err := repo.Publish(ctx, release); err != nil {
+		t.Fatalf("Publish of a release matching the trusted key: %v", err)
+	}
+	latest, err := repo.Latest(ctx)
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if latest.ReleaseID != release.ReleaseID {
+		t.Fatalf("Latest().ReleaseID = %q, want %q", latest.ReleaseID, release.ReleaseID)
+	}
+}
+
+// TestPostgresRepositoryPublishWithTrustedPublicKeyRejectsWrongKeySignature
+// is the internal security review's own adversarial scenario applied to
+// the write path: a release signed by some other key entirely (an
+// attacker's, or simply the wrong operational key) must never make it
+// into the table at all once a trusted key is configured, even though the
+// signature field itself is well-formed and the manifest's own
+// manifest_sha256 is internally self-consistent.
+func TestPostgresRepositoryPublishWithTrustedPublicKeyRejectsWrongKeySignature(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	trusted, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, _ := signedRelease(t, "https://api.example.org", []string{"https://evil.example.org"}, time.Now().UTC())
+	repo := frontendrelease.NewPostgresRepository(pool).WithTrustedPublicKey(trusted)
+
+	if err := repo.Publish(ctx, release); err == nil {
+		t.Fatal("Publish of a release signed by a different key succeeded, want a rejection")
+	}
+	if _, err := repo.Latest(ctx); err != frontendrelease.ErrNoActiveRelease {
+		t.Fatalf("Latest() after a rejected Publish = %v, want ErrNoActiveRelease (nothing should have been inserted)", err)
+	}
+}
+
+// TestPostgresRepositoryPublishWithNoTrustedPublicKeyPreservesOldBehavior
+// proves the default, zero-value PostgresRepository (every existing call
+// site: cmd/frontendrelease's own `publish` subcommand, and every other
+// test in this file) is completely unaffected by WithTrustedPublicKey's
+// existence -- Publish still only requires a non-empty Signature, no
+// matter which key produced it.
+func TestPostgresRepositoryPublishWithNoTrustedPublicKeyPreservesOldBehavior(t *testing.T) {
+	ctx, pool := newTestPool(t)
+	repo := frontendrelease.NewPostgresRepository(pool)
+	release, _ := signedRelease(t, "https://api.example.org", nil, time.Now().UTC())
+
+	if err := repo.Publish(ctx, release); err != nil {
+		t.Fatalf("Publish with no trusted key configured: %v", err)
+	}
+}
+
 func TestPostgresRepositoryListOrdersNewestFirst(t *testing.T) {
 	ctx, pool := newTestPool(t)
 	repo := frontendrelease.NewPostgresRepository(pool)

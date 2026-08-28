@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -292,9 +294,27 @@ func run() error {
 			}
 		}
 	}
+	// ADR-037 / internal security review finding: the fixed trust anchor
+	// GET /.well-known/openinfra-frontend and the CORS allowlist verify
+	// every release against before trusting it -- see
+	// loadFrontendReleaseTrustedKey's own doc comment for what an unset
+	// FRONTEND_RELEASE_PUBLIC_KEY means.
+	frontendReleaseTrustedKey, err := loadFrontendReleaseTrustedKey()
+	if err != nil {
+		return err
+	}
+	releaseRepository := frontendrelease.NewPostgresRepository(pool)
+	if len(frontendReleaseTrustedKey) == ed25519.PublicKeySize {
+		// Defense in depth (frontendrelease.PostgresRepository.Publish's own
+		// doc comment): this process has no write path to frontend_releases
+		// today (cmd/frontendrelease is the only Publish caller), but wiring
+		// this now means one never accidentally exists unverified later.
+		releaseRepository = releaseRepository.WithTrustedPublicKey(frontendReleaseTrustedKey)
+	}
 	dashboardServer := dashboard.New(pool, redisClient, chainClient, walletService, userRepository, authLimiter, workloadService).
 		WithAllowedOrigins(allowedOrigins).
-		WithFrontendReleases(frontendrelease.NewPostgresRepository(pool))
+		WithFrontendReleases(releaseRepository).
+		WithFrontendReleaseTrustKey(frontendReleaseTrustedKey)
 	httpServer := &http.Server{
 		Handler:           dashboardServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -494,6 +514,42 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// frontendReleasePublicKeyEnv names the fixed, deploy-configured Ed25519
+// public key this process trusts as ADR-037's release-signing key --
+// hex-encoded, matching cmd/frontendrelease/main.go's own loadPublicKey
+// file format, just sourced from an env var here rather than a path
+// (this file's TLS_CERT_FILE/TLS_CLIENT_CA_FILE/CA_KEY_FILE above are all
+// os.Getenv-direct, no-default trust-anchor config for exactly this
+// reason: there is no safe fallback value for a trust anchor). This is
+// the fix for the internal security review's finding that nothing on the
+// runtime read path ever verified a release against a real key: unset
+// (the default, e.g. every pre-existing local dev/Compose deployment)
+// leaves dashboard.Server.releaseTrustedKey nil, which
+// wellKnownFrontend/corsAllowlist treat as "trust nothing" -- the whole
+// content-addressed-frontend trust root stays inert rather than ever
+// silently trusting an unverified release.
+const frontendReleasePublicKeyEnv = "FRONTEND_RELEASE_PUBLIC_KEY"
+
+// loadFrontendReleaseTrustedKey reads and hex-decodes
+// frontendReleasePublicKeyEnv, if set. A malformed (wrong length,
+// non-hex) value fails startup outright -- the same "don't silently
+// misconfigure a trust anchor" posture as safeHTTPListener's insecure-bind
+// guard below, rather than logging a warning and continuing with no
+// verification. An unset value returns (nil, nil): the caller wires that
+// nil straight into dashboard.Server, which already treats a nil/wrong-
+// length key as "verify nothing, trust nothing."
+func loadFrontendReleaseTrustedKey() (ed25519.PublicKey, error) {
+	raw := strings.TrimSpace(os.Getenv(frontendReleasePublicKeyEnv))
+	if raw == "" {
+		return nil, nil
+	}
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("%s must be a %d-byte hex-encoded Ed25519 public key", frontendReleasePublicKeyEnv, ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(decoded), nil
 }
 
 // splitNonEmpty splits a comma-separated operator-supplied list (e.g.
