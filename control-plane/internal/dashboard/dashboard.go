@@ -12,10 +12,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/frontendrelease"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/walletlogin"
 	"github.com/openinfra/network/internal/workloadapi"
@@ -53,6 +55,24 @@ type Server struct {
 	// to disturb it for this change.
 	workloads *workloadapi.Service
 	now       func() time.Time
+	// allowedOrigins is ADR-037 §4's static cross-origin allowlist for
+	// credentialed requests -- the canonical DNSLink origin and the
+	// self-hosted kubo gateway origin, sourced from operator config
+	// (cmd/controlplane/main.go). Nil/empty is a fully backward-
+	// compatible default: no static cross-origin trust beyond
+	// same-origin and whatever releases (below) currently grants.
+	allowedOrigins []string
+	// releases is optional: nil means "no frontendrelease releases have
+	// been wired to this server" (every pre-ADR-037 test/deployment),
+	// in which case /.well-known/openinfra-frontend 404s and
+	// corsAllowlist relies on allowedOrigins alone. Set by
+	// cmd/controlplane/main.go once a frontendrelease.PostgresRepository
+	// exists.
+	releases frontendrelease.Repository
+
+	releaseOriginsMu    sync.Mutex
+	releaseOriginsAt    time.Time
+	releaseOriginsCache []string
 }
 
 type Provider struct {
@@ -211,6 +231,27 @@ func New(pool *pgxpool.Pool, redisClient redis.UniversalClient, chain *blockchai
 	return &Server{pool: pool, redis: redisClient, chain: chain, wallet: wallet, users: users, limiter: limiter, workloads: workloads, now: time.Now}
 }
 
+// WithFrontendReleases wires ADR-037's frontendrelease.Repository into an
+// already-constructed Server, enabling GET /.well-known/openinfra-frontend
+// and letting corsAllowlist consult the currently active release's own
+// allowed_login_origins on top of allowedOrigins. Optional and additive:
+// a Server never given this stays exactly as it behaved before ADR-037
+// (no .well-known endpoint, static-allowlist-only CORS) -- a separate
+// method rather than a New() parameter so every existing call site
+// (including every test in this package) is unaffected.
+func (s *Server) WithFrontendReleases(releases frontendrelease.Repository) *Server {
+	s.releases = releases
+	return s
+}
+
+// WithAllowedOrigins sets ADR-037 §4's static cross-origin allowlist for
+// credentialed requests -- see the Server.allowedOrigins field comment.
+// Separate method for the same reason as WithFrontendReleases above.
+func (s *Server) WithAllowedOrigins(origins []string) *Server {
+	s.allowedOrigins = origins
+	return s
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	static, err := fs.Sub(assets, "assets")
@@ -219,6 +260,11 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
+	// ADR-037 §3: the canonical trust root a verifier reaches over
+	// ordinary domain-validated TLS, deliberately *not* itself content-
+	// addressed -- returns exactly the signed manifest of the currently
+	// active frontend release.
+	mux.HandleFunc("GET /.well-known/openinfra-frontend", s.wellKnownFrontend)
 	mux.HandleFunc("GET /api/v1/overview", s.overview)
 	mux.HandleFunc("POST /api/v1/auth/challenge", s.authChallenge)
 	mux.HandleFunc("POST /api/v1/auth/login", s.authLogin)
@@ -245,7 +291,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		http.Redirect(w, r, "/dashboard/", http.StatusTemporaryRedirect)
 	})
-	return securityHeaders(mux)
+	return securityHeaders(s.corsAllowlist(mux))
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {

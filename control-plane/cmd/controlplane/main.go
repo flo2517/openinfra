@@ -20,6 +20,7 @@ import (
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/dashboard"
+	"github.com/openinfra/network/internal/frontendrelease"
 	"github.com/openinfra/network/internal/openstackapi"
 	"github.com/openinfra/network/internal/openstackapi/cinder"
 	"github.com/openinfra/network/internal/orchestrator"
@@ -276,8 +277,26 @@ func run() error {
 	walletService := walletlogin.NewService(walletlogin.NewPostgresRepository(pool), userRepository)
 	authRateLimit := envIntOrDefault("DASHBOARD_AUTH_RATE_LIMIT_PER_MINUTE", 10)
 	authLimiter := ratelimit.NewRedisLimiter(redisClient, authRateLimit, 60)
+	// ADR-037 §4: the static cross-origin allowlist for credentialed
+	// dashboard requests -- the canonical DNSLink origin and the
+	// self-hosted kubo gateway origin, nothing else. Empty by default
+	// (comma-separated, e.g. "https://dashboard.example.org,https://
+	// gateway.example.org") -- a deployment that never sets this behaves
+	// exactly as before ADR-037 (same-origin only), the smallest possible
+	// change for the existing single-origin dev/Compose stack.
+	var allowedOrigins []string
+	if raw := os.Getenv("DASHBOARD_ALLOWED_LOGIN_ORIGINS"); raw != "" {
+		for _, origin := range strings.Split(raw, ",") {
+			if trimmed := strings.TrimSpace(origin); trimmed != "" {
+				allowedOrigins = append(allowedOrigins, trimmed)
+			}
+		}
+	}
+	dashboardServer := dashboard.New(pool, redisClient, chainClient, walletService, userRepository, authLimiter, workloadService).
+		WithAllowedOrigins(allowedOrigins).
+		WithFrontendReleases(frontendrelease.NewPostgresRepository(pool))
 	httpServer := &http.Server{
-		Handler:           dashboard.New(pool, redisClient, chainClient, walletService, userRepository, authLimiter, workloadService).Handler(),
+		Handler:           dashboardServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

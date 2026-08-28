@@ -23,7 +23,11 @@ const NON_STOPPABLE_STATES = new Set(['STOPPING', 'STOPPED', 'COMPLETED', 'FAILE
 function authedFetch(path, options = {}) {
   const key = window.openinfraSession.key();
   const headers = Object.assign({}, options.headers, { authorization: 'Bearer ' + key });
-  return fetch(path, Object.assign({}, options, { headers }));
+  // ADR-037 §2: every credentialed call routes through
+  // openinfraApiUrl(path) (config.js) instead of a hard-coded
+  // same-origin-relative path, so it targets config.json's api_origin
+  // once this bundle is served from a content-addressed gateway.
+  return fetch(window.openinfraApiUrl(path), Object.assign({}, options, { headers }));
 }
 
 // cpuCell/ramCell/storageCell read Requirements the same way app.js's

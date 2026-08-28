@@ -85,6 +85,11 @@ const context = vm.createContext({
     }),
   },
   window: {
+    // ADR-037 §2: normally set by config.js, loaded before operator.js on
+    // the real page (index.html). This harness only loads operator.js in
+    // isolation, so it stubs the same same-origin-relative identity
+    // config.json's checked-in api_origin: "" default produces.
+    openinfraApiUrl: path => path,
     openinfraSession: {
       key: () => config.session,
       onChange: () => {},

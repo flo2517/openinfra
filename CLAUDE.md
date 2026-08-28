@@ -156,7 +156,7 @@ implementation, per `AGENTS.md`.
   the architecture docs describe.
 - `tests/e2e/` (dispatched by `tests/e2e/run.sh`, invoked via `make e2e`) is only partly in CI:
   `30-migrations-rollback` runs as its own job (`e2e-migrations`); `00-happy-path`,
-  `10-multi-provider-concurrency`, and `20-chaos-injection` do not.
+  `10-multi-provider-concurrency`, `20-chaos-injection`, and `40-content-addressed-frontend` do not.
 - `internal/orchestrator/worker.go`'s retry path has no maximum-attempt cutoff: a workload whose
   Agent has permanently died retries the same `DEPLOYING` state against the same dead provider
   forever rather than eventually failing or rescheduling elsewhere (found while writing
