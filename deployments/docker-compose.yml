@@ -203,6 +203,17 @@ services:
       CONTROL_PLANE_GRPC_ADDR: 0.0.0.0:50051
       CONTROL_PLANE_HTTP_ADDR: 0.0.0.0:8080
       OPENINFRA_DEV_DASHBOARD_INSECURE: "true"
+      # ADR-031 §2: the OpenStack-compatible surface (Keystone/Nova/
+      # Neutron/Glance/Cinder) is a separate listener from the dashboard
+      # above, defaulting to loopback-only inside the container
+      # (control-plane/cmd/controlplane/main.go's loopbackHTTPListener).
+      # Never wired into this dev stack until now -- found via a post-merge
+      # functional check: the entire v2.0 OpenStack API surface built this
+      # session had no published port and was unreachable from the host.
+      # Same insecure-dev-bind pattern as OPENINFRA_DEV_DASHBOARD_INSECURE
+      # above, not a security relaxation of the listener's own auth.
+      OPENSTACK_API_HTTP_ADDR: 0.0.0.0:8087
+      OPENINFRA_DEV_OPENSTACK_API_INSECURE: "true"
       TLS_CERT_FILE: /run/openinfra-tls/server.crt
       TLS_KEY_FILE: /run/openinfra-tls/server.key
       TLS_CLIENT_CA_FILE: /run/openinfra-tls/ca.crt
@@ -224,6 +235,7 @@ services:
     ports:
       - "127.0.0.1:50051:50051"
       - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8087:8087"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
