@@ -27,7 +27,7 @@ let providersOffset=0,providersLimit=500;
 async function refresh(){
   if(active)active.abort();active=new AbortController();text('sample','Actualisation…');
   try{
-    const response=await fetch(`/api/v1/overview?providers_offset=${providersOffset}`,{signal:active.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();
+    const response=await fetch(window.openinfraApiUrl(`/api/v1/overview?providers_offset=${providersOffset}`),{signal:active.signal});if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();
     providersLimit=data.providers_limit||providersLimit;
     text('fresh',data.providers_fresh);text('total',`${data.providers_total} enregistrés`);text('cpu',Number(data.cpu_available).toFixed(1));text('memory',`${Math.round(data.memory_available_mb/1024)} GiB`);text('block',`#${data.finalized_block}`);text('chain',data.chain_syncing?'synchronisation en cours':`best #${data.best_block}`);text('workload-count',data.workloads_total);
     // validators_active is -1 when the read failed: show that as unknown,
@@ -71,7 +71,7 @@ async function loadValidatorHealth(fallbackAccounts,activeCount,signal){
   validators.replaceChildren();
   const unavailable='Ensemble des validateurs indisponible — ne pas confondre avec zéro validateur actif.';
   try{
-    const response=await fetch('/api/v1/validator/health',{signal});
+    const response=await fetch(window.openinfraApiUrl('/api/v1/validator/health'),{signal});
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const data=await response.json();
     text('validator-quorum',data.min_quorum);text('validator-committee',data.target_committee_size);
@@ -112,7 +112,7 @@ async function loadValidatorScores(){
   if(!providerId){warning.hidden=false;warning.textContent='Indiquez un provider_id.';return}
   rows.replaceChildren();
   try{
-    const response=await fetch(`/api/v1/validator-scores/${encodeURIComponent(providerId)}`);
+    const response=await fetch(window.openinfraApiUrl(`/api/v1/validator-scores/${encodeURIComponent(providerId)}`));
     if(response.status===404){warning.hidden=false;warning.textContent='Provider introuvable.';return}
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const data=await response.json();
@@ -141,7 +141,7 @@ async function loadOpenRounds(){
   // panel above; repeating it here would be two alerts for one mistake.
   if(!providerId)return;
   try{
-    const response=await fetch(`/api/v1/validator/rounds/${encodeURIComponent(providerId)}`);
+    const response=await fetch(window.openinfraApiUrl(`/api/v1/validator/rounds/${encodeURIComponent(providerId)}`));
     if(response.status===404)return;
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const data=await response.json();
@@ -185,7 +185,7 @@ async function loadProviderOnChain(){
   for(const id of ['onchain-points','onchain-availability','onchain-samples','onchain-sequence','onchain-observed','onchain-hash'])$(id).textContent=unknown;
   if(!providerId)return;
   try{
-    const response=await fetch(`/api/v1/provider/${encodeURIComponent(providerId)}/onchain`);
+    const response=await fetch(window.openinfraApiUrl(`/api/v1/provider/${encodeURIComponent(providerId)}/onchain`));
     if(response.status===404)return;
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const data=await response.json();

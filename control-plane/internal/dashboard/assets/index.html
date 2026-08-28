@@ -3,6 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!--
+    ADR-037 §5: this <meta> CSP is what a content-addressed gateway
+    hosting this exact release actually enforces (a static file cannot
+    carry an HTTP response header set by a Go server this project may
+    not operate) -- a tampered copy of this tag changes the page's own
+    CID, which is this policy's own tamper-evidence. connect-src 'self'
+    is what the direct-serve /dashboard/ path (this checked-in copy)
+    needs for its own same-origin API calls and its same-origin
+    config.json fetch below; a real release build additionally widens
+    this to the canonical api_origin (frontendrelease.BuildRelease's
+    rewriteCSPForAPIOrigin) when api_origin is set to something other
+    than same-origin. frame-ancestors is a known, spec-level no-op here
+    (ignored via <meta>, header-only) -- see dashboard.go's
+    securityHeaders for the still-enforced header equivalent on the
+    direct-serve path.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'">
   <title>OpenInfra Network</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -125,6 +142,19 @@
       </div>
     </section>
   </main>
+  <!--
+    config.js is deliberately NOT `defer`red, and loaded before every
+    script below: it runs synchronously, in document order, so
+    window.openinfraApiUrl already exists the instant auth.js/app.js/
+    tenant.js/operator.js (all `defer`, which only guarantees running
+    after full document parse, in relative order among themselves) start
+    executing. Also deliberately an external file rather than an inline
+    <script> block: this CSP's script-src 'self' (both the meta tag
+    above and dashboard.go's header on the direct-serve path) has no
+    'unsafe-inline', so an inline script would simply not run at all --
+    config.js is a same-origin file, like every other script here.
+  -->
+  <script src="config.js"></script>
   <script src="auth.js" defer></script>
   <script src="app.js" defer></script>
   <script src="tenant.js" defer></script>

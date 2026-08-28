@@ -51,7 +51,7 @@ var (
 	ErrSecurityGroupInUse = errors.New("security group is still attached to a port")
 	ErrRuleNotFound       = errors.New("security group rule not found")
 	// ErrDuplicateRule is CreateRule's failure on an exact-duplicate rule
-	// (migration 000022's neutron_security_group_rules_dedup_idx), real
+	// (migration 000023's neutron_security_group_rules_dedup_idx), real
 	// Neutron's own SecurityGroupRuleExists behavior.
 	ErrDuplicateRule = errors.New("an identical security group rule already exists")
 	// ErrInvalidRule is CreateRule's failure for a structurally invalid
