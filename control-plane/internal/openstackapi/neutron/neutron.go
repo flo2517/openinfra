@@ -67,6 +67,7 @@ type Server struct {
 	networks       NetworkRepository
 	ports          PortRepository
 	securityGroups SecurityGroupRepository
+	workloads      WorkloadLookup
 }
 
 // New builds a neutron Server. users authenticates every route via
@@ -75,9 +76,14 @@ type Server struct {
 // (network.go/port.go/securitygroup.go) -- internal/openstackapi.New
 // passes NewPostgresNetworkRepository/NewPostgresPortRepository/
 // NewPostgresSecurityGroupRepository, the same pool every other
-// PostgresRepository in this package family shares.
-func New(users osauth.TokenAuthenticator, bandwidth BandwidthRepository, usage UsageRepository, zones ZoneLister, networks NetworkRepository, ports PortRepository, securityGroups SecurityGroupRepository) *Server {
-	return &Server{users: users, bandwidth: bandwidth, usage: usage, zones: zones, networks: networks, ports: ports, securityGroups: securityGroups}
+// PostgresRepository in this package family shares. workloads is the
+// same *workloadapi.PostgresRepository instance
+// internal/openstackapi.New already threads into cinder.New as its own
+// WorkloadLookup -- updatePort's BindPort path uses it to verify a
+// device_id's target workload belongs to the caller's own project (see
+// port.go's WorkloadLookup doc comment for why: PR #195 Finding 1).
+func New(users osauth.TokenAuthenticator, bandwidth BandwidthRepository, usage UsageRepository, zones ZoneLister, networks NetworkRepository, ports PortRepository, securityGroups SecurityGroupRepository, workloads WorkloadLookup) *Server {
+	return &Server{users: users, bandwidth: bandwidth, usage: usage, zones: zones, networks: networks, ports: ports, securityGroups: securityGroups, workloads: workloads}
 }
 
 // Register adds this package's routes to mux, matching

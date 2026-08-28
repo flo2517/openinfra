@@ -25,7 +25,9 @@ pub use rate_limit::{CommandRunner, RateLimiter, SystemCommandRunner};
 pub use security_group::SecurityGroupEnforcer;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -195,6 +197,39 @@ pub fn docker_volume_name(volume_id: &str) -> String {
 /// "not applicable" sentinel (agent.proto's own documented convention,
 /// matching `internal/openstackapi/neutron`'s identical CHECK-constraint
 /// shape on the Control-Plane side) rather than proto3 `optional`.
+/// Reports whether `value` is a well-formed `address/prefix_len` CIDR:
+/// exactly one `/`, the address half parses as a real `IpAddr` (v4 or
+/// v6), and the prefix half is a bare, unsigned decimal integer (no
+/// sign, no whitespace, no leading `+`) within that address family's
+/// valid bit range (0-32 for v4, 0-128 for v6). Deliberately manual
+/// rather than a byte-for-byte reimplementation of a full CIDR-parsing
+/// crate: this crate has no existing CIDR-parsing dependency (see this
+/// function's caller's own doc comment/PR #195 Finding 3), and the
+/// wire format here is narrow enough that `IpAddr::from_str` plus this
+/// bounds check covers it exactly, with no partial/lenient parsing path
+/// (e.g. `str::parse::<u8>` alone would silently accept a leading `+`,
+/// which this deliberately does not by checking every byte is an ASCII
+/// digit first).
+fn is_valid_cidr(value: &str) -> bool {
+    let Some((address, prefix_len)) = value.split_once('/') else {
+        return false;
+    };
+    let Ok(address) = IpAddr::from_str(address) else {
+        return false;
+    };
+    if prefix_len.is_empty() || !prefix_len.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(prefix_len) = prefix_len.parse::<u32>() else {
+        return false;
+    };
+    let max_prefix_len = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    prefix_len <= max_prefix_len
+}
+
 fn parse_security_group_rule(
     rule: &agent_api::proto::SecurityGroupRule,
 ) -> Result<SecurityGroupRule, ExecutorError> {
@@ -247,6 +282,27 @@ fn parse_security_group_rule(
     if rule.remote_ip_prefix.is_empty() || rule.remote_ip_prefix.len() > 64 {
         return Err(ExecutorError::InvalidRequest(
             "security_context.rules[].remote_ip_prefix must be a non-empty CIDR of at most 64 characters".to_string(),
+        ));
+    }
+    // Finding 3 (internal security review, PR #195): remote_ip_prefix is
+    // security-relevant input crossing a process boundary
+    // (agent-core::local_state's own doc comment on SecurityGroupRule
+    // already claims this crate re-validates it independently -- before
+    // this check, that claim was false, and the length/emptiness check
+    // above let a malformed value straight through to
+    // security_group.rs's add_rule_args, which places it as a single,
+    // unvalidated argv token in an `nft add rule ...` invocation. nft's
+    // own CLI parser concatenates argv tokens into one grammar buffer
+    // (confirmed against a real nft 1.0.9 binary), so a value containing
+    // an nft statement separator (e.g. "10.0.0.0/24; add rule ... accept
+    // #") is a real grammar-injection primitive there even though
+    // CommandRunner never invokes a shell. Rejecting (never truncating
+    // or sanitizing) anything that doesn't parse as a real CIDR closes
+    // that off at the one place a wire value becomes a command argument.
+    if !is_valid_cidr(&rule.remote_ip_prefix) {
+        return Err(ExecutorError::InvalidRequest(
+            "security_context.rules[].remote_ip_prefix must be a valid CIDR (address/prefix_len)"
+                .to_string(),
         ));
     }
     Ok(SecurityGroupRule {
@@ -919,6 +975,19 @@ impl DockerExecutor {
     /// fresh-deploy path above, tearing down an already-running workload
     /// on this failure would be a strictly worse outcome than leaving it
     /// running with its last-known-good nftables state intact.
+    ///
+    /// Deliberately does **not** early-return on an already-`true`
+    /// `record.security_groups_applied` (Finding 2, internal security
+    /// review, PR #195): that flag is this Agent's own persisted memory
+    /// of a *past* successful application, never independently
+    /// re-verified against the actual kernel/nftables state -- trusting
+    /// it here would skip reapplication for exactly the case this
+    /// method exists to handle (drift between persisted state and
+    /// live kernel state after a restart). `apply_to_interface`'s own
+    /// doc comment establishes it is idempotent (flush-then-readd, safe
+    /// to call twice, no meaningful cost), so there is no real reason to
+    /// ever skip it here -- every call to `recover()` for a workload
+    /// with a bound port (`Some(rules)`) reapplies unconditionally.
     async fn apply_security_groups_if_needed(
         &self,
         record: &mut WorkloadRecord,
@@ -927,9 +996,6 @@ impl DockerExecutor {
         let Some(rules) = record.security_group_rules.clone() else {
             return;
         };
-        if record.security_groups_applied {
-            return;
-        }
         match self
             .engine
             .apply_security_groups(container_id, &rules)
@@ -2912,6 +2978,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_reapplies_security_groups_even_when_the_persisted_flag_says_already_applied() {
+        // Finding 2 (internal security review, PR #195): recover() must
+        // never trust a persisted security_groups_applied == true as
+        // proof the live kernel/nftables state still matches -- it must
+        // call the engine again every time a workload has a bound port
+        // (Some(rules)), regardless of that flag. Reproduced here: a
+        // normal deploy() with a security context leaves
+        // security_groups_applied == true and the container running;
+        // recover() must still issue a second apply_security_groups
+        // call, not skip it because the flag already says "applied."
+        let directory = tempfile::tempdir().expect("directory");
+        let engine = Arc::new(FakeEngine::default());
+        let executor = executor(engine.clone(), directory.path(), 1);
+        let request = request_with_security_context(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(agent_api::proto::PortSecurityContext {
+                rules: vec![proto_rule("ingress", "tcp", 443, 443, "0.0.0.0/0")],
+            }),
+        );
+        let workload_id = request.workload_id.clone();
+
+        let container_id = executor.deploy(request).await.expect("deploy");
+
+        let record = executor
+            .state
+            .workload(&workload_id)
+            .expect("workload record after deploy");
+        assert!(
+            record.security_groups_applied,
+            "deploy() must have set the flag before recover() is exercised"
+        );
+        assert_eq!(
+            engine
+                .security_group_calls
+                .lock()
+                .expect("security group calls lock")
+                .len(),
+            1,
+            "deploy() itself must have applied security groups exactly once"
+        );
+
+        executor.recover().await.expect("recover");
+
+        let calls = engine
+            .security_group_calls
+            .lock()
+            .expect("security group calls lock");
+        assert_eq!(
+            calls.len(),
+            2,
+            "recover() must reapply security groups unconditionally, not skip it because \
+             the persisted flag already says applied"
+        );
+        assert_eq!(calls[1].0, container_id);
+    }
+
+    #[tokio::test]
     async fn deploy_rejects_negative_egress_mbps() {
         let directory = tempfile::tempdir().expect("directory");
         let engine = Arc::new(FakeEngine::default());
@@ -3020,6 +3144,56 @@ mod tests {
             .await
             .expect_err("an empty remote_ip_prefix must be rejected");
         assert!(error.to_string().contains("remote_ip_prefix"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_remote_ip_prefix_that_is_not_a_real_cidr() {
+        // Finding 3 (internal security review, PR #195): before this
+        // check, parse_security_group_rule only validated
+        // remote_ip_prefix's emptiness and length, never that it is
+        // actually a CIDR -- letting a malformed value straight through
+        // to security_group.rs's add_rule_args, which places it as a
+        // single, unvalidated argv token in an `nft add rule ...`
+        // invocation. nft's own CLI parser concatenates argv tokens into
+        // one grammar buffer (confirmed against a real nft 1.0.9
+        // binary), so a few plausible-looking-but-wrong strings are
+        // exercised here, not just the review's own reproduction.
+        for malformed in [
+            // The review's own reproduction: an nft statement separator
+            // plus a second, attacker-controlled rule and a comment to
+            // swallow the CIDR-parser's own trailing "accept" token.
+            "10.0.0.0/24; add rule netdev openinfra_sg sg_in_eth0 accept #",
+            "not-a-cidr",
+            "10.0.0.0",       // no prefix length at all
+            "10.0.0.0/33",    // prefix length out of range for IPv4
+            "10.0.0.0/-1",    // negative prefix length
+            "10.0.0.0/+8",    // leading '+' must not be accepted
+            "10.0.0.0/8 ",    // trailing whitespace
+            "2001:db8::/129", // prefix length out of range for IPv6
+        ] {
+            let directory = tempfile::tempdir().expect("directory");
+            let engine = Arc::new(FakeEngine::default());
+            let executor = executor(engine, directory.path(), 1);
+            let request = request_with_security_context(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(agent_api::proto::PortSecurityContext {
+                    rules: vec![proto_rule("ingress", "any", -1, -1, malformed)],
+                }),
+            );
+
+            let result = executor.deploy(request).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!(
+                    "{malformed:?} must be rejected as an invalid CIDR, never reach add_rule_args"
+                ),
+            };
+            assert!(
+                error.to_string().contains("remote_ip_prefix"),
+                "{malformed:?}: expected a remote_ip_prefix error, got {error}"
+            );
+        }
     }
 
     // --- ADR-028: disconnected mode / durable command reconciliation ---

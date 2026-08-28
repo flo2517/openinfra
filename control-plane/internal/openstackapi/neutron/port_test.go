@@ -157,6 +157,61 @@ func TestBindPortRejectsASecondPortForAWorkloadAlreadyBoundElsewhere(t *testing.
 	}
 }
 
+// TestBindPortRejectsAWorkloadOwnedByAnotherProject reproduces the
+// internal security review's own PR #195 Finding 1 scenario: project A
+// creates its own port, then tries to PUT it with device_id set to
+// project B's workload_id, hoping the orchestrator will later apply
+// project A's fixed_ip and security-group rules to project B's workload
+// at deploy dispatch. Before the fix, BindPort's repository query only
+// checked the PORT's project_id, never the WORKLOAD's, so this bind
+// succeeded. It must now be rejected before the port row is ever
+// touched.
+func TestBindPortRejectsAWorkloadOwnedByAnotherProject(t *testing.T) {
+	ctx, server := newTestServer(t, &fakeZoneLister{})
+	projectA := createTestProject(t, ctx, server.pool)
+	projectB := createTestProject(t, ctx, server.pool)
+	tokenA := mintProjectScopedToken(t, ctx, server.pool, server.users, projectA)
+	networkID, subnetID := createNetworkAndSubnet(t, server, tokenA, "10.36.0.0/29")
+	_, portBody := doJSON(t, server.handler, "POST", "/v2.0/ports", tokenA, map[string]any{
+		"port": map[string]any{"network_id": networkID, "subnet_id": subnetID},
+	})
+	portID := portBody["port"].(map[string]any)["id"].(string)
+
+	// Project B's own workload -- project A must never be able to bind
+	// its port to this.
+	victimWorkloadID := insertOpenWorkload(t, ctx, server.pool, "provider-hijack-victim", projectB, "RUNNING", 0, 0)
+
+	status, body := doJSON(t, server.handler, "PUT", "/v2.0/ports/"+portID, tokenA, map[string]any{
+		"port": map[string]any{"device_id": victimWorkloadID},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("binding a port to another project's workload must be rejected, got %d: %v", status, body)
+	}
+
+	// The port must still be unbound -- the rejected bind must never
+	// have reached the write.
+	status, showBody := doJSON(t, server.handler, "GET", "/v2.0/ports/"+portID, tokenA, nil)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %v", status, showBody)
+	}
+	if deviceID := showBody["port"].(map[string]any)["device_id"]; deviceID != "" {
+		t.Fatalf("port must remain unbound after a rejected cross-project bind attempt, got device_id=%v", deviceID)
+	}
+
+	// And project B's own view of its workload's port must still show
+	// no binding -- PortForWorkload (the orchestrator's own read path)
+	// must never resolve project A's port for project B's workload.
+	status, listBody := doJSON(t, server.handler, "GET", "/v2.0/ports", tokenA, nil)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %v", status, listBody)
+	}
+	for _, p := range listBody["ports"].([]any) {
+		if p.(map[string]any)["device_id"] == victimWorkloadID {
+			t.Fatalf("no port owned by project A may be bound to project B's workload: %v", p)
+		}
+	}
+}
+
 func TestDeletePortFailsWhileBoundAndSucceedsAfterUnbind(t *testing.T) {
 	ctx, server := newTestServer(t, &fakeZoneLister{})
 	projectID := createTestProject(t, ctx, server.pool)

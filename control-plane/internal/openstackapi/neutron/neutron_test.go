@@ -15,6 +15,7 @@ import (
 	"github.com/openinfra/network/internal/openstackapi/neutron"
 	"github.com/openinfra/network/internal/testsupport"
 	"github.com/openinfra/network/internal/userauth"
+	"github.com/openinfra/network/internal/workloadapi"
 	"github.com/openinfra/network/migrations"
 )
 
@@ -86,7 +87,8 @@ func newTestServer(t *testing.T, zones neutron.ZoneLister) (context.Context, tes
 	ctx, pool := newTestPool(t)
 	users := userauth.NewPostgresRepository(pool)
 	server := neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), zones,
-		neutron.NewPostgresNetworkRepository(pool), neutron.NewPostgresPortRepository(pool), neutron.NewPostgresSecurityGroupRepository(pool))
+		neutron.NewPostgresNetworkRepository(pool), neutron.NewPostgresPortRepository(pool), neutron.NewPostgresSecurityGroupRepository(pool),
+		workloadapi.NewPostgresRepository(pool))
 	mux := http.NewServeMux()
 	server.Register(mux)
 	return ctx, testServer{handler: mux, pool: pool, users: users}

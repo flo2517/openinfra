@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/openinfra/network/internal/openstackapi/osauth"
+	"github.com/openinfra/network/internal/workloadapi"
 )
 
 var (
@@ -44,6 +45,11 @@ var (
 	// ErrSubnetPoolExhausted is CreatePort's failure when no address in
 	// the subnet's CIDR remains unallocated.
 	ErrSubnetPoolExhausted = errors.New("subnet has no available addresses")
+	// ErrWorkloadNotOwned is updatePort's failure when a bind's
+	// device_id names a workload that does not belong to the caller's
+	// own project -- see updatePort's doc comment for the cross-project
+	// hijack this closes (internal security review, PR #195 Finding 1).
+	ErrWorkloadNotOwned = errors.New("device_id does not name a workload owned by this project")
 )
 
 // Port is one durable neutron_ports row. WorkloadID mirrors real
@@ -98,6 +104,26 @@ type PortRepository interface {
 	// its own project-scoped workload lookup upstream), never by an HTTP
 	// handler in this package directly.
 	PortForWorkload(ctx context.Context, workloadID string) (port Port, found bool, err error)
+}
+
+// WorkloadLookup is the subset of *workloadapi.PostgresRepository this
+// package needs to enforce that a port's device_id (bind target) belongs
+// to the caller's own project -- mirrors
+// internal/openstackapi/cinder.WorkloadLookup's identical
+// project-scoped GetByProject exactly, reused here for the same reason:
+// BindPort's own repository query only ever verified the PORT's
+// project_id, never the WORKLOAD named by device_id, so a caller from
+// project A could bind their own port to project B's workload_id and
+// have it accepted -- PortForWorkload/ResolveForWorkload then resolve
+// that binding with no project scope at all (by design: the orchestrator
+// is a trusted internal caller resolving by workload_id, not a
+// tenant-facing project scope), so project A's fixed_ip and
+// security-group rules would be applied to project B's workload at
+// deploy dispatch (internal security review, PR #195 Finding 1). This
+// lookup closes that gap at the one HTTP entry point that accepts a
+// caller-supplied device_id.
+type WorkloadLookup interface {
+	GetByProject(ctx context.Context, workloadID, projectID string) (workloadapi.Workload, error)
 }
 
 func (s *Server) createPort(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +265,24 @@ func (s *Server) updatePort(w http.ResponseWriter, r *http.Request) {
 		} else {
 			if _, parseErr := uuid.Parse(*body.Port.DeviceID); parseErr != nil {
 				osauth.WriteError(w, http.StatusBadRequest, "Bad Request", "port.device_id must be a workload UUID")
+				return
+			}
+			// Finding 1 (internal security review, PR #195): device_id
+			// must name a workload owned by the caller's own project --
+			// without this, the BindPort write below only ever verified
+			// the PORT's project_id, never the WORKLOAD's, letting
+			// project A bind its own port to project B's workload_id and
+			// have project A's fixed_ip/security-group rules applied to
+			// project B's workload at deploy dispatch. Mirrors
+			// cinder.attachVolume's identical GetByProject ownership
+			// check before its own attach write.
+			if _, err := s.workloads.GetByProject(ctx, *body.Port.DeviceID, identity); err != nil {
+				if errors.Is(err, workloadapi.ErrNotFound) {
+					osauth.WriteError(w, http.StatusBadRequest, "Bad Request", ErrWorkloadNotOwned.Error())
+					return
+				}
+				slog.Error("neutron: workload lookup for port bind failed", "error", err)
+				osauth.WriteError(w, http.StatusServiceUnavailable, "Service Unavailable", "port update unavailable")
 				return
 			}
 			port, err = s.ports.BindPort(ctx, portID, identity, *body.Port.DeviceID)

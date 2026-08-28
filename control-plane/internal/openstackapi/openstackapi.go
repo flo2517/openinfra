@@ -116,7 +116,7 @@ func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Re
 		keystone: keystone.New(users, projectsRepo, baseURL, audit),
 		nova:     nova.New(pool, users, projectsRepo, workloads, workloadStore, directory, nova.DefaultFlavors),
 		neutron: neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), directory,
-			neutron.NewPostgresNetworkRepository(pool), neutron.NewPostgresPortRepository(pool), neutron.NewPostgresSecurityGroupRepository(pool)),
+			neutron.NewPostgresNetworkRepository(pool), neutron.NewPostgresPortRepository(pool), neutron.NewPostgresSecurityGroupRepository(pool), workloadStore),
 		glance:  glance.New(users, glance.NewPostgresRepository(pool), glance.AuditRecorder(audit)),
 		cinder:  cinder.New(users, cinder.NewPostgresRepository(pool), workloadStore, volumeDispatcher, cinder.AuditRecorder(audit)),
 		limiter: limiter,
