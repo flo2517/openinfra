@@ -25,6 +25,7 @@ import (
 	"github.com/openinfra/network/internal/frontendrelease"
 	"github.com/openinfra/network/internal/openstackapi"
 	"github.com/openinfra/network/internal/openstackapi/cinder"
+	"github.com/openinfra/network/internal/openstackapi/neutron"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/pki"
 	"github.com/openinfra/network/internal/projects"
@@ -260,6 +261,14 @@ func run() error {
 		worker.SetOverlay(overlay)
 		slog.Info("WireGuard workload overlay enabled", "interface", interfaceName, "first_port", firstPort, "last_port", lastPort)
 	}
+	// ADR-035 §3 / issue #170: without this, DEPLOYING dispatch never
+	// populates DeployRequest.security_context at all -- a tenant could
+	// attach a security group to a port and get 200 OK, but the Agent
+	// would never install any nftables enforcement for it on any real
+	// deploy, the exact "wired but never actually reaches the Agent" gap
+	// issue #26's security review already found (and fixed) for Cinder
+	// volumes (see the worker.SetVolumeAttachments call above).
+	worker.SetSecurityGroupResolver(neutron.NewPostgresPortSecurityResolver(neutron.NewPostgresPortRepository(pool), neutron.NewPostgresSecurityGroupRepository(pool)))
 	go worker.Run(ctx)
 	controlplanev1.RegisterControlPlaneServiceServer(server, service)
 	healthServer := health.NewServer()

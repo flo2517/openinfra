@@ -94,6 +94,50 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+/// ADR-035 §3: which way a `SecurityGroupRule` applies -- "ingress" is
+/// traffic arriving *at* the workload, "egress" is traffic *leaving* it,
+/// matching `neutron.SecurityGroupRule`'s own vocabulary on the
+/// Control-Plane side (`internal/openstackapi/neutron.DirectionIngress`/
+/// `DirectionEgress`) and migration 000022's identical CHECK constraint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SecurityGroupDirection {
+    Ingress,
+    Egress,
+}
+
+/// The rule vocabulary ADR-035 §3 settles on for this slice --
+/// `remote_group_id` (a rule referencing another security group's live
+/// membership) is explicitly out of scope; every rule matches a static
+/// `remote_ip_prefix` CIDR instead.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SecurityGroupProtocol {
+    Tcp,
+    Udp,
+    Icmp,
+    Any,
+}
+
+/// One security-group rule to enforce against this workload's veth,
+/// mirroring `agent.proto`'s `SecurityGroupRule` message and
+/// `internal/openstackapi/neutron.SecurityGroupRule` field-for-field --
+/// kept as this crate's own plain type (not a re-export of the generated
+/// proto type), the same "never a borrowed proto type" precedent
+/// `VolumeMount` above already establishes. `port_range_min`/`max` are
+/// `None` together for protocol `Icmp`/`Any`, `Some` together (a valid,
+/// ordered 0-65535 range) for `Tcp`/`Udp` -- the same shape migration
+/// 000022's CHECK constraint enforces on the Control-Plane side; this
+/// crate re-validates it independently (`security_group.rs`'s own
+/// parsing) rather than trusting the wire value, since this is
+/// security-relevant input crossing a process boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityGroupRule {
+    pub direction: SecurityGroupDirection,
+    pub protocol: SecurityGroupProtocol,
+    pub port_range_min: Option<u16>,
+    pub port_range_max: Option<u16>,
+    pub remote_ip_prefix: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadRecord {
     pub workload_id: String,
@@ -159,6 +203,35 @@ pub struct WorkloadRecord {
     /// volumes attached.
     #[serde(default)]
     pub volume_mounts: Vec<VolumeMount>,
+    /// ADR-035 §1/§3: this workload's Neutron security-group rule set, if
+    /// it is bound to a Neutron port at all -- mirrors
+    /// `DeployRequest.security_context`'s own presence-is-the-signal
+    /// convention (see that field's doc comment in agent.proto):
+    ///   - `None`: no bound Neutron port (every workload built before
+    ///     this field existed, and every workload today that doesn't
+    ///     opt into the Neutron networking surface) -- no nftables
+    ///     enforcement, identical to pre-ADR-035 behavior.
+    ///   - `Some(rules)`, `rules` possibly empty: a bound port exists;
+    ///     empty means ADR-035 §3's fail-closed default (deny all).
+    ///
+    /// `#[serde(default)]` so records persisted before this field existed
+    /// deserialize to `None` (no enforcement expected), not a hard error
+    /// -- the same backward-compat reason as every other field added
+    /// after this struct's original shape.
+    #[serde(default)]
+    pub security_group_rules: Option<Vec<SecurityGroupRule>>,
+    /// Whether `apply_security_groups` has actually succeeded for this
+    /// workload's current container -- `rate_limited`'s exact sibling for
+    /// the same reason: a security-group application failure must never
+    /// be conflated with the container itself failing (marking a
+    /// still-running, still-unfirewalled container `Failed` would
+    /// silently free a capacity slot for something still consuming real
+    /// resources), and `deploy()`'s retry path / `recover()` both need to
+    /// know whether reapplication is still owed without needing the
+    /// original request again. `#[serde(default)]` for the same
+    /// backward-compat reason as `rate_limited`.
+    #[serde(default)]
+    pub security_groups_applied: bool,
 }
 
 /// ADR-027 §2/§3/§5: the Agent's current mTLS leaf identity, persisted by
@@ -594,6 +667,8 @@ mod tests {
             rate_limited: false,
             lease_end: Some(1_700_000_000),
             volume_mounts: Vec::new(),
+            security_group_rules: None,
+            security_groups_applied: false,
         };
         {
             let state = LocalState::open(directory.path()).expect("open state");
@@ -637,6 +712,8 @@ mod tests {
             rate_limited: false,
             lease_end: Some(1_700_000_000),
             volume_mounts: Vec::new(),
+            security_group_rules: None,
+            security_groups_applied: false,
         };
         let vm_record = |id: &str| WorkloadRecord {
             workload_id: id.to_string(),
@@ -651,6 +728,8 @@ mod tests {
             rate_limited: false,
             lease_end: Some(1_700_000_000),
             volume_mounts: Vec::new(),
+            security_group_rules: None,
+            security_groups_applied: false,
         };
 
         // A container workload at max_active=1 fills the Container

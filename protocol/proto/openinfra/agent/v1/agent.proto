@@ -133,6 +133,31 @@ message DeployRequest {
   // "no callable redeploy" gap (internal/openstackapi/nova's package
   // doc comment) rather than a silently half-built fix.
   repeated VolumeAttachment volumes = 8;
+  // ADR-035 §3 / issue #170 (hard half of issue #25): the fail-closed
+  // security-group rule set to enforce against this workload's own veth,
+  // populated by internal/orchestrator's deploy dispatch from whichever
+  // Neutron port (if any) is currently bound to this workload_id
+  // (internal/openstackapi/neutron.PortSecurityResolver.ResolveForWorkload).
+  //
+  // Presence, not content, is the signal agent-executor's security_group.rs
+  // acts on (ADR-035 §1's backward-compatibility guarantee, extended):
+  //   - Unset (the default -- every DeployRequest for a workload with no
+  //     bound Neutron port, which is every workload built before this field
+  //     existed, and every workload today that does not opt into the
+  //     Neutron networking surface): no nftables enforcement is installed
+  //     at all, identical to today's behavior.
+  //   - Set with zero `rules` (a bound port with no security group
+  //     attached, or an attached group with no rules): ADR-035 §3's
+  //     fail-closed default -- the Agent installs a default-drop chain and
+  //     adds no accept rules, denying all traffic in both directions.
+  //   - Set with one or more `rules`: the Agent installs a default-drop
+  //     chain, then adds one accept rule per entry.
+  //
+  // Only meaningful for RUNTIME_CONTAINER, matching `volumes`'/`vm`'s own
+  // "ignored for the other runtime" precedent above -- ADR-035 says
+  // nothing about VM-workload security groups, and agent-executor's
+  // vm::VmExecutor does not read this field.
+  PortSecurityContext security_context = 9;
 }
 
 enum Runtime {
@@ -152,6 +177,33 @@ message VolumeAttachment {
   string volume_id = 1;
   string mount_path = 2;
   bool read_only = 3;
+}
+
+// ADR-035 §3: wraps the unioned rule set (across every security group
+// attached to a workload's bound Neutron port) so DeployRequest can carry
+// "no bound port" (this whole message unset) distinctly from "bound port,
+// zero rules" (this message set, `rules` empty) -- see DeployRequest.
+// security_context's own doc comment for exactly how agent-executor tells
+// the two apart and what each means.
+message PortSecurityContext {
+  repeated SecurityGroupRule rules = 1;
+}
+
+// One security-group rule, mirroring
+// internal/openstackapi/neutron.SecurityGroupRule field-for-field (ADR-035
+// §3's rule vocabulary: remote_ip_prefix/CIDR only, no remote_group_id --
+// see that ADR's own "Out of scope" section). port_range_min/max use -1 as
+// their "not applicable" sentinel rather than proto3's `optional` keyword
+// (this schema has no other `optional` field, and 0-65535 already leaves
+// -1 unambiguous) -- always -1 together for protocol "icmp"/"any", always
+// a real 0-65535 value together for "tcp"/"udp", matching migration
+// 000022's own CHECK constraint on the Control-Plane side.
+message SecurityGroupRule {
+  string direction = 1;
+  string protocol = 2;
+  int32 port_range_min = 3;
+  int32 port_range_max = 4;
+  string remote_ip_prefix = 5;
 }
 
 // ADR-033 §4: digest-pinned, fetched over HTTPS, verified before first

@@ -15,6 +15,7 @@ import (
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/openstackapi/cinder"
+	"github.com/openinfra/network/internal/openstackapi/neutron"
 	"github.com/openinfra/network/internal/scheduler"
 	"github.com/openinfra/network/internal/workloadapi"
 	agentv1 "github.com/openinfra/network/protocol/generated/go/agent/v1"
@@ -93,6 +94,36 @@ type OverlayManager interface {
 	Revoke(context.Context, string) error
 }
 
+// OverlayAttacherWithAllowedIPs is an optional capability of OverlayManager
+// -- *wireguard.Manager implements it, but the interface is checked via a
+// type assertion (the same optional-capability pattern
+// DeploymentReconciler above already uses for w.dispatcher) rather than
+// added to OverlayManager itself, so an OverlayManager test fake
+// implementing only Attach/Revoke is unaffected. ADR-035 §1: when a
+// workload is bound to a Neutron port, its IPAM-reserved fixed_ip
+// replaces wireguard.Manager.Attach's own overlayAddress(0)
+// placeholder-derived AllowedIPs -- see AttachWithAllowedIPs's own doc
+// comment for the full reasoning.
+type OverlayAttacherWithAllowedIPs interface {
+	AttachWithAllowedIPs(ctx context.Context, workloadID, leaseID, containerID string, expiresAt time.Time, allowedIPs []string) error
+}
+
+// SecurityGroupResolver is internal/openstackapi/neutron's
+// PortSecurityResolver read surface (ADR-035 §3, issue #170) --
+// resolved at DEPLOYING dispatch time from whichever Neutron port (if
+// any) is currently bound to the workload being deployed, matching
+// VolumeAttachments' identical "resolve current attachment state at
+// dispatch time" shape immediately above.
+//
+// Optional, set via SetSecurityGroupResolver: a nil value (the zero
+// *Worker's default, and every existing test/deployment that predates
+// ADR-035) degrades DEPLOYING dispatch to "no security context, no
+// AllowedIPs override" exactly as before this fix -- never a hard
+// failure, matching VolumeAttachments' own degraded-mode precedent.
+type SecurityGroupResolver interface {
+	ResolveForWorkload(ctx context.Context, workloadID string) (rules []neutron.SecurityGroupRule, fixedIP string, hasPort bool, err error)
+}
+
 type Worker struct {
 	store               PersistentStore
 	directory           ProviderDirectory
@@ -102,6 +133,7 @@ type Worker struct {
 	ranker              *scheduler.Ranker
 	reputation          ReputationSource
 	volumes             VolumeAttachments
+	securityGroups      SecurityGroupResolver
 	interval, blockTime time.Duration
 	workerID            string
 	claimDuration       time.Duration
@@ -196,6 +228,15 @@ func (w *Worker) SetReputationSource(reputation ReputationSource) { w.reputation
 // the workload being deployed. See VolumeAttachments' own doc comment
 // for the degraded-mode behavior when left unset.
 func (w *Worker) SetVolumeAttachments(volumes VolumeAttachments) { w.volumes = volumes }
+
+// SetSecurityGroupResolver enables populating DeployRequest.security_context
+// (and, when the resolved port carries a fixed_ip, overriding the
+// WireGuard overlay's AllowedIPs) at DEPLOYING dispatch time. See
+// SecurityGroupResolver's own doc comment for the degraded-mode behavior
+// when left unset.
+func (w *Worker) SetSecurityGroupResolver(resolver SecurityGroupResolver) {
+	w.securityGroups = resolver
+}
 func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -334,6 +375,24 @@ func (w *Worker) processOne(ctx context.Context) error {
 				})
 			}
 		}
+		// ADR-035 §3 / issue #170: populate DeployRequest.security_context
+		// from whatever Neutron port (if any) is currently bound to this
+		// workload_id -- and, if that port carries an IPAM-reserved
+		// fixed_ip (ADR-035 §1), remember it so the WireGuard attach call
+		// below can override AllowedIPs. boundFixedIP stays empty for
+		// every workload with no bound port, which keeps the overlay
+		// attach call below on its exact existing path.
+		var boundFixedIP string
+		if w.securityGroups != nil {
+			rules, fixedIP, hasPort, err := w.securityGroups.ResolveForWorkload(ctx, item.WorkloadID)
+			if err != nil {
+				return w.retry(ctx, item, "SECURITY_GROUP_LOOKUP_FAILED", err)
+			}
+			if hasPort {
+				request.SecurityContext = &agentv1.PortSecurityContext{Rules: securityGroupRuleProtos(rules)}
+				boundFixedIP = fixedIP
+			}
+		}
 		deployCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
 		defer cancel()
 		containerID, err := w.dispatcher.DeployAndConfirm(deployCtx, provider.RegisteredProvider, request)
@@ -341,11 +400,29 @@ func (w *Worker) processOne(ctx context.Context) error {
 			return w.retry(ctx, item, "AGENT_DEPLOY_FAILED", err)
 		}
 		if w.overlay != nil {
-			if err := w.overlay.Attach(ctx, item.WorkloadID, item.LeaseID, containerID, definitionExpiry); err != nil {
+			// ADR-035 §1: a bound port's fixed_ip takes the place of
+			// Attach's own overlayAddress(0) placeholder -- always a
+			// single /32, matching ADR-010's unchanged one-address-per-
+			// peer model exactly (ADR-035 §3: "AllowedIPs continues to be
+			// programmed to exactly the port's single fixed_ip... the
+			// ceiling is structurally outside and above anything a
+			// security-group rule can express"). Exactly one of Attach/
+			// AttachWithAllowedIPs is called -- never both: Allocate is a
+			// no-op for a workload_id that already has a peer (see its
+			// own doc comment), so calling the plain, placeholder-using
+			// Attach first would permanently shadow a fixed_ip override
+			// attempted afterward.
+			var attachErr error
+			if attacher, ok := w.overlay.(OverlayAttacherWithAllowedIPs); ok && boundFixedIP != "" {
+				attachErr = attacher.AttachWithAllowedIPs(ctx, item.WorkloadID, item.LeaseID, containerID, definitionExpiry, []string{boundFixedIP + "/32"})
+			} else {
+				attachErr = w.overlay.Attach(ctx, item.WorkloadID, item.LeaseID, containerID, definitionExpiry)
+			}
+			if attachErr != nil {
 				// Do not expose a running workload with a partially attached
 				// network. Stop is best effort; the worker retries this state.
 				_ = w.dispatcher.StopAndConfirm(ctx, provider.RegisteredProvider, item.WorkloadID)
-				return w.retry(ctx, item, "OVERLAY_ATTACH_FAILED", err)
+				return w.retry(ctx, item, "OVERLAY_ATTACH_FAILED", attachErr)
 			}
 		}
 		return w.store.MarkRunning(ctx, item, containerID)
@@ -662,6 +739,35 @@ func workloadEgressMbps(definition *sharedv1.WorkloadDefinition) int32 {
 		return 0
 	}
 	return definition.Requirements.Bandwidth.EgressMbps
+}
+
+// securityGroupRuleProtos converts neutron.SecurityGroupRule (Go-side,
+// *int32 for an unset port range) into agent.proto's SecurityGroupRule
+// (wire-side, -1 for an unset port range) -- agent.proto's own doc
+// comment on SecurityGroupRule.port_range_min/max is the documented
+// contract this mirrors. An empty/nil rules produces an empty (never
+// nil-in-meaning) slice, matching PortSecurityContext.rules' own
+// "presence of the wrapper message, not this field, is the fail-closed
+// signal" convention (DeployRequest.security_context's doc comment).
+func securityGroupRuleProtos(rules []neutron.SecurityGroupRule) []*agentv1.SecurityGroupRule {
+	protos := make([]*agentv1.SecurityGroupRule, 0, len(rules))
+	for _, rule := range rules {
+		protos = append(protos, &agentv1.SecurityGroupRule{
+			Direction:      rule.Direction,
+			Protocol:       rule.Protocol,
+			PortRangeMin:   int32PtrOrSentinel(rule.PortRangeMin),
+			PortRangeMax:   int32PtrOrSentinel(rule.PortRangeMax),
+			RemoteIpPrefix: rule.RemoteIPPrefix,
+		})
+	}
+	return protos
+}
+
+func int32PtrOrSentinel(value *int32) int32 {
+	if value == nil {
+		return -1
+	}
+	return *value
 }
 
 // derefOrEmpty reads a possibly-nil string pointer -- cinder.Volume.

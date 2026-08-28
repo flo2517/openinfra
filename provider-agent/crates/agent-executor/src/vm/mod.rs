@@ -263,6 +263,12 @@ impl VmExecutor {
             // `DeployRequest.volumes` is ignored entirely on this path,
             // the same way `vm` is already ignored on the Docker path.
             volume_mounts: Vec::new(),
+            // ADR-035 §5: this ADR says nothing about VM-workload
+            // security groups (out of scope); a VM record never carries
+            // one, matching `volume_mounts`' own "ignored on this path"
+            // precedent immediately above.
+            security_group_rules: None,
+            security_groups_applied: false,
         })
     }
 
@@ -1216,6 +1222,7 @@ mod tests {
                 vm_image_sha256: digest.to_string(),
             }),
             volumes: Vec::new(),
+            security_context: None,
         }
     }
 

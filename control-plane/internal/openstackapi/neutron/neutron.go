@@ -1,23 +1,27 @@
-// Package neutron implements the "easy half" of issue #25's
-// Neutron-compatible networking surface, as ADR-031 §5/§8 scoped it: the
-// QoS/bandwidth and availability-zone pieces are a genuine compatibility
-// *shim* over already-shipped mechanism (ADR-025's tc-enforced bandwidth
-// reservation, ADR-026's availability-zone placement constraint), not
-// new orchestration state -- ADR-031 §8's sequencing table marks this
-// slice "Yes, directly," unlike networks/subnets/ports/security-groups.
+// Package neutron implements issue #25's Neutron-compatible networking
+// surface in two slices:
 //
-// This package deliberately does NOT implement networks, subnets, ports,
-// routers, security groups, floating IPs, IPAM, or DHCP/metadata policy.
-// That half of Neutron is docs/adr/035-neutron-networks-subnets-security-
-// groups.md, which is still Status: Proposed -- not accepted, not this
-// package's to build (tracked separately by issue #170). Nothing here
-// creates a network-topology primitive of any kind.
+//   - The "easy half" (ADR-031 §5/§8): QoS/bandwidth and
+//     availability-zone reporting, a genuine compatibility *shim* over
+//     already-shipped mechanism (ADR-025's tc-enforced bandwidth
+//     reservation, ADR-026's availability-zone placement constraint), not
+//     new orchestration state. Every handler in this slice (qos.go,
+//     availability_zone.go, usage.go) is read-only -- see those files'
+//     own doc comments for why.
+//   - The "hard half" (ADR-035, issue #170, now Accepted): networks,
+//     subnets, ports, security groups, and security-group rules -- this
+//     file, network.go, port.go, securitygroup.go, and
+//     postgres_networking.go, backed by migration 000022's schema. This
+//     is genuinely new orchestration state (ADR-035 §1: "inventing one is
+//     unavoidable, not a shim"), unlike the easy half above.
 //
-// Every handler in this package is read-only. Real Neutron's
-// qos-policies and availability_zones extensions both support
-// create/update; this build exposes list/show only, because everything
-// surfaced here is a live reflection of state some other,
-// already-accepted mechanism owns:
+// Routers, floating IPs, and DHCP/metadata policy remain out of scope for
+// both slices (ADR-035's own "Out of scope" section) -- nothing in this
+// package creates any of those three concepts.
+//
+// The easy half's handlers stay read-only, because everything they
+// surface is a live reflection of state some other, already-accepted
+// mechanism owns:
 //   - a workload's committed bandwidth reservation
 //     (workloads.reserved_ingress_mbps/reserved_egress_mbps, migration
 //     000010) -- internal/workloadapi.PostgresRepository.AssignLease is
@@ -56,17 +60,30 @@ import (
 // Server composes every handler this package registers -- constructed
 // once by internal/openstackapi.New, following keystone.Server's shape.
 type Server struct {
-	users     osauth.TokenAuthenticator
-	bandwidth BandwidthRepository
-	usage     UsageRepository
-	zones     ZoneLister
+	users          osauth.TokenAuthenticator
+	bandwidth      BandwidthRepository
+	usage          UsageRepository
+	zones          ZoneLister
+	networks       NetworkRepository
+	ports          PortRepository
+	securityGroups SecurityGroupRepository
+	workloads      WorkloadLookup
 }
 
 // New builds a neutron Server. users authenticates every route via
 // osauth.RequireToken, matching every other internal/openstackapi/*
-// package.
-func New(users osauth.TokenAuthenticator, bandwidth BandwidthRepository, usage UsageRepository, zones ZoneLister) *Server {
-	return &Server{users: users, bandwidth: bandwidth, usage: usage, zones: zones}
+// package. networks/ports/securityGroups back ADR-035's hard half
+// (network.go/port.go/securitygroup.go) -- internal/openstackapi.New
+// passes NewPostgresNetworkRepository/NewPostgresPortRepository/
+// NewPostgresSecurityGroupRepository, the same pool every other
+// PostgresRepository in this package family shares. workloads is the
+// same *workloadapi.PostgresRepository instance
+// internal/openstackapi.New already threads into cinder.New as its own
+// WorkloadLookup -- updatePort's BindPort path uses it to verify a
+// device_id's target workload belongs to the caller's own project (see
+// port.go's WorkloadLookup doc comment for why: PR #195 Finding 1).
+func New(users osauth.TokenAuthenticator, bandwidth BandwidthRepository, usage UsageRepository, zones ZoneLister, networks NetworkRepository, ports PortRepository, securityGroups SecurityGroupRepository, workloads WorkloadLookup) *Server {
+	return &Server{users: users, bandwidth: bandwidth, usage: usage, zones: zones, networks: networks, ports: ports, securityGroups: securityGroups, workloads: workloads}
 }
 
 // Register adds this package's routes to mux, matching
@@ -80,6 +97,33 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v2.0/availability_zones", osauth.RequireToken(s.users, s.listAvailabilityZones))
 	mux.HandleFunc("GET /v2.0/metering/bandwidth_usage", osauth.RequireToken(s.users, s.listBandwidthUsage))
 	mux.HandleFunc("GET /v2.0/metering/bandwidth_usage/{workload_id}", osauth.RequireToken(s.users, s.showBandwidthUsage))
+
+	// ADR-035's hard half: networks, subnets, ports, security groups.
+	mux.HandleFunc("POST /v2.0/networks", osauth.RequireToken(s.users, s.createNetwork))
+	mux.HandleFunc("GET /v2.0/networks", osauth.RequireToken(s.users, s.listNetworks))
+	mux.HandleFunc("GET /v2.0/networks/{network_id}", osauth.RequireToken(s.users, s.showNetwork))
+	mux.HandleFunc("DELETE /v2.0/networks/{network_id}", osauth.RequireToken(s.users, s.deleteNetwork))
+
+	mux.HandleFunc("POST /v2.0/subnets", osauth.RequireToken(s.users, s.createSubnet))
+	mux.HandleFunc("GET /v2.0/subnets", osauth.RequireToken(s.users, s.listSubnets))
+	mux.HandleFunc("GET /v2.0/subnets/{subnet_id}", osauth.RequireToken(s.users, s.showSubnet))
+	mux.HandleFunc("DELETE /v2.0/subnets/{subnet_id}", osauth.RequireToken(s.users, s.deleteSubnet))
+
+	mux.HandleFunc("POST /v2.0/ports", osauth.RequireToken(s.users, s.createPort))
+	mux.HandleFunc("GET /v2.0/ports", osauth.RequireToken(s.users, s.listPorts))
+	mux.HandleFunc("GET /v2.0/ports/{port_id}", osauth.RequireToken(s.users, s.showPort))
+	mux.HandleFunc("PUT /v2.0/ports/{port_id}", osauth.RequireToken(s.users, s.updatePort))
+	mux.HandleFunc("DELETE /v2.0/ports/{port_id}", osauth.RequireToken(s.users, s.deletePort))
+
+	mux.HandleFunc("POST /v2.0/security-groups", osauth.RequireToken(s.users, s.createSecurityGroup))
+	mux.HandleFunc("GET /v2.0/security-groups", osauth.RequireToken(s.users, s.listSecurityGroups))
+	mux.HandleFunc("GET /v2.0/security-groups/{security_group_id}", osauth.RequireToken(s.users, s.showSecurityGroup))
+	mux.HandleFunc("DELETE /v2.0/security-groups/{security_group_id}", osauth.RequireToken(s.users, s.deleteSecurityGroup))
+
+	mux.HandleFunc("POST /v2.0/security-group-rules", osauth.RequireToken(s.users, s.createSecurityGroupRule))
+	mux.HandleFunc("GET /v2.0/security-group-rules", osauth.RequireToken(s.users, s.listSecurityGroupRules))
+	mux.HandleFunc("GET /v2.0/security-group-rules/{security_group_rule_id}", osauth.RequireToken(s.users, s.showSecurityGroupRule))
+	mux.HandleFunc("DELETE /v2.0/security-group-rules/{security_group_rule_id}", osauth.RequireToken(s.users, s.deleteSecurityGroupRule))
 }
 
 // requireProjectID reads the project-scoped identity osauth.RequireToken

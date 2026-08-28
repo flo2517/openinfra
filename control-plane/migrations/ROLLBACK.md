@@ -28,6 +28,29 @@ Run manually (against a real database, never against `$POSTGRES_DB` in the
 Compose dev stack unless you mean it) with `psql -f`, applying each block in
 the order below, top to bottom.
 
+## 000023_neutron_networks_subnets_security_groups.sql
+```sql
+DROP INDEX IF EXISTS neutron_port_security_groups_group_idx;
+DROP INDEX IF EXISTS neutron_port_security_groups_port_idx;
+DROP TABLE IF EXISTS neutron_port_security_groups;
+DROP INDEX IF EXISTS neutron_security_group_rules_dedup_idx;
+DROP INDEX IF EXISTS neutron_security_group_rules_group_idx;
+DROP TABLE IF EXISTS neutron_security_group_rules;
+DROP INDEX IF EXISTS neutron_security_groups_project_idx;
+DROP TABLE IF EXISTS neutron_security_groups;
+DROP INDEX IF EXISTS neutron_ports_workload_idx;
+DROP INDEX IF EXISTS neutron_ports_network_idx;
+DROP INDEX IF EXISTS neutron_ports_project_idx;
+DROP INDEX IF EXISTS neutron_ports_subnet_fixed_ip_idx;
+DROP TABLE IF EXISTS neutron_ports;
+DROP INDEX IF EXISTS neutron_subnets_project_idx;
+DROP INDEX IF EXISTS neutron_subnets_network_idx;
+DROP INDEX IF EXISTS neutron_subnets_cidr_idx;
+DROP TABLE IF EXISTS neutron_subnets;
+DROP INDEX IF EXISTS neutron_networks_project_idx;
+DROP TABLE IF EXISTS neutron_networks;
+```
+
 ## 000022_frontend_releases.sql
 ```sql
 DROP INDEX IF EXISTS frontend_releases_active_idx;
