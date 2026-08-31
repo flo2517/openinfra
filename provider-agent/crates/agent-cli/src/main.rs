@@ -897,6 +897,12 @@ fn control_plane_client_identity(state: &LocalState) -> Result<Option<(String, S
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+    // Must run before any TLS config is built (mtls::build_server_config,
+    // or handle_join/handle_heartbeat's ClientTlsConfig) -- see
+    // mtls::install_default_crypto_provider's doc comment for why this
+    // can't be left to rustls's automatic feature-based resolution in
+    // this workspace.
+    mtls::install_default_crypto_provider();
     let cli = Cli::parse();
 
     match cli.command {
