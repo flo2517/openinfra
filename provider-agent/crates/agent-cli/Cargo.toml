@@ -14,20 +14,24 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 serde_yaml = "0.9"
 tokio = { version = "1.0", features = ["full"] }
-tonic = { version = "0.10", features = ["tls"] }
+tonic = { version = "0.12", features = ["tls"] }
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
-prost = "0.12"
-prost-types = "0.12"
+prost = "0.13"
+prost-types = "0.13"
 # ADR-013 §3: the Agent's mTLS server accepts a second client class (an
 # allowlisted Network Validator key) alongside the Control Plane CA chain.
 # tonic's ServerTlsConfig has no hook for a custom rustls ClientCertVerifier
 # (see mtls.rs's module doc), so this drops to the same rustls/tokio-rustls
-# versions tonic 0.10's "tls" feature already pulls in (kept in lockstep --
+# versions tonic 0.12's "tls" feature already pulls in (kept in lockstep --
 # do not bump independently of tonic) and builds the ServerConfig by hand.
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
-rustls-pemfile = "1"
-tokio-rustls = "0.24"
+# rustls 0.23's danger::ClientCertVerifier trait is available without any
+# extra cargo feature (the 0.21-era "dangerous_configuration" feature was
+# removed -- the danger APIs are always present, just namespaced under
+# `rustls::server::danger`/`rustls::client::danger` as a naming signal).
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
 tokio-stream = "0.1"
 # Parses the peer certificate's DER to extract its raw Ed25519
 # SubjectPublicKeyInfo for the allowlist check -- a real X.509 parse, not a

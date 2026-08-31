@@ -10,11 +10,9 @@
 //! (ADR-011 §2's explicit no-separate-validator-PKI decision).
 //!
 //! `tonic::transport::ServerTlsConfig` has no hook to plug in a custom
-//! `rustls::server::ClientCertVerifier` -- it always builds one of
-//! rustls's two fixed verifiers
-//! (`AllowAnyAuthenticatedClient`/`AllowAnyAnonymousOrAuthenticatedClient`)
-//! internally from a single CA `Certificate`
-//! (see the vendored `tonic-0.10.2/src/transport/service/tls.rs`, which is
+//! `rustls::server::danger::ClientCertVerifier` -- it always builds one of
+//! rustls's fixed verifiers internally from a single CA `Certificate`
+//! (see the vendored `tonic-0.12.3/src/transport/service/tls.rs`, which is
 //! not part of tonic's public API). So this module drops one layer lower:
 //! it builds a `rustls::ServerConfig` by hand with a custom verifier, then
 //! feeds `tokio_rustls::TlsAcceptor`-wrapped connections into
@@ -24,14 +22,53 @@
 //! provides a blanket impl for the very type `tokio_rustls::TlsAcceptor`
 //! produces), so no adapter type is needed to satisfy
 //! `serve_with_incoming`'s bounds.
+//!
+//! Ported from rustls 0.21's `ClientCertVerifier` trait (tonic 0.10) to
+//! rustls 0.23's `server::danger::ClientCertVerifier` (tonic 0.12+) --
+//! same two-trust-basis logic, on a reshaped trait surface:
+//!
+//! - `verify_client_cert`'s `end_entity`/`intermediates` are now
+//!   `&CertificateDer<'_>`/`&[CertificateDer<'_>]` (the `rustls-pki-types`
+//!   DER newtypes replacing 0.21's bare `rustls::Certificate(Vec<u8>)`),
+//!   and `now` is a `pki_types::UnixTime` rather than `std::time::
+//!   SystemTime`. The CA-chain-or-allowlisted-key decision logic itself is
+//!   unchanged: try the CA path first, only fall back to the allowlist on
+//!   its failure, never let the allowlist override a successful CA
+//!   verification.
+//! - `client_auth_root_subjects` is renamed `root_hint_subjects` (same
+//!   contract: the subjects the server hints to the client during the
+//!   handshake).
+//! - `AllowAnyAuthenticatedClient::new(roots)` (a concrete rustls type) is
+//!   replaced by `WebPkiClientVerifier::builder(Arc::new(roots)).build()`
+//!   (a fallible builder returning `Arc<dyn ClientCertVerifier>`) -- the
+//!   same "require a certificate chaining to one of these roots" CA
+//!   verifier, just constructed through 0.23's builder API. `ca` below
+//!   holds that trait object instead of the old concrete type.
+//! - `verify_tls12_signature`/`verify_tls13_signature`/
+//!   `supported_verify_schemes` are new *required* trait methods in 0.23
+//!   (0.21 supplied them as default methods backed by the same webpki
+//!   verification internally, so the old impl never had to mention them).
+//!   Delegated here to `self.ca`'s own implementation, which is exactly
+//!   the same "does this signature verify against the presented
+//!   certificate's own SubjectPublicKeyInfo" check the old default
+//!   performed -- it validates the handshake signature against whatever
+//!   certificate was presented, independent of how that certificate's
+//!   trust was established, so it applies identically to a CA-chained
+//!   certificate and an allowlisted self-signed one. A validator cannot
+//!   pass this verifier without a valid signature over its self-signed
+//!   certificate's own key, matching how a Control-Plane-issued client
+//!   can't either -- exactly the same guarantee the 0.21 code's doc
+//!   comment described, now explicit instead of inherited.
 
-use rustls::server::{AllowAnyAuthenticatedClient, ClientCertVerified, ClientCertVerifier};
-use rustls::{Certificate, DistinguishedName, PrivateKey, RootCertStore};
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme};
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
 use tokio_stream::wrappers::ReceiverStream;
@@ -46,7 +83,7 @@ const ALPN_H2: &[u8] = b"h2";
 /// next mTLS handshake evaluated after that heartbeat lands, matching
 /// ADR-013's "refreshed every heartbeat" contract and the "expired
 /// allowlist entry rejected" test both ADR-011 and ADR-013 call for.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ValidatorAllowlist {
     keys: Arc<RwLock<HashSet<[u8; 32]>>>,
 }
@@ -81,24 +118,31 @@ impl ValidatorAllowlist {
 /// and can never override, a successful CA verification.
 ///
 /// Signature verification (that the peer actually holds the private key
-/// for the certificate it presented) is unaffected: `ClientCertVerifier`'s
-/// default `verify_tls12_signature`/`verify_tls13_signature` (not
-/// overridden here) validate the handshake signature against whatever
-/// certificate was presented, independent of how that certificate's trust
-/// was established. A validator cannot pass this verifier without a valid
-/// signature over its self-signed certificate's own key, matching how a
-/// Control-Plane-issued client can't either.
+/// for the certificate it presented) is unaffected: `verify_tls12_signature`/
+/// `verify_tls13_signature` below, delegated to `self.ca`, validate the
+/// handshake signature against whatever certificate was presented,
+/// independent of how that certificate's trust was established. A
+/// validator cannot pass this verifier without a valid signature over its
+/// self-signed certificate's own key, matching how a Control-Plane-issued
+/// client can't either.
+///
+/// `#[derive(Debug)]`: rustls 0.23's `ClientCertVerifier` trait requires
+/// `Debug` (0.21's did not) -- `ca`'s `Arc<dyn ClientCertVerifier>` and
+/// `ValidatorAllowlist` both already implement it.
+#[derive(Debug)]
 struct AllowlistClientCertVerifier {
-    ca: AllowAnyAuthenticatedClient,
+    ca: Arc<dyn ClientCertVerifier>,
     allowlist: ValidatorAllowlist,
 }
 
 impl AllowlistClientCertVerifier {
-    fn new(client_ca_roots: RootCertStore, allowlist: ValidatorAllowlist) -> Self {
-        Self {
-            ca: AllowAnyAuthenticatedClient::new(client_ca_roots),
-            allowlist,
-        }
+    fn new(client_ca_roots: RootCertStore, allowlist: ValidatorAllowlist) -> anyhow::Result<Self> {
+        let ca = WebPkiClientVerifier::builder(Arc::new(client_ca_roots))
+            .build()
+            .map_err(|error| {
+                anyhow::anyhow!("build Control-Plane-CA client certificate verifier: {error}")
+            })?;
+        Ok(Self { ca, allowlist })
     }
 }
 
@@ -111,26 +155,54 @@ impl ClientCertVerifier for AllowlistClientCertVerifier {
         true
     }
 
-    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
-        self.ca.client_auth_root_subjects()
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.ca.root_hint_subjects()
     }
 
     fn verify_client_cert(
         &self,
-        end_entity: &Certificate,
-        intermediates: &[Certificate],
-        now: SystemTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
         if let Ok(verified) = self.ca.verify_client_cert(end_entity, intermediates, now) {
             return Ok(verified);
         }
-        match extract_ed25519_raw_public_key(&end_entity.0) {
+        match extract_ed25519_raw_public_key(end_entity.as_ref()) {
             Some(key) if self.allowlist.contains(&key) => Ok(ClientCertVerified::assertion()),
             _ => Err(rustls::Error::General(
                 "client certificate is neither Control-Plane-issued nor an allowlisted Network Validator key"
                     .into(),
             )),
         }
+    }
+
+    // Required as of rustls 0.23 (0.21 supplied these as default trait
+    // methods); delegated to the CA verifier's own implementation, which
+    // checks the signature against the presented certificate's own
+    // SubjectPublicKeyInfo only -- unaffected by which of the two trust
+    // bases above accepted the certificate. See this module's doc comment
+    // for the full old-API-to-new-API mapping.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.ca.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.ca.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.ca.supported_verify_schemes()
     }
 }
 
@@ -149,32 +221,28 @@ fn extract_ed25519_raw_public_key(der: &[u8]) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(spki.subject_public_key.data.as_ref()).ok()
 }
 
-fn load_cert_chain(pem: &[u8]) -> anyhow::Result<Vec<Certificate>> {
+// rustls-pemfile 2's `certs`/`private_key` return `rustls_pki_types` DER
+// newtypes directly (`CertificateDer<'static>`/`PrivateKeyDer<'static>`,
+// the latter already a union of RSA/PKCS8/EC so no manual `Item` match is
+// needed any more), replacing 1.x's bare `Vec<u8>` + hand-rolled `Item`
+// loop.
+fn load_cert_chain(pem: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     rustls_pemfile::certs(&mut Cursor::new(pem))
-        .map(|certs| certs.into_iter().map(Certificate).collect())
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|_| anyhow::anyhow!("invalid Agent TLS certificate PEM"))
 }
 
-fn load_private_key(pem: &[u8]) -> anyhow::Result<PrivateKey> {
-    let mut cursor = Cursor::new(pem);
-    loop {
-        match rustls_pemfile::read_one(&mut cursor)? {
-            Some(
-                rustls_pemfile::Item::RSAKey(key)
-                | rustls_pemfile::Item::PKCS8Key(key)
-                | rustls_pemfile::Item::ECKey(key),
-            ) => return Ok(PrivateKey(key)),
-            Some(_) => continue,
-            None => anyhow::bail!("no private key found in Agent TLS key PEM"),
-        }
-    }
+fn load_private_key(pem: &[u8]) -> anyhow::Result<PrivateKeyDer<'static>> {
+    rustls_pemfile::private_key(&mut Cursor::new(pem))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in Agent TLS key PEM"))
 }
 
 fn load_root_store(pem: &[u8]) -> anyhow::Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
-    let parsed = rustls_pemfile::certs(&mut Cursor::new(pem))
+    let parsed: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut Cursor::new(pem))
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|_| anyhow::anyhow!("invalid client CA PEM"))?;
-    let (_, ignored) = roots.add_parsable_certificates(&parsed);
+    let (_, ignored) = roots.add_parsable_certificates(parsed);
     if ignored != 0 {
         anyhow::bail!("client CA PEM contained unparsable certificates");
     }
@@ -196,13 +264,46 @@ pub fn build_server_config(
     let cert_chain = load_cert_chain(certificate_pem)?;
     let private_key = load_private_key(private_key_pem)?;
     let roots = load_root_store(client_ca_pem)?;
-    let verifier = Arc::new(AllowlistClientCertVerifier::new(roots, allowlist));
+    // rustls 0.23's `ServerConfig::builder()` already resolves the
+    // process-default `CryptoProvider` (aws-lc-rs, pulled in transitively
+    // via tokio-rustls's default features) on its own -- 0.21's
+    // `.with_safe_defaults()` step no longer exists because there is no
+    // longer a choice to make explicit here.
+    let verifier = Arc::new(AllowlistClientCertVerifier::new(roots, allowlist)?);
     let mut config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
         .with_client_cert_verifier(verifier)
         .with_single_cert(cert_chain, private_key)?;
     config.alpn_protocols.push(ALPN_H2.to_vec());
     Ok(config)
+}
+
+/// Installs `aws-lc-rs` as the process-wide rustls `CryptoProvider`, once.
+///
+/// Both this module's `ServerConfig`/`WebPkiClientVerifier` construction
+/// above and tonic's own internal TLS config building (`main.rs`'s
+/// `connect_control_plane_with_identity`, via `ClientTlsConfig`) resolve
+/// their cryptography through rustls's *process-default* `CryptoProvider`
+/// rather than one threaded through explicitly. Relying on rustls's
+/// automatic "exactly one of the ring/aws-lc-rs crate features is enabled"
+/// resolution is not safe in this workspace: `agent-executor` also depends
+/// on `reqwest` (for qcow2 boot-image fetches), whose `rustls-tls` feature
+/// pulls in rustls's `ring` feature alongside the `aws_lc_rs` feature
+/// tonic/tokio-rustls's own "tls" feature already enables. With both crate
+/// features compiled into the same binary, automatic resolution is
+/// ambiguous and panics the first time any code builds a rustls config
+/// without an explicit provider (`CryptoProvider::
+/// get_default_or_install_from_crate_features`'s own panic message).
+/// Installing explicitly, once, before any TLS code path runs removes that
+/// ambiguity: aws-lc-rs is the same backend tokio-rustls already defaults
+/// to, so this changes nothing about which cryptography actually verifies
+/// certificates and handshakes, only how the choice is made explicit
+/// rather than left to feature-unification luck.
+///
+/// Idempotent: `install_default` only ever takes effect on the first call
+/// in a process; every later call (multiple tests sharing one test
+/// binary, or an accidental second call from `main`) is a harmless no-op.
+pub fn install_default_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Binds `addr` and returns a stream of TLS-terminated connections ready
@@ -264,7 +365,6 @@ pub async fn serve_incoming(
 mod tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, PKCS_ED25519};
-    use std::time::SystemTime;
 
     fn empty_params() -> CertificateParams {
         CertificateParams::new(Vec::<String>::new()).unwrap()
@@ -285,6 +385,11 @@ mod tests {
     }
 
     fn build_fixture() -> Fixture {
+        // Every test below eventually builds a rustls ServerConfig/
+        // ClientConfig or constructs AllowlistClientCertVerifier directly,
+        // each needing the process-default CryptoProvider resolved -- see
+        // install_default_crypto_provider's doc comment.
+        install_default_crypto_provider();
         let ca_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
         let mut ca_params = empty_params();
         ca_params
@@ -338,9 +443,9 @@ mod tests {
         let fixture = build_fixture();
         let roots = load_root_store(&fixture.client_ca_pem).unwrap();
         let verifier =
-            AllowlistClientCertVerifier::new(roots, ValidatorAllowlist::new() /* empty */);
-        let end_entity = Certificate(fixture.ca_issued_client_der);
-        let result = verifier.verify_client_cert(&end_entity, &[], SystemTime::now());
+            AllowlistClientCertVerifier::new(roots, ValidatorAllowlist::new() /* empty */).unwrap();
+        let end_entity = CertificateDer::from(fixture.ca_issued_client_der);
+        let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
         assert!(
             result.is_ok(),
             "CA-chained certificate must still be accepted: {result:?}"
@@ -353,9 +458,9 @@ mod tests {
         let roots = load_root_store(&fixture.client_ca_pem).unwrap();
         let allowlist = ValidatorAllowlist::new();
         allowlist.set([fixture.self_signed_raw_key]);
-        let verifier = AllowlistClientCertVerifier::new(roots, allowlist);
-        let end_entity = Certificate(fixture.self_signed_der);
-        let result = verifier.verify_client_cert(&end_entity, &[], SystemTime::now());
+        let verifier = AllowlistClientCertVerifier::new(roots, allowlist).unwrap();
+        let end_entity = CertificateDer::from(fixture.self_signed_der);
+        let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
         assert!(
             result.is_ok(),
             "allowlisted validator key must be accepted: {result:?}"
@@ -369,9 +474,9 @@ mod tests {
         // Allowlist is non-empty but doesn't contain this certificate's key.
         let allowlist = ValidatorAllowlist::new();
         allowlist.set([[0xAA; 32]]);
-        let verifier = AllowlistClientCertVerifier::new(roots, allowlist);
-        let end_entity = Certificate(fixture.self_signed_der);
-        let result = verifier.verify_client_cert(&end_entity, &[], SystemTime::now());
+        let verifier = AllowlistClientCertVerifier::new(roots, allowlist).unwrap();
+        let end_entity = CertificateDer::from(fixture.self_signed_der);
+        let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
         assert!(
             result.is_err(),
             "neither CA-chained nor allowlisted certificate must be rejected"
@@ -384,12 +489,12 @@ mod tests {
         let roots = load_root_store(&fixture.client_ca_pem).unwrap();
         let allowlist = ValidatorAllowlist::new();
         allowlist.set([fixture.self_signed_raw_key]);
-        let verifier = AllowlistClientCertVerifier::new(roots, allowlist.clone());
-        let end_entity = Certificate(fixture.self_signed_der.clone());
+        let verifier = AllowlistClientCertVerifier::new(roots, allowlist.clone()).unwrap();
+        let end_entity = CertificateDer::from(fixture.self_signed_der.clone());
 
         // First handshake: this validator is active, so it's accepted.
         assert!(verifier
-            .verify_client_cert(&end_entity, &[], SystemTime::now())
+            .verify_client_cert(&end_entity, &[], UnixTime::now())
             .is_ok());
 
         // A newer heartbeat pushes a set that no longer includes this
@@ -397,7 +502,7 @@ mod tests {
         // replaces, it doesn't merge.
         allowlist.set([[0xBB; 32]]);
 
-        let result = verifier.verify_client_cert(&end_entity, &[], SystemTime::now());
+        let result = verifier.verify_client_cert(&end_entity, &[], UnixTime::now());
         assert!(
             result.is_err(),
             "a superseded allowlist entry must no longer be accepted: {result:?}"
@@ -448,12 +553,11 @@ mod tests {
 
         let mut client_root_store = RootCertStore::empty();
         for cert in load_cert_chain(&fixture.server_cert_pem).unwrap() {
-            client_root_store.add(&cert).unwrap();
+            client_root_store.add(cert).unwrap();
         }
-        let client_identity = Certificate(fixture.ca_issued_client_der);
+        let client_identity = CertificateDer::from(fixture.ca_issued_client_der);
         let client_key = load_private_key(&fixture.ca_issued_client_key_pem).unwrap();
         let client_config = tokio_rustls::rustls::ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(client_root_store)
             .with_client_auth_cert(vec![client_identity], client_key)
             .unwrap();

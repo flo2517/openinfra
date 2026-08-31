@@ -281,7 +281,7 @@ impl BandwidthRateLimiter {
 fn caller_public_key<T>(request: &Request<T>) -> [u8; 32] {
     request
         .peer_certs()
-        .and_then(|certs| certs.first().map(|cert| cert.get_ref().to_vec()))
+        .and_then(|certs| certs.first().map(|cert| cert.as_ref().to_vec()))
         .and_then(|der| extract_ed25519_raw_public_key(&der))
         .unwrap_or(UNKNOWN_CALLER)
 }
