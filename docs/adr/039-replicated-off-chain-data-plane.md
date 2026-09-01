@@ -2,13 +2,13 @@
 
 ## Status
 
-Proposed.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
 
-Written by Claude Code, autonomously, in response to issue #33, following the convention
-established by ADR-029/036/037/038 for a design of this weight: held as `Proposed` for the
-repository owner's explicit, in-session review and acceptance. Nothing here is implemented by this
-ADR itself. This document does not authorize any code change; it proposes a design for the
-repository owner to accept, reject, or send back for revision.
+Originally written by Claude Code, autonomously, in response to issue #33, held as `Proposed` per
+the convention established by ADR-029/036/037/038 until this acceptance. Nothing here is
+implemented yet by this ADR itself; issue #33 is unblocked by this acceptance and now carries the
+implementation work.
 
 **Numbering note**, following the identical precedent ADR-036/037/038 each already established for
 themselves. ADR-012 §6's gate table reserves this design as "ADR-024 — replicated off-chain data
