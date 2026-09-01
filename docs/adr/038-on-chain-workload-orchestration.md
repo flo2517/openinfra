@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed.
+Accepted (by the repository owner, explicitly, relayed in-session — after reviewing a full summary
+of this ADR's decisions and their reasoning, then confirming to proceed with implementation).
+Nothing here is implemented yet by this ADR itself; issue #50 (and #62's provider-reselection slice)
+is unblocked by this acceptance and now carries the implementation work.
 
 **Numbering note.** ADR-012 §6's gate table reserves this design as "ADR-019 — on-chain
 orchestration," unblocking #50 and #62. `038` is the actual next-free ADR number at the time this
