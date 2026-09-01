@@ -212,7 +212,7 @@ named in the last column.
 | **ADR-021** — content-addressed distribution and decentralized storage | #35, #58, #59 | "another database". Must settle: pinning, retention proofs, erasure, and gateway trust. **Partially fulfilled**: accepted as `docs/adr/037-content-addressed-frontend-distribution.md` — `037`, next-free at time of writing, not `021` — for #35's static-frontend-assets slice only. #58/#59's broader object/block storage scope is still open and needs its own follow-up ADR. |
 | **ADR-022** — TEE and distributed attestation | #60, #61 | none (new trust root). Must settle: which vendor roots are trusted, revocation, and what an unattested provider may still do |
 | **ADR-023** — decentralized identity, key rotation, and governance | #36 | `EnsureRoot` as governance (`blockchain/runtime/src/lib.rs:316`). Must settle: rotation and recovery per role, stake/delegation, timelocks, and emergency constraints |
-| **ADR-024** — replicated off-chain data plane | #33 | "another database". Must settle: event log vs CRDT, deterministic IDs, ordering, snapshots, pruning, and the PostgreSQL deprecation criteria. (Moved here from its original `ADR-016` reservation — see "Consequences" below.) |
+| **ADR-024** — replicated off-chain data plane | #33 | "another database". Must settle: event log vs CRDT, deterministic IDs, ordering, snapshots, pruning, and the PostgreSQL deprecation criteria. (Moved here from its original `ADR-016` reservation — see "Consequences" below.) **Fulfilled**: accepted as `docs/adr/039-replicated-off-chain-data-plane.md` — `039`, next-free at time of writing, not `024`, per this table's own numbering policy below. |
 
 Three issues need **no new gate**:
 
