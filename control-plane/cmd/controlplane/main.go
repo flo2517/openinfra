@@ -22,6 +22,7 @@ import (
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
 	"github.com/openinfra/network/internal/dashboard"
+	"github.com/openinfra/network/internal/eventlog"
 	"github.com/openinfra/network/internal/frontendrelease"
 	"github.com/openinfra/network/internal/openstackapi"
 	"github.com/openinfra/network/internal/openstackapi/cinder"
@@ -172,6 +173,29 @@ func run() error {
 	)
 	server := grpc.NewServer(options...)
 	workloadRepository := workloadapi.NewPostgresRepository(pool)
+	// ADR-039 §11's governed toggle: the dual-write into event_log is on
+	// by default (this is the actual mechanism issue #33 asks this PR to
+	// deliver), but a single env var lets an operator disable it --
+	// falling back to workloadRepository's pre-ADR-039, single-statement,
+	// non-transactional code path byte-for-byte (see SetEventLog's doc
+	// comment) -- without any code change or redeploy of anything else,
+	// exactly the "operated, monitored, and rolled back independently"
+	// property ADR-039 §11 calls for. registrar already implements
+	// eventlog.Signer (blockchainbridge/eventsigning.go): the identical
+	// Ed25519 bridge-account key EnsureActive/EnsureLeaseActive/
+	// EnsureLeaseCompleted already sign every on-chain extrinsic with,
+	// reused here for Control-Plane-originated event_log entries per
+	// ADR-039 §3 -- no new key infrastructure.
+	// eventLogRepository is always constructed (reading/exporting
+	// event_log costs nothing when the table happens to be empty) so
+	// SubscribeEvents (wired onto `service` below) stays exercisable even
+	// when dual-write itself is disabled -- a witness can still read
+	// whatever event_log history already exists even if this specific
+	// Control Plane process is presently not appending to it.
+	eventLogRepository := eventlog.NewPostgresRepository(pool)
+	if envOrDefault("EVENT_LOG_ENABLED", "true") == "true" {
+		workloadRepository.SetEventLog(eventLogRepository, registrar)
+	}
 	// Constructed once and shared: the gRPC ControlPlaneService server
 	// (via providerjoin.Service.SetWorkloadService below) and the
 	// dashboard's tenant-tier submitMyWorkload (internal/dashboard/
@@ -195,6 +219,7 @@ func run() error {
 	providerRepository := providerjoin.NewPostgresRepository(pool)
 	service := providerjoin.NewService(providerRepository, providerjoin.NewRedisHeartbeatStore(redisClient), registrar)
 	service.SetWorkloadService(workloadService)
+	service.SetEventExporter(eventLogRepository)
 	// ADR-013 §3: push the current active-validator allowlist to Agents on
 	// every heartbeat. chainClient already implements ValidatorSource via
 	// RPCClient.LatestActiveNetworkValidators; a read failure degrades to

@@ -37,6 +37,36 @@ service ControlPlaneService {
   rpc SubmitWorkload(SubmitWorkloadRequest) returns (SubmitWorkloadResponse);
   rpc GetWorkload(GetWorkloadRequest) returns (GetWorkloadResponse);
   rpc StopWorkload(StopWorkloadRequest) returns (StopWorkloadResponse);
+
+  // SubscribeEvents (ADR-039 §10/§9, issue #33) is the witness export
+  // surface: any independent party -- a tenant, a third-party auditor, a
+  // future second Control Plane once #34/ADR-017 exists -- can call this
+  // with no special relationship to the Control Plane beyond the RPC
+  // itself and read access to a chain node (to independently verify each
+  // event's chain_anchor). Streams exactly one subject's signed event_log
+  // history, strictly ordered by sequence, starting after since_sequence
+  // (0 replays from genesis) -- a witness resuming after a disconnect
+  // passes back the last sequence it verified so it never re-receives or
+  // loses an event across a reconnect (ADR-039 Tests required,
+  // "Partition"). Deliberately scoped to one subject per call, matching
+  // internal/eventlog's own per-subject verification boundary (ADR-039
+  // §2) -- discovering subject_ids a witness has not seen before is out
+  // of this RPC's scope for this PR (see internal/eventlog's doc
+  // comment).
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream SubscribeEventsResponse);
+}
+
+message SubscribeEventsRequest {
+  // "WORKLOAD_LIFECYCLE" | "LEASE_CORRELATION" | "METERING_EVIDENCE"
+  // (ADR-039 §1) -- matches EventEnvelope.subject_type's own string
+  // convention.
+  string subject_type = 1;
+  bytes subject_id = 2;
+  uint64 since_sequence = 3;
+}
+
+message SubscribeEventsResponse {
+  openinfra.shared.v1.EventEnvelope event = 1;
 }
 
 message BeginJoinRequest {

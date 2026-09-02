@@ -38,7 +38,12 @@ type PersistentStore interface {
 	ClaimNext(context.Context, string, time.Duration) (workloadapi.Workload, error)
 	BeginScheduling(context.Context, workloadapi.Workload) error
 	AssignLease(context.Context, workloadapi.Workload, string, [32]byte, workloadapi.ProviderCapacity) (uint64, error)
-	MarkLeased(context.Context, workloadapi.Workload, uint64) error
+	// MarkLeased's blockHash is the finalized block at which
+	// EnsureLeaseActive observed this lease Active on-chain -- persisted
+	// so every later Mark* call for this workload can anchor its own
+	// event_log entry against the same already-finalized fact (ADR-039
+	// §5, workloadapi.Workload.LeaseBlockHash's doc comment).
+	MarkLeased(ctx context.Context, item workloadapi.Workload, leaseID uint64, blockHash [32]byte) error
 	RetryLater(context.Context, workloadapi.Workload, string, string, time.Duration) error
 	// MarkFailed is retry's terminal counterpart, used once RetryPolicy's
 	// MaxAttempts is reached: see PostgresRepository.MarkFailed's doc
@@ -300,10 +305,19 @@ func (w *Worker) processOne(ctx context.Context) error {
 		duration := uint32((time.Duration(definition.DurationSeconds)*time.Second + w.blockTime - 1) / w.blockTime)
 		leaseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		if _, err := w.leases.EnsureLeaseActive(leaseCtx, leaseID, providerKey, item.ResourceHash, duration); err != nil {
+		finalized, err := w.leases.EnsureLeaseActive(leaseCtx, leaseID, providerKey, item.ResourceHash, duration)
+		if err != nil {
 			return w.retry(ctx, item, "LEASE_NOT_FINALIZED", err)
 		}
-		return w.store.MarkLeased(ctx, item, leaseID)
+		// ADR-039 §5: the block at which this lease's Active state was
+		// actually observed finalized is the anchor every later
+		// event_log entry for this workload reuses -- see
+		// workloadapi.PostgresRepository.MarkLeased's doc comment.
+		var blockHash [32]byte
+		if len(finalized.FinalizedBlockHash) == 32 {
+			copy(blockHash[:], finalized.FinalizedBlockHash)
+		}
+		return w.store.MarkLeased(ctx, item, leaseID, blockHash)
 	case "LEASED":
 		leaseID, err := strconv.ParseUint(item.LeaseID, 10, 64)
 		if err != nil {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openinfra/network/internal/eventlog"
 	"github.com/openinfra/network/internal/pki"
 	controlplanev1 "github.com/openinfra/network/protocol/generated/go/controlplane/v1"
 	sharedv1 "github.com/openinfra/network/protocol/generated/go/shared/v1"
@@ -119,6 +120,19 @@ type ValidatorSource interface {
 	LatestActiveNetworkValidators(ctx context.Context) ([][32]byte, error)
 }
 
+// EventExporter is SubscribeEvents' (ADR-039 §10, issue #33) read
+// dependency: eventlog.PostgresRepository's ExportSubject implements this
+// directly. Optional, like ValidatorSource/WorkloadReconciler:
+// SetEventExporter may be left unset, in which case SubscribeEvents fails
+// loudly with Unavailable (matching SubmitWorkload/GetWorkload/
+// StopWorkload's own nil-guard convention just below) rather than
+// silently streaming nothing -- a witness getting an explicit "not
+// configured" error is very different from a witness that believes it
+// received a subject's complete (empty) history.
+type EventExporter interface {
+	ExportSubject(ctx context.Context, subjectType eventlog.SubjectType, subjectID []byte, sinceSequence uint64, limit int) ([]eventlog.Entry, error)
+}
+
 type Service struct {
 	controlplanev1.UnimplementedControlPlaneServiceServer
 	repository         Repository
@@ -133,6 +147,7 @@ type Service struct {
 	workloadReconciler WorkloadReconciler
 	ca                 *pki.CA
 	renewalNonces      RenewalNonceStore
+	eventExporter      EventExporter
 }
 
 func (s *Service) SetWorkloadService(workloads WorkloadService) { s.workloads = workloads }
@@ -165,6 +180,10 @@ func (s *Service) SetCertificateAuthority(ca *pki.CA) { s.ca = ca }
 // RenewCertificate returns Unavailable without it rather than accepting a
 // renewal with no replay protection at all.
 func (s *Service) SetRenewalNonceStore(store RenewalNonceStore) { s.renewalNonces = store }
+
+// SetEventExporter enables SubscribeEvents (ADR-039 §10). See
+// EventExporter's own doc comment for the fail-loud behavior when unset.
+func (s *Service) SetEventExporter(exporter EventExporter) { s.eventExporter = exporter }
 
 func (s *Service) SubmitWorkload(ctx context.Context, request *controlplanev1.SubmitWorkloadRequest) (*controlplanev1.SubmitWorkloadResponse, error) {
 	if s.workloads == nil {

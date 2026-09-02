@@ -64,11 +64,18 @@ type Workload struct {
 	ResourceHash                                [32]byte
 	Definition                                  []byte
 	ProviderID, LeaseID, ContainerID, ErrorCode string
-	CreatedAt, UpdatedAt                        time.Time
-	WorkerID                                    string
-	WorkerLeaseUntil                            time.Time
-	Version                                     int64
-	AttemptCount                                int
+	// LeaseBlockHash is the finalized block hash observed the moment this
+	// workload's lease was first confirmed Active on-chain (set once by
+	// MarkLeased, carried forward unchanged by every later Mark* call) --
+	// ADR-039 §5's ChainAnchor.BlockHash for every event_log entry this
+	// workload produces from LEASED onward. Zero before a lease exists
+	// (ADR-039 §5's honestly-named pre-lease gap).
+	LeaseBlockHash       [32]byte
+	CreatedAt, UpdatedAt time.Time
+	WorkerID             string
+	WorkerLeaseUntil     time.Time
+	Version              int64
+	AttemptCount         int
 	// ReservedCPUMillicores/RAMMB/StorageGB/IngressMbps/EgressMbps are this
 	// workload's claim on its eventual provider's declared total
 	// capacity, fixed at creation time from validated

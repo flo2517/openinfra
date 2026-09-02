@@ -28,6 +28,31 @@ Run manually (against a real database, never against `$POSTGRES_DB` in the
 Compose dev stack unless you mean it) with `psql -f`, applying each block in
 the order below, top to bottom.
 
+## 000024_event_log.sql
+```sql
+ALTER TABLE workloads DROP COLUMN IF EXISTS lease_block_hash;
+DROP TABLE IF EXISTS event_log_witness_acks;
+DROP INDEX IF EXISTS event_log_rejections_subject_idx;
+DROP TABLE IF EXISTS event_log_rejections;
+DROP INDEX IF EXISTS event_log_subject_type_recorded_idx;
+DROP INDEX IF EXISTS event_log_subject_idx;
+DROP TABLE IF EXISTS event_log;
+```
+Rollback here is lossy in the same way every append-only-log migration in
+this directory is: `event_log`/`event_log_rejections`/
+`event_log_witness_acks` are the *authoritative* signed history for every
+workload-lifecycle transition once ADR-039's dual-write is active (ADR-039
+§11) -- dropping them destroys that history, not merely a cache of it.
+`workloads` itself is completely unaffected (it stays the live, directly-
+written table it already is, per ADR-039 §11 -- this migration only adds a
+new table and one new nullable column, never touches an existing row), so
+rolling this back never breaks workload-lifecycle correctness; it only
+means no witness can independently verify or replay what happened
+afterward. The governed toggle (ADR-039 §11, `Worker.SetEventLog`) is the
+operationally-correct way to stop *writing* new event_log rows without
+losing the history already recorded; this DROP is for a genuine schema
+rollback, not the normal way to disable the feature.
+
 ## 000023_neutron_networks_subnets_security_groups.sql
 ```sql
 DROP INDEX IF EXISTS neutron_port_security_groups_group_idx;
