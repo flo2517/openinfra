@@ -111,13 +111,19 @@ type Server struct {
 func New(pool *pgxpool.Pool, users userauth.Repository, projectsRepo projects.Repository, workloads *workloadapi.Service, workloadStore *workloadapi.PostgresRepository, directory *agentmanager.Directory, agentClient *agentmanager.Client, baseURL string, limiter RateLimiter) *Server {
 	audit := newAuditRecorder(pool)
 	volumeDispatcher := agentmanager.NewVolumeDeleteDispatcher(agentClient, agentmanager.NewPostgresRegistry(pool))
+	// Constructed once and shared between glance.Server and nova.Server
+	// (nova.New's images argument) below: both must see the identical
+	// image state, and a server-create's imageRef resolution (issue #24)
+	// reuses this exact repository rather than a second, independently
+	// constructed one.
+	glanceRepo := glance.NewPostgresRepository(pool)
 	return &Server{
 		pool:     pool,
 		keystone: keystone.New(users, projectsRepo, baseURL, audit),
-		nova:     nova.New(pool, users, projectsRepo, workloads, workloadStore, directory, nova.DefaultFlavors),
+		nova:     nova.New(pool, users, projectsRepo, workloads, workloadStore, directory, glanceRepo, nova.DefaultFlavors),
 		neutron: neutron.New(users, neutron.NewPostgresBandwidthRepository(pool), neutron.NewPostgresUsageRepository(pool), directory,
 			neutron.NewPostgresNetworkRepository(pool), neutron.NewPostgresPortRepository(pool), neutron.NewPostgresSecurityGroupRepository(pool), workloadStore),
-		glance:  glance.New(users, glance.NewPostgresRepository(pool), glance.AuditRecorder(audit)),
+		glance:  glance.New(users, glanceRepo, glance.AuditRecorder(audit)),
 		cinder:  cinder.New(users, cinder.NewPostgresRepository(pool), workloadStore, volumeDispatcher, cinder.AuditRecorder(audit)),
 		limiter: limiter,
 	}

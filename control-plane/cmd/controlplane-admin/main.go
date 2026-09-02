@@ -55,6 +55,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/providerjoin"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/migrations"
@@ -76,6 +77,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "create-user", "issue-key", "revoke-key", "grant-role":
 		return runUserCommand(ctx, args)
+	case "create-project", "set-quota":
+		return runProjectCommand(ctx, args)
 	case "revoke-provider":
 		return runRevokeProvider(ctx, args)
 	case "resolve-dispute":
@@ -193,6 +196,94 @@ func grantRole(ctx context.Context, repository *userauth.PostgresRepository, use
 		return fmt.Errorf("grant role: %w", err)
 	}
 	fmt.Printf("user %s is now role=%s\n", userID, role)
+	return nil
+}
+
+// runProjectCommand is the offline-Postgres-write counterpart of
+// runUserCommand above, for internal/projects (ADR-031 §3's Keystone-
+// compatible project model): there is deliberately no self-service
+// project-creation RPC either (same reasoning as create-user's own doc
+// comment), so standing up a project -- and, for a fixture that needs to
+// prove quota rejection, tightening its quota -- is this same kind of
+// local/offline operation. Added for tests/e2e/suites/50-nova-placement.sh
+// (issue #24), which otherwise has no way to mint the project a real
+// Keystone-scoped token requires without hand-rolling SQL that duplicates
+// this package's own AddMembership/SetQuota logic.
+func runProjectCommand(ctx context.Context, args []string) error {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return fmt.Errorf("configure PostgreSQL: %w", err)
+	}
+	defer pool.Close()
+	if err := migrations.Apply(ctx, pool); err != nil {
+		return fmt.Errorf("migrate PostgreSQL: %w", err)
+	}
+	repository := projects.NewPostgresRepository(pool)
+
+	switch args[0] {
+	case "create-project":
+		if len(args) != 3 {
+			return errors.New("usage: controlplane-admin create-project <name> <owner-user-id>")
+		}
+		return createProject(ctx, repository, args[1], args[2])
+	case "set-quota":
+		if len(args) != 6 {
+			return errors.New("usage: controlplane-admin set-quota <project-id> <max-cpu-millicores> <max-ram-mb> <max-storage-gb> <max-workloads>")
+		}
+		return setQuota(ctx, repository, args[1], args[2], args[3], args[4], args[5])
+	}
+	return usageError()
+}
+
+// createProject mints a new project and immediately adds owner-user-id as
+// projects.RoleMember -- the smallest fixture a Keystone-scoped token
+// request (POST /v3/auth/tokens with scope.project.id) needs: issueToken
+// requires a real project_memberships row for the requesting user (see
+// keystone.Server.issueToken/resolveScope), not just a project.
+func createProject(ctx context.Context, repository *projects.PostgresRepository, name, ownerUserID string) error {
+	project, err := repository.CreateProject(ctx, name, "")
+	if err != nil {
+		return fmt.Errorf("create project: %w", err)
+	}
+	if err := repository.AddMembership(ctx, project.ProjectID, ownerUserID, projects.RoleMember); err != nil {
+		return fmt.Errorf("add membership: %w", err)
+	}
+	fmt.Println("project_id:", project.ProjectID)
+	return nil
+}
+
+// setQuota parses and applies a project's resource ceiling (internal/
+// projects.Quota) -- the fixture a quota-exceeded-rejection test needs, the
+// same dimensions internal/openstackapi/nova's own
+// TestCreateServerRejectsWhenProjectQuotaIsExceeded already exercises at
+// the Go-test layer.
+func setQuota(ctx context.Context, repository *projects.PostgresRepository, projectID, maxCPUMillicores, maxRAMMB, maxStorageGB, maxWorkloads string) error {
+	cpu, err := strconv.ParseInt(maxCPUMillicores, 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse max-cpu-millicores: %w", err)
+	}
+	ram, err := strconv.ParseInt(maxRAMMB, 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse max-ram-mb: %w", err)
+	}
+	storage, err := strconv.ParseInt(maxStorageGB, 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse max-storage-gb: %w", err)
+	}
+	workloads, err := strconv.ParseInt(maxWorkloads, 10, 32)
+	if err != nil {
+		return fmt.Errorf("parse max-workloads: %w", err)
+	}
+	if err := repository.SetQuota(ctx, projects.Quota{
+		ProjectID: projectID, MaxCPUMillicores: cpu, MaxRAMMB: ram, MaxStorageGB: storage, MaxWorkloads: int32(workloads),
+	}); err != nil {
+		return fmt.Errorf("set quota: %w", err)
+	}
+	fmt.Println("quota set for project", projectID)
 	return nil
 }
 
@@ -315,5 +406,5 @@ func parseUpholdOrReject(value string) (bool, error) {
 }
 
 func usageError() error {
-	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator_readonly|operator_admin> | revoke-provider <provider-id> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject> | fund-account <account-hex> <amount>>")
+	return errors.New("usage: controlplane-admin <create-user <display-name> | issue-key <user-id> | revoke-key <key-id> | grant-role <user-id> <tenant|operator_readonly|operator_admin> | create-project <name> <owner-user-id> | set-quota <project-id> <max-cpu-millicores> <max-ram-mb> <max-storage-gb> <max-workloads> | revoke-provider <provider-id> | resolve-dispute <provider-hex> <round> <dimension> <uphold|reject> | fund-account <account-hex> <amount>>")
 }

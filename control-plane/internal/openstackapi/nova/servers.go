@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/userauth"
 	"github.com/openinfra/network/internal/workloadapi"
@@ -149,6 +150,63 @@ func (s *Server) detailBody(ctx context.Context, workload workloadapi.Workload, 
 // retroactively un-perform the action it was describing" posture
 // internal/openstackapi's own audit recorder documents for an identical
 // best-effort-second-write shape.
+// resolveImageRef resolves a server-create request's imageRef into a
+// digest-pinned image reference through #26's Glance registry
+// (internal/openstackapi/glance), rather than trusting a caller-supplied
+// digest reference directly -- issue #24's remaining Glance-integration
+// gap. s.images.GetImage already enforces project scoping (the caller's
+// own image of any visibility, or another project's public one) and
+// collapses "doesn't exist" and "belongs to a different, non-public
+// project" into the identical glance.ErrNotFound (see ImageLookup's doc
+// comment) -- both cases are rejected here the same way, with the same
+// Nova-shaped 400 badRequest this handler already uses for an unknown
+// flavorRef immediately above, so a caller cannot distinguish "no such
+// image" from "not your image" (no enumeration oracle, matching Glance's
+// own GET /v2/images/{image_id} precedent).
+//
+// The resolved reference is built from the image's own stored fields,
+// never from anything the caller supplied beyond the opaque image_id --
+// this is the actual fix for the passthrough gap: before this, imageRef
+// itself (attacker-controlled) was used verbatim as the deploy target,
+// with nothing to stop it naming an image never registered, or never
+// digest-pinned, at all.
+func (s *Server) resolveImageRef(w http.ResponseWriter, r *http.Request, imageRef, projectID string) (pinnedImage string, ok bool) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	image, err := s.images.GetImage(ctx, imageRef, projectID)
+	if errors.Is(err, glance.ErrNotFound) {
+		writeNovaError(w, http.StatusBadRequest, "badRequest", "Image "+imageRef+" could not be found.")
+		return "", false
+	}
+	if err != nil {
+		slog.Error("nova: image lookup failed", "project_id", projectID, "image_ref", imageRef, "error", err)
+		writeNovaError(w, http.StatusServiceUnavailable, "computeFault", "image lookup unavailable")
+		return "", false
+	}
+	return canonicalImageReference(image), true
+}
+
+// canonicalImageReference composes the digest-pinned deploy target this
+// package hands to workloadapi.Service.SubmitWorkload from a resolved
+// Glance image's own source_ref and digest -- the same
+// `repo[:tag]@sha256:<hex>` shape internal/workloadapi's own digestImage
+// validation already requires of every container-workload Image field
+// (service.go), so a Glance-resolved container image is pinned with
+// exactly the same discipline a directly-submitted one already is. An
+// image registered with a non-Docker-reference-shaped source_ref (e.g.
+// ADR-033's qcow2 URLs, this registry's other supported case per
+// internal/openstackapi/glance's own package doc comment) composes into a
+// string digestImage rejects -- SubmitWorkload then returns
+// InvalidArgument, which submitWorkloadError below already maps to a real
+// Nova-shaped 400, not a silent pass-through: this package only ever
+// creates RUNTIME_CONTAINER workloads (see this package's own doc
+// comment), so an image Nova cannot actually deploy is correctly refused
+// here, not mistaken for success.
+func canonicalImageReference(image glance.Image) string {
+	return image.SourceRef + "@sha256:" + image.DigestSHA256
+}
+
 func (s *Server) createServer(w http.ResponseWriter, r *http.Request) {
 	identity, projectID, ok := requireProjectScope(w, r)
 	if !ok {
@@ -165,7 +223,8 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request) {
 		writeNovaError(w, http.StatusBadRequest, "badRequest", "server name is required")
 		return
 	}
-	if strings.TrimSpace(body.Server.ImageRef) == "" {
+	imageRef := strings.TrimSpace(body.Server.ImageRef)
+	if imageRef == "" {
 		writeNovaError(w, http.StatusBadRequest, "badRequest", "imageRef is required")
 		return
 	}
@@ -192,9 +251,14 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pinnedImage, ok := s.resolveImageRef(w, r, imageRef, projectID)
+	if !ok {
+		return
+	}
+
 	request := &controlplanev1.SubmitWorkloadRequest{
 		RequestId: uuid.NewString(),
-		Image:     body.Server.ImageRef,
+		Image:     pinnedImage,
 		Definition: &sharedv1.WorkloadDefinition{
 			WorkloadId: uuid.NewString(),
 			// COMPUTE_INTENSIVE: the same arbitrary-but-valid placeholder
