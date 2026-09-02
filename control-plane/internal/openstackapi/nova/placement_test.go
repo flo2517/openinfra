@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/projects"
 )
 
@@ -109,13 +110,14 @@ func TestResourceProviderUsagesReflectsAnOpenWorkload(t *testing.T) {
 		t.Fatalf("VCPU usage before any workload = %d, want 0", zero.Usages["VCPU"])
 	}
 
-	worker := newWorker(s)
+	imageID := registerGlanceImage(t, ctx, s, actor.projectID, testImageSourceRef, testImageDigest, glance.VisibilityPrivate)
+	worker, _ := newWorker(s)
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
 	defer cancelWorker()
 
 	createRecorder := doRequest(s.handler, http.MethodPost, "/v2.1/"+actor.projectID+"/servers", actor.token,
-		createServerBody("usage-probe", testImageRef, "2", nil)) // oi.medium: 2 vcpus
+		createServerBody("usage-probe", imageID, "2", nil)) // oi.medium: 2 vcpus
 	if createRecorder.Code != http.StatusAccepted {
 		t.Fatalf("create status = %d, want %d; body=%s", createRecorder.Code, http.StatusAccepted, createRecorder.Body.String())
 	}
@@ -150,13 +152,14 @@ func TestAllocationsForConsumerReflectsAWorkloadAndDeniesOtherProjects(t *testin
 	actor := newProjectActor(t, ctx, s, "placement-alloc", projects.RoleMember)
 	other := newProjectActor(t, ctx, s, "placement-alloc-other", projects.RoleMember)
 
-	worker := newWorker(s)
+	imageID := registerGlanceImage(t, ctx, s, actor.projectID, testImageSourceRef, testImageDigest, glance.VisibilityPrivate)
+	worker, _ := newWorker(s)
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
 	defer cancelWorker()
 
 	createRecorder := doRequest(s.handler, http.MethodPost, "/v2.1/"+actor.projectID+"/servers", actor.token,
-		createServerBody("alloc-probe", testImageRef, "1", nil))
+		createServerBody("alloc-probe", imageID, "1", nil))
 	if createRecorder.Code != http.StatusAccepted {
 		t.Fatalf("create status = %d, want %d; body=%s", createRecorder.Code, http.StatusAccepted, createRecorder.Body.String())
 	}

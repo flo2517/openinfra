@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/agentmanager"
 	"github.com/openinfra/network/internal/blockchainbridge"
+	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/openstackapi/nova"
 	"github.com/openinfra/network/internal/orchestrator"
 	"github.com/openinfra/network/internal/projects"
@@ -108,12 +110,24 @@ func (successfulLeases) EnsureLeaseCompleted(_ context.Context, leaseID uint64) 
 	return blockchainbridge.FinalizedLease{LeaseID: leaseID}, nil
 }
 
-type successfulDispatcher struct{}
+// successfulDispatcher additionally records the Image every
+// DeployAndConfirm call actually dispatched with (mutex-guarded: the
+// orchestrator worker calls it from its own goroutine) -- used by
+// TestServerLifecycleReachesRunningListsGetsAndDeletes to prove the
+// Glance-resolved digest-pinned reference, not the caller-supplied Glance
+// image_id, is what actually reaches the deploy dispatch call.
+type successfulDispatcher struct {
+	mu         sync.Mutex
+	lastImages []string
+}
 
-func (successfulDispatcher) DeployAndConfirm(_ context.Context, _ agentmanager.RegisteredProvider, request *agentv1.DeployRequest) (string, error) {
+func (d *successfulDispatcher) DeployAndConfirm(_ context.Context, _ agentmanager.RegisteredProvider, request *agentv1.DeployRequest) (string, error) {
+	d.mu.Lock()
+	d.lastImages = append(d.lastImages, request.Image)
+	d.mu.Unlock()
 	return "container-" + request.WorkloadId, nil
 }
-func (successfulDispatcher) StopAndConfirm(_ context.Context, _ agentmanager.RegisteredProvider, _ string) error {
+func (d *successfulDispatcher) StopAndConfirm(_ context.Context, _ agentmanager.RegisteredProvider, _ string) error {
 	return nil
 }
 
@@ -123,6 +137,7 @@ type testServer struct {
 	users        *userauth.PostgresRepository
 	projects     *projects.PostgresRepository
 	workloadRepo *workloadapi.PostgresRepository
+	images       *glance.PostgresRepository
 	directory    *fakeDirectory
 }
 
@@ -139,6 +154,7 @@ func newTestServer(t *testing.T) (context.Context, testServer) {
 	projectsRepo := projects.NewPostgresRepository(pool)
 	workloadRepo := workloadapi.NewPostgresRepository(pool)
 	workloadService := workloadapi.NewService(workloadRepo)
+	imageRepo := glance.NewPostgresRepository(pool)
 	directory := &fakeDirectory{providers: []agentmanager.SchedulableProvider{testProvider()}}
 	// AssignLease's UPDATE (workloadapi/postgres.go) writes
 	// workloads.provider_id under a real foreign key against providers --
@@ -151,10 +167,10 @@ func newTestServer(t *testing.T) (context.Context, testServer) {
 		testProvider().ProviderID, make([]byte, 32), testProvider().AgentEndpoint); err != nil {
 		t.Fatal(err)
 	}
-	server := nova.New(pool, users, projectsRepo, workloadService, workloadRepo, directory, nova.DefaultFlavors)
+	server := nova.New(pool, users, projectsRepo, workloadService, workloadRepo, directory, imageRepo, nova.DefaultFlavors)
 	mux := http.NewServeMux()
 	server.Register(mux)
-	return ctx, testServer{handler: mux, pool: pool, users: users, projects: projectsRepo, workloadRepo: workloadRepo, directory: directory}
+	return ctx, testServer{handler: mux, pool: pool, users: users, projects: projectsRepo, workloadRepo: workloadRepo, images: imageRepo, directory: directory}
 }
 
 // newWorker builds an internal/orchestrator.Worker against the exact same
@@ -162,10 +178,30 @@ func newTestServer(t *testing.T) (context.Context, testServer) {
 // nova.Server was built with, so a server this test creates through HTTP
 // is the very row the worker claims and advances -- proving nova's
 // create path and the orchestrator's existing lifecycle are the same
-// pipeline, not two independent mechanisms that happen to agree.
-func newWorker(s testServer) *orchestrator.Worker {
+// pipeline, not two independent mechanisms that happen to agree. Returns
+// the *successfulDispatcher double too, so a caller can inspect which
+// Image each dispatched DeployRequest actually carried.
+func newWorker(s testServer) (*orchestrator.Worker, *successfulDispatcher) {
 	ranker := scheduler.NewRanker(scheduler.DefaultMaxReputationScore, scheduler.DefaultDefaultReputationScore)
-	return orchestrator.NewWorker(s.workloadRepo, s.directory, successfulLeases{}, successfulDispatcher{}, ranker)
+	dispatcher := &successfulDispatcher{}
+	return orchestrator.NewWorker(s.workloadRepo, s.directory, successfulLeases{}, dispatcher, ranker), dispatcher
+}
+
+// registerGlanceImage inserts a real glance_images row (through the exact
+// glance.PostgresRepository the nova.Server under test was wired with,
+// not a second one) and returns its minted image_id -- the fixture every
+// createServer test that needs a real, resolvable imageRef uses instead
+// of a bare digest string.
+func registerGlanceImage(t *testing.T, ctx context.Context, s testServer, projectID, sourceRef, digest, visibility string) string {
+	t.Helper()
+	image, err := s.images.CreateImage(ctx, glance.Image{
+		ProjectID: projectID, Name: "test-image-" + uuid.NewString(),
+		SourceRef: sourceRef, DigestSHA256: digest, Visibility: visibility,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return image.ImageID
 }
 
 type actor struct {
@@ -225,8 +261,29 @@ func createServerBody(name, imageRef, flavorRef string, metadata map[string]stri
 	return encoded
 }
 
+// testImageRef is a syntactically valid digest-pinned reference, but --
+// since createServer now resolves imageRef through Glance before ever
+// reaching SubmitWorkload (issue #24's Glance-integration fix) -- it does
+// NOT name a registered image. It is only usable in tests that never
+// reach image resolution at all: the three token-rejection tests (401 on
+// missing/invalid token, 403 on an unscoped token) fail at
+// requireProjectScope/osauth.RequireToken; the unknown-flavor and
+// quota-exceeded tests fail at their own earlier checks (flavor lookup,
+// CheckQuota) -- see createServer's own ordering. Any test that expects a
+// server actually to be created must register a real Glance image first
+// (registerGlanceImage) and pass its image_id instead.
 const testImageRef = "example.com/app@sha256:" +
 	"1111111111111111111111111111111111111111111111111111111111111111"
+
+// testImageSourceRef/testImageDigest are the Glance source_ref/digest
+// pair registerGlanceImage's callers use when they need
+// canonicalImageReference's resolved output to equal testImageRef exactly
+// (source_ref + "@sha256:" + digest == testImageRef) -- useful for tests
+// that assert on the exact image string a deploy dispatched with.
+const (
+	testImageSourceRef = "example.com/app"
+	testImageDigest    = "1111111111111111111111111111111111111111111111111111111111111111"
+)
 
 // waitForWorkloadState polls the real Postgres row (through the
 // project-scoped GetByProject path, the exact one nova's own showServer
@@ -264,14 +321,15 @@ func waitForWorkloadState(t *testing.T, ctx context.Context, s testServer, proje
 func TestServerLifecycleReachesRunningListsGetsAndDeletes(t *testing.T) {
 	ctx, s := newTestServer(t)
 	actor := newProjectActor(t, ctx, s, "alpha", projects.RoleMember)
+	imageID := registerGlanceImage(t, ctx, s, actor.projectID, testImageSourceRef, testImageDigest, glance.VisibilityPrivate)
 
-	worker := newWorker(s)
+	worker, dispatcher := newWorker(s)
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
 	defer cancelWorker()
 
 	createRecorder := doRequest(s.handler, http.MethodPost, "/v2.1/"+actor.projectID+"/servers", actor.token,
-		createServerBody("web-1", testImageRef, "1", map[string]string{"env": "test"}))
+		createServerBody("web-1", imageID, "1", map[string]string{"env": "test"}))
 	if createRecorder.Code != http.StatusAccepted {
 		t.Fatalf("create status = %d, want %d; body=%s", createRecorder.Code, http.StatusAccepted, createRecorder.Body.String())
 	}
@@ -292,6 +350,27 @@ func TestServerLifecycleReachesRunningListsGetsAndDeletes(t *testing.T) {
 
 	// Drive the real orchestrator state machine to RUNNING.
 	waitForWorkloadState(t, ctx, s, actor.projectID, serverID, "RUNNING", 20*time.Second)
+
+	// The real deploy dispatch must have carried the Glance-resolved
+	// digest-pinned reference (testImageRef, composed from
+	// testImageSourceRef+testImageDigest), never the opaque Glance
+	// image_id the client actually submitted -- proving createServer
+	// resolves imageRef through Glance rather than passing it through.
+	dispatcher.mu.Lock()
+	dispatchedImages := append([]string(nil), dispatcher.lastImages...)
+	dispatcher.mu.Unlock()
+	var sawResolvedImage bool
+	for _, image := range dispatchedImages {
+		if image == testImageRef {
+			sawResolvedImage = true
+		}
+		if image == imageID {
+			t.Fatalf("deploy dispatched with the raw Glance image_id %q instead of a resolved digest-pinned reference", imageID)
+		}
+	}
+	if !sawResolvedImage {
+		t.Fatalf("no DeployAndConfirm call carried the resolved image %q; dispatched images: %v", testImageRef, dispatchedImages)
+	}
 
 	// GET reflects ACTIVE (Nova's mapping of workloadapi's RUNNING).
 	showRecorder := doRequest(s.handler, http.MethodGet, "/v2.1/"+actor.projectID+"/servers/"+serverID, actor.token, nil)
@@ -505,9 +584,85 @@ func TestCreateServerRejectsWhenProjectQuotaIsExceeded(t *testing.T) {
 func TestCreateServerAllowsAProjectWithNoConfiguredQuota(t *testing.T) {
 	ctx, s := newTestServer(t)
 	actor := newProjectActor(t, ctx, s, "unbounded", projects.RoleMember)
+	imageID := registerGlanceImage(t, ctx, s, actor.projectID, testImageSourceRef, testImageDigest, glance.VisibilityPrivate)
 
 	recorder := doRequest(s.handler, http.MethodPost, "/v2.1/"+actor.projectID+"/servers", actor.token,
-		createServerBody("fine", testImageRef, "4", nil)) // largest default flavor
+		createServerBody("fine", imageID, "4", nil)) // largest default flavor
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+	}
+}
+
+// TestCreateServerRejectsAnUnknownImageRef proves an imageRef naming no
+// registered Glance image is rejected with a real Nova-shaped error
+// (badRequest, matching the sibling unknown-flavorRef precedent
+// immediately below), not silently passed through as a deploy target.
+func TestCreateServerRejectsAnUnknownImageRef(t *testing.T) {
+	ctx, s := newTestServer(t)
+	actor := newProjectActor(t, ctx, s, "unknown-image", projects.RoleMember)
+
+	recorder := doRequest(s.handler, http.MethodPost, "/v2.1/"+actor.projectID+"/servers", actor.token,
+		createServerBody("x", uuid.NewString(), "1", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	var decoded map[string]struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := decoded["badRequest"]; !ok {
+		t.Fatalf("400 body missing the \"badRequest\" fault wrapper: %+v", decoded)
+	}
+
+	// No workload must have been created -- an image-resolution failure is
+	// not a partial success, the same discipline
+	// TestCreateServerRejectsWhenProjectQuotaIsExceeded already asserts for
+	// a quota rejection.
+	listRecorder := doRequest(s.handler, http.MethodGet, "/v2.1/"+actor.projectID+"/servers", actor.token, nil)
+	var listed struct {
+		Servers []map[string]any `json:"servers"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Servers) != 0 {
+		t.Fatalf("expected no servers after an unknown-imageRef create, got %d", len(listed.Servers))
+	}
+}
+
+// TestCreateServerRejectsACrossProjectPrivateImageRef proves an imageRef
+// naming a real, existing Glance image that is private to a *different*
+// project is rejected identically to an unknown one (glance.ErrNotFound's
+// own no-enumeration-oracle collapsing, reused verbatim here) -- the
+// task's explicit "belongs to a different project" acceptance criterion.
+func TestCreateServerRejectsACrossProjectPrivateImageRef(t *testing.T) {
+	ctx, s := newTestServer(t)
+	owner := newProjectActor(t, ctx, s, "image-owner", projects.RoleMember)
+	otherActor := newProjectActor(t, ctx, s, "image-outsider", projects.RoleMember)
+	imageID := registerGlanceImage(t, ctx, s, owner.projectID, testImageSourceRef, testImageDigest, glance.VisibilityPrivate)
+
+	recorder := doRequest(s.handler, http.MethodPost, "/v2.1/"+otherActor.projectID+"/servers", otherActor.token,
+		createServerBody("x", imageID, "1", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+}
+
+// TestCreateServerAllowsACrossProjectPublicImageRef proves a *public*
+// image registered by a different project resolves successfully --
+// Glance's own visibility model (reused, not reimplemented, per
+// ImageLookup's doc comment) distinguishes "private to another project"
+// from "public," and only the former is a rejection.
+func TestCreateServerAllowsACrossProjectPublicImageRef(t *testing.T) {
+	ctx, s := newTestServer(t)
+	owner := newProjectActor(t, ctx, s, "public-image-owner", projects.RoleMember)
+	otherActor := newProjectActor(t, ctx, s, "public-image-consumer", projects.RoleMember)
+	imageID := registerGlanceImage(t, ctx, s, owner.projectID, testImageSourceRef, testImageDigest, glance.VisibilityPublic)
+
+	recorder := doRequest(s.handler, http.MethodPost, "/v2.1/"+otherActor.projectID+"/servers", otherActor.token,
+		createServerBody("x", imageID, "1", nil))
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusAccepted, recorder.Body.String())
 	}

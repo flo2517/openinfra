@@ -37,6 +37,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openinfra/network/internal/agentmanager"
+	"github.com/openinfra/network/internal/openstackapi/glance"
 	"github.com/openinfra/network/internal/openstackapi/osauth"
 	"github.com/openinfra/network/internal/projects"
 	"github.com/openinfra/network/internal/workloadapi"
@@ -79,6 +80,22 @@ type ProviderDirectory interface {
 	ListSchedulableProviders(ctx context.Context) ([]agentmanager.SchedulableProvider, error)
 }
 
+// ImageLookup is the subset of *glance.PostgresRepository this package
+// needs to resolve a server-create request's imageRef through #26's
+// already-merged Glance image registry (internal/openstackapi/glance)
+// instead of trusting a caller-supplied digest reference directly (the
+// remaining Glance-integration gap named in issue #24). GetImage already
+// scopes by project -- the caller's own image (any visibility) or another
+// project's public one -- and collapses "doesn't exist" and "exists but
+// isn't this caller's to see" into the identical glance.ErrNotFound; that
+// exact behavior is reused here verbatim (not duplicated), so an imageRef
+// naming an unknown or foreign-project-private image is rejected the same
+// way Glance's own GET /v2/images/{image_id} already rejects it -- no
+// second, independently-drifting scoping check.
+type ImageLookup interface {
+	GetImage(ctx context.Context, imageID, projectID string) (glance.Image, error)
+}
+
 // Server holds nova's handler dependencies. Constructed once by
 // internal/openstackapi.New and registered via Register, matching
 // internal/openstackapi/keystone.Server's exact shape.
@@ -89,6 +106,7 @@ type Server struct {
 	submitter WorkloadSubmitter
 	store     WorkloadStore
 	directory ProviderDirectory
+	images    ImageLookup
 	flavors   []Flavor
 	now       func() time.Time
 }
@@ -96,12 +114,15 @@ type Server struct {
 // New builds a nova Server. flavors may be nil, in which case
 // DefaultFlavors is used -- the task's own "fixed/configurable catalog"
 // requirement: fixed by default, configurable by a caller that wants a
-// different list.
-func New(pool *pgxpool.Pool, users osauth.TokenAuthenticator, projectsRepo projects.Repository, submitter WorkloadSubmitter, store WorkloadStore, directory ProviderDirectory, flavors []Flavor) *Server {
+// different list. images is internal/openstackapi.New's shared
+// glance.Repository instance (the exact one glance.Server itself is built
+// with) -- not a second, independently-constructed one -- so a server
+// create and a direct Glance lookup always see the identical image state.
+func New(pool *pgxpool.Pool, users osauth.TokenAuthenticator, projectsRepo projects.Repository, submitter WorkloadSubmitter, store WorkloadStore, directory ProviderDirectory, images ImageLookup, flavors []Flavor) *Server {
 	if flavors == nil {
 		flavors = DefaultFlavors
 	}
-	return &Server{pool: pool, users: users, projects: projectsRepo, submitter: submitter, store: store, directory: directory, flavors: flavors, now: time.Now}
+	return &Server{pool: pool, users: users, projects: projectsRepo, submitter: submitter, store: store, directory: directory, images: images, flavors: flavors, now: time.Now}
 }
 
 // Register adds this package's routes to mux, the same pattern
