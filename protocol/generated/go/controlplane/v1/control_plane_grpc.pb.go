@@ -26,6 +26,7 @@ const (
 	ControlPlaneService_SubmitWorkload_FullMethodName   = "/openinfra.controlplane.v1.ControlPlaneService/SubmitWorkload"
 	ControlPlaneService_GetWorkload_FullMethodName      = "/openinfra.controlplane.v1.ControlPlaneService/GetWorkload"
 	ControlPlaneService_StopWorkload_FullMethodName     = "/openinfra.controlplane.v1.ControlPlaneService/StopWorkload"
+	ControlPlaneService_SubscribeEvents_FullMethodName  = "/openinfra.controlplane.v1.ControlPlaneService/SubscribeEvents"
 )
 
 // ControlPlaneServiceClient is the client API for ControlPlaneService service.
@@ -58,6 +59,22 @@ type ControlPlaneServiceClient interface {
 	SubmitWorkload(ctx context.Context, in *SubmitWorkloadRequest, opts ...grpc.CallOption) (*SubmitWorkloadResponse, error)
 	GetWorkload(ctx context.Context, in *GetWorkloadRequest, opts ...grpc.CallOption) (*GetWorkloadResponse, error)
 	StopWorkload(ctx context.Context, in *StopWorkloadRequest, opts ...grpc.CallOption) (*StopWorkloadResponse, error)
+	// SubscribeEvents (ADR-039 §10/§9, issue #33) is the witness export
+	// surface: any independent party -- a tenant, a third-party auditor, a
+	// future second Control Plane once #34/ADR-017 exists -- can call this
+	// with no special relationship to the Control Plane beyond the RPC
+	// itself and read access to a chain node (to independently verify each
+	// event's chain_anchor). Streams exactly one subject's signed event_log
+	// history, strictly ordered by sequence, starting after since_sequence
+	// (0 replays from genesis) -- a witness resuming after a disconnect
+	// passes back the last sequence it verified so it never re-receives or
+	// loses an event across a reconnect (ADR-039 Tests required,
+	// "Partition"). Deliberately scoped to one subject per call, matching
+	// internal/eventlog's own per-subject verification boundary (ADR-039
+	// §2) -- discovering subject_ids a witness has not seen before is out
+	// of this RPC's scope for this PR (see internal/eventlog's doc
+	// comment).
+	SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubscribeEventsResponse], error)
 }
 
 type controlPlaneServiceClient struct {
@@ -138,6 +155,25 @@ func (c *controlPlaneServiceClient) StopWorkload(ctx context.Context, in *StopWo
 	return out, nil
 }
 
+func (c *controlPlaneServiceClient) SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubscribeEventsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ControlPlaneService_ServiceDesc.Streams[0], ControlPlaneService_SubscribeEvents_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SubscribeEventsRequest, SubscribeEventsResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControlPlaneService_SubscribeEventsClient = grpc.ServerStreamingClient[SubscribeEventsResponse]
+
 // ControlPlaneServiceServer is the server API for ControlPlaneService service.
 // All implementations must embed UnimplementedControlPlaneServiceServer
 // for forward compatibility.
@@ -168,6 +204,22 @@ type ControlPlaneServiceServer interface {
 	SubmitWorkload(context.Context, *SubmitWorkloadRequest) (*SubmitWorkloadResponse, error)
 	GetWorkload(context.Context, *GetWorkloadRequest) (*GetWorkloadResponse, error)
 	StopWorkload(context.Context, *StopWorkloadRequest) (*StopWorkloadResponse, error)
+	// SubscribeEvents (ADR-039 §10/§9, issue #33) is the witness export
+	// surface: any independent party -- a tenant, a third-party auditor, a
+	// future second Control Plane once #34/ADR-017 exists -- can call this
+	// with no special relationship to the Control Plane beyond the RPC
+	// itself and read access to a chain node (to independently verify each
+	// event's chain_anchor). Streams exactly one subject's signed event_log
+	// history, strictly ordered by sequence, starting after since_sequence
+	// (0 replays from genesis) -- a witness resuming after a disconnect
+	// passes back the last sequence it verified so it never re-receives or
+	// loses an event across a reconnect (ADR-039 Tests required,
+	// "Partition"). Deliberately scoped to one subject per call, matching
+	// internal/eventlog's own per-subject verification boundary (ADR-039
+	// §2) -- discovering subject_ids a witness has not seen before is out
+	// of this RPC's scope for this PR (see internal/eventlog's doc
+	// comment).
+	SubscribeEvents(*SubscribeEventsRequest, grpc.ServerStreamingServer[SubscribeEventsResponse]) error
 	mustEmbedUnimplementedControlPlaneServiceServer()
 }
 
@@ -198,6 +250,9 @@ func (UnimplementedControlPlaneServiceServer) GetWorkload(context.Context, *GetW
 }
 func (UnimplementedControlPlaneServiceServer) StopWorkload(context.Context, *StopWorkloadRequest) (*StopWorkloadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StopWorkload not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) SubscribeEvents(*SubscribeEventsRequest, grpc.ServerStreamingServer[SubscribeEventsResponse]) error {
+	return status.Error(codes.Unimplemented, "method SubscribeEvents not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) mustEmbedUnimplementedControlPlaneServiceServer() {}
 func (UnimplementedControlPlaneServiceServer) testEmbeddedByValue()                             {}
@@ -346,6 +401,17 @@ func _ControlPlaneService_StopWorkload_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlaneService_SubscribeEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeEventsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ControlPlaneServiceServer).SubscribeEvents(m, &grpc.GenericServerStream[SubscribeEventsRequest, SubscribeEventsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControlPlaneService_SubscribeEventsServer = grpc.ServerStreamingServer[SubscribeEventsResponse]
+
 // ControlPlaneService_ServiceDesc is the grpc.ServiceDesc for ControlPlaneService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -382,6 +448,12 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _ControlPlaneService_StopWorkload_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "SubscribeEvents",
+			Handler:       _ControlPlaneService_SubscribeEvents_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "openinfra/controlplane/v1/control_plane.proto",
 }

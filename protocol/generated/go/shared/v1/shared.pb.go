@@ -1013,22 +1013,131 @@ func (x *Lease) GetState() LeaseState {
 	return LeaseState_LEASE_STATE_UNSPECIFIED
 }
 
-// --- Event Envelope ---
-type EventEnvelope struct {
+// --- Event Envelope (ADR-039 / issue #33) ---
+//
+// ChainAnchor is ADR-039 §5's reference to an already-finalized
+// pallet-lease fact (LeaseCreated / LeaseStateChanged): an independent
+// witness holding only a chain node and a copy of the event log can
+// check that lease_id genuinely exists, finalized, at block_hash --
+// generalizing ADR-038 §6.2's DeployRequest.scheduling_block_hash from a
+// single audit-correlation field to every workload-lifecycle event.
+type ChainAnchor struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	EventId       string                 `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
-	EventType     string                 `protobuf:"bytes,2,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	Source        string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,5,opt,name=payload,proto3" json:"payload,omitempty"` // Serialized specific event model
-	Signature     string                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`
+	LeaseId       uint64                 `protobuf:"varint,1,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	BlockHash     []byte                 `protobuf:"bytes,2,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"` // exactly 32 bytes when present
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *ChainAnchor) Reset() {
+	*x = ChainAnchor{}
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChainAnchor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChainAnchor) ProtoMessage() {}
+
+func (x *ChainAnchor) ProtoReflect() protoreflect.Message {
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChainAnchor.ProtoReflect.Descriptor instead.
+func (*ChainAnchor) Descriptor() ([]byte, []int) {
+	return file_openinfra_shared_v1_shared_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *ChainAnchor) GetLeaseId() uint64 {
+	if x != nil {
+		return x.LeaseId
+	}
+	return 0
+}
+
+func (x *ChainAnchor) GetBlockHash() []byte {
+	if x != nil {
+		return x.BlockHash
+	}
+	return nil
+}
+
+// event_id/event_type/timestamp/source/payload/signature (fields 1-6) are
+// this message's original fields -- reserved since before ADR-039, never
+// populated or read by any real Go consumer prior to it (confirmed via
+// `grep -rl EventEnvelope control-plane --include=*.go`, ADR-039 Context
+// -- zero matches outside the generated file itself). Fields 7+ are
+// ADR-039's additions, evolving this already-reserved message rather than
+// introducing a second, overlapping type (ADR-039 Decision §10, and its
+// own Open Questions section for why that specific choice was made, and
+// what it leaves unconfirmed: no record of this message's original
+// intended purpose exists in this codebase). internal/eventlog.Entry
+// (control-plane) is the canonical, signed, hash-chained representation
+// this wire message carries -- see that package's own doc comments for
+// the full design (ADR-039 §1-§9).
+type EventEnvelope struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	EventId   string                 `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	EventType string                 `protobuf:"bytes,2,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
+	Timestamp *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Source    string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`
+	Payload   []byte                 `protobuf:"bytes,5,opt,name=payload,proto3" json:"payload,omitempty"` // Serialized specific event model
+	Signature string                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`
+	// subject_type: "WORKLOAD_LIFECYCLE" | "LEASE_CORRELATION" |
+	// "METERING_EVIDENCE" (ADR-039 §1) -- a string, not an enum, matching
+	// event_type's own existing string convention on this message rather
+	// than introducing a second enumeration style.
+	SubjectType string `protobuf:"bytes,7,opt,name=subject_type,json=subjectType,proto3" json:"subject_type,omitempty"`
+	// subject_id: workload_id (UTF-8 bytes of its UUID text form) for
+	// WORKLOAD_LIFECYCLE/LEASE_CORRELATION today; see internal/eventlog's
+	// doc comment for METERING_EVIDENCE's still-unwired shape.
+	SubjectId []byte `protobuf:"bytes,8,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"`
+	// sequence: monotonic per (subject_type, subject_id), starting at 1 --
+	// never a global ordering key (ADR-039 §2).
+	Sequence uint64 `protobuf:"varint,9,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	// prev_event_hash: exactly 32 bytes, all-zero for sequence = 1,
+	// otherwise the previous event's event_id (ADR-039 §2's hash chain).
+	PrevEventHash []byte `protobuf:"bytes,10,opt,name=prev_event_hash,json=prevEventHash,proto3" json:"prev_event_hash,omitempty"`
+	// chain_anchor: absent only for a subject's very first event, before
+	// any lease exists to anchor against -- ADR-039 §5's honestly-named
+	// pre-lease gap, not an omission elsewhere.
+	ChainAnchor *ChainAnchor `protobuf:"bytes,11,opt,name=chain_anchor,json=chainAnchor,proto3" json:"chain_anchor,omitempty"`
+	// payload_hash: exactly 32 bytes, sha256 over the same canonical bytes
+	// event_id is computed from (internal/eventlog.CoreBytes) -- present so
+	// a witness can verify payload integrity without recomputing event_id
+	// first.
+	PayloadHash []byte `protobuf:"bytes,12,opt,name=payload_hash,json=payloadHash,proto3" json:"payload_hash,omitempty"`
+	// signer_public_key: raw 32-byte Ed25519 public key -- either a
+	// registered provider's identity key or the Control Plane's own
+	// bridge-account key (ADR-039 §3), never a new key type.
+	SignerPublicKey []byte `protobuf:"bytes,13,opt,name=signer_public_key,json=signerPublicKey,proto3" json:"signer_public_key,omitempty"`
+	// signature_bytes: raw 64-byte Ed25519 signature over
+	// internal/eventlog.SignedBytes(entry). Distinct from the pre-existing
+	// `signature` string field above (field 6) -- that field is never
+	// populated for an ADR-039 event, and this one is never populated for
+	// whatever this message's original, pre-ADR-039 purpose was, so the two
+	// cannot collide in practice; kept separate rather than repurposing
+	// field 6's type, which would be a breaking wire change for any future
+	// consumer of the original shape.
+	SignatureBytes []byte `protobuf:"bytes,14,opt,name=signature_bytes,json=signatureBytes,proto3" json:"signature_bytes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
 func (x *EventEnvelope) Reset() {
 	*x = EventEnvelope{}
-	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[9]
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1040,7 +1149,7 @@ func (x *EventEnvelope) String() string {
 func (*EventEnvelope) ProtoMessage() {}
 
 func (x *EventEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[9]
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1053,7 +1162,7 @@ func (x *EventEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventEnvelope.ProtoReflect.Descriptor instead.
 func (*EventEnvelope) Descriptor() ([]byte, []int) {
-	return file_openinfra_shared_v1_shared_proto_rawDescGZIP(), []int{9}
+	return file_openinfra_shared_v1_shared_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *EventEnvelope) GetEventId() string {
@@ -1096,6 +1205,62 @@ func (x *EventEnvelope) GetSignature() string {
 		return x.Signature
 	}
 	return ""
+}
+
+func (x *EventEnvelope) GetSubjectType() string {
+	if x != nil {
+		return x.SubjectType
+	}
+	return ""
+}
+
+func (x *EventEnvelope) GetSubjectId() []byte {
+	if x != nil {
+		return x.SubjectId
+	}
+	return nil
+}
+
+func (x *EventEnvelope) GetSequence() uint64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
+func (x *EventEnvelope) GetPrevEventHash() []byte {
+	if x != nil {
+		return x.PrevEventHash
+	}
+	return nil
+}
+
+func (x *EventEnvelope) GetChainAnchor() *ChainAnchor {
+	if x != nil {
+		return x.ChainAnchor
+	}
+	return nil
+}
+
+func (x *EventEnvelope) GetPayloadHash() []byte {
+	if x != nil {
+		return x.PayloadHash
+	}
+	return nil
+}
+
+func (x *EventEnvelope) GetSignerPublicKey() []byte {
+	if x != nil {
+		return x.SignerPublicKey
+	}
+	return nil
+}
+
+func (x *EventEnvelope) GetSignatureBytes() []byte {
+	if x != nil {
+		return x.SignatureBytes
+	}
+	return nil
 }
 
 // --- Metering Summary (ADR-029 / issue #20) ---
@@ -1160,7 +1325,7 @@ type MeteringSummary struct {
 
 func (x *MeteringSummary) Reset() {
 	*x = MeteringSummary{}
-	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[10]
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1172,7 +1337,7 @@ func (x *MeteringSummary) String() string {
 func (*MeteringSummary) ProtoMessage() {}
 
 func (x *MeteringSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[10]
+	mi := &file_openinfra_shared_v1_shared_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1185,7 +1350,7 @@ func (x *MeteringSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MeteringSummary.ProtoReflect.Descriptor instead.
 func (*MeteringSummary) Descriptor() ([]byte, []int) {
-	return file_openinfra_shared_v1_shared_proto_rawDescGZIP(), []int{10}
+	return file_openinfra_shared_v1_shared_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *MeteringSummary) GetWorkloadId() string {
@@ -1352,7 +1517,11 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"workloadId\x120\n" +
 	"\x05start\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x05start\x12,\n" +
 	"\x03end\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\x03end\x125\n" +
-	"\x05state\x18\a \x01(\x0e2\x1f.openinfra.shared.v1.LeaseStateR\x05state\"\xd3\x01\n" +
+	"\x05state\x18\a \x01(\x0e2\x1f.openinfra.shared.v1.LeaseStateR\x05state\"G\n" +
+	"\vChainAnchor\x12\x19\n" +
+	"\blease_id\x18\x01 \x01(\x04R\aleaseId\x12\x1d\n" +
+	"\n" +
+	"block_hash\x18\x02 \x01(\fR\tblockHash\"\x96\x04\n" +
 	"\rEventEnvelope\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x1d\n" +
 	"\n" +
@@ -1360,7 +1529,17 @@ const file_openinfra_shared_v1_shared_proto_rawDesc = "" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x16\n" +
 	"\x06source\x18\x04 \x01(\tR\x06source\x12\x18\n" +
 	"\apayload\x18\x05 \x01(\fR\apayload\x12\x1c\n" +
-	"\tsignature\x18\x06 \x01(\tR\tsignature\"\xdc\x03\n" +
+	"\tsignature\x18\x06 \x01(\tR\tsignature\x12!\n" +
+	"\fsubject_type\x18\a \x01(\tR\vsubjectType\x12\x1d\n" +
+	"\n" +
+	"subject_id\x18\b \x01(\fR\tsubjectId\x12\x1a\n" +
+	"\bsequence\x18\t \x01(\x04R\bsequence\x12&\n" +
+	"\x0fprev_event_hash\x18\n" +
+	" \x01(\fR\rprevEventHash\x12C\n" +
+	"\fchain_anchor\x18\v \x01(\v2 .openinfra.shared.v1.ChainAnchorR\vchainAnchor\x12!\n" +
+	"\fpayload_hash\x18\f \x01(\fR\vpayloadHash\x12*\n" +
+	"\x11signer_public_key\x18\r \x01(\fR\x0fsignerPublicKey\x12'\n" +
+	"\x0fsignature_bytes\x18\x0e \x01(\fR\x0esignatureBytes\"\xdc\x03\n" +
 	"\x0fMeteringSummary\x12\x1f\n" +
 	"\vworkload_id\x18\x01 \x01(\tR\n" +
 	"workloadId\x12\x19\n" +
@@ -1415,7 +1594,7 @@ func file_openinfra_shared_v1_shared_proto_rawDescGZIP() []byte {
 }
 
 var file_openinfra_shared_v1_shared_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_openinfra_shared_v1_shared_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_openinfra_shared_v1_shared_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_openinfra_shared_v1_shared_proto_goTypes = []any{
 	(NodeStatus)(0),               // 0: openinfra.shared.v1.NodeStatus
 	(WorkloadProfile)(0),          // 1: openinfra.shared.v1.WorkloadProfile
@@ -1429,9 +1608,10 @@ var file_openinfra_shared_v1_shared_proto_goTypes = []any{
 	(*ResourceRequirements)(nil),  // 9: openinfra.shared.v1.ResourceRequirements
 	(*WorkloadConstraints)(nil),   // 10: openinfra.shared.v1.WorkloadConstraints
 	(*Lease)(nil),                 // 11: openinfra.shared.v1.Lease
-	(*EventEnvelope)(nil),         // 12: openinfra.shared.v1.EventEnvelope
-	(*MeteringSummary)(nil),       // 13: openinfra.shared.v1.MeteringSummary
-	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
+	(*ChainAnchor)(nil),           // 12: openinfra.shared.v1.ChainAnchor
+	(*EventEnvelope)(nil),         // 13: openinfra.shared.v1.EventEnvelope
+	(*MeteringSummary)(nil),       // 14: openinfra.shared.v1.MeteringSummary
+	(*timestamppb.Timestamp)(nil), // 15: google.protobuf.Timestamp
 }
 var file_openinfra_shared_v1_shared_proto_depIdxs = []int32{
 	4,  // 0: openinfra.shared.v1.NodeIdentity.capabilities:type_name -> openinfra.shared.v1.ResourceCapability
@@ -1442,15 +1622,16 @@ var file_openinfra_shared_v1_shared_proto_depIdxs = []int32{
 	9,  // 5: openinfra.shared.v1.WorkloadDefinition.requirements:type_name -> openinfra.shared.v1.ResourceRequirements
 	10, // 6: openinfra.shared.v1.WorkloadDefinition.constraints:type_name -> openinfra.shared.v1.WorkloadConstraints
 	6,  // 7: openinfra.shared.v1.ResourceRequirements.bandwidth:type_name -> openinfra.shared.v1.Bandwidth
-	14, // 8: openinfra.shared.v1.Lease.start:type_name -> google.protobuf.Timestamp
-	14, // 9: openinfra.shared.v1.Lease.end:type_name -> google.protobuf.Timestamp
+	15, // 8: openinfra.shared.v1.Lease.start:type_name -> google.protobuf.Timestamp
+	15, // 9: openinfra.shared.v1.Lease.end:type_name -> google.protobuf.Timestamp
 	2,  // 10: openinfra.shared.v1.Lease.state:type_name -> openinfra.shared.v1.LeaseState
-	14, // 11: openinfra.shared.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
-	12, // [12:12] is the sub-list for method output_type
-	12, // [12:12] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	15, // 11: openinfra.shared.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
+	12, // 12: openinfra.shared.v1.EventEnvelope.chain_anchor:type_name -> openinfra.shared.v1.ChainAnchor
+	13, // [13:13] is the sub-list for method output_type
+	13, // [13:13] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_openinfra_shared_v1_shared_proto_init() }
@@ -1464,7 +1645,7 @@ func file_openinfra_shared_v1_shared_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_openinfra_shared_v1_shared_proto_rawDesc), len(file_openinfra_shared_v1_shared_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

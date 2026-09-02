@@ -167,7 +167,32 @@ enum LeaseState {
   LEASE_STATE_EXPIRED = 5;
 }
 
-// --- Event Envelope ---
+// --- Event Envelope (ADR-039 / issue #33) ---
+//
+// ChainAnchor is ADR-039 §5's reference to an already-finalized
+// pallet-lease fact (LeaseCreated / LeaseStateChanged): an independent
+// witness holding only a chain node and a copy of the event log can
+// check that lease_id genuinely exists, finalized, at block_hash --
+// generalizing ADR-038 §6.2's DeployRequest.scheduling_block_hash from a
+// single audit-correlation field to every workload-lifecycle event.
+message ChainAnchor {
+  uint64 lease_id = 1;
+  bytes block_hash = 2; // exactly 32 bytes when present
+}
+
+// event_id/event_type/timestamp/source/payload/signature (fields 1-6) are
+// this message's original fields -- reserved since before ADR-039, never
+// populated or read by any real Go consumer prior to it (confirmed via
+// `grep -rl EventEnvelope control-plane --include=*.go`, ADR-039 Context
+// -- zero matches outside the generated file itself). Fields 7+ are
+// ADR-039's additions, evolving this already-reserved message rather than
+// introducing a second, overlapping type (ADR-039 Decision §10, and its
+// own Open Questions section for why that specific choice was made, and
+// what it leaves unconfirmed: no record of this message's original
+// intended purpose exists in this codebase). internal/eventlog.Entry
+// (control-plane) is the canonical, signed, hash-chained representation
+// this wire message carries -- see that package's own doc comments for
+// the full design (ADR-039 §1-§9).
 message EventEnvelope {
   string event_id = 1;
   string event_type = 2;
@@ -175,6 +200,44 @@ message EventEnvelope {
   string source = 4;
   bytes payload = 5; // Serialized specific event model
   string signature = 6;
+
+  // subject_type: "WORKLOAD_LIFECYCLE" | "LEASE_CORRELATION" |
+  // "METERING_EVIDENCE" (ADR-039 §1) -- a string, not an enum, matching
+  // event_type's own existing string convention on this message rather
+  // than introducing a second enumeration style.
+  string subject_type = 7;
+  // subject_id: workload_id (UTF-8 bytes of its UUID text form) for
+  // WORKLOAD_LIFECYCLE/LEASE_CORRELATION today; see internal/eventlog's
+  // doc comment for METERING_EVIDENCE's still-unwired shape.
+  bytes subject_id = 8;
+  // sequence: monotonic per (subject_type, subject_id), starting at 1 --
+  // never a global ordering key (ADR-039 §2).
+  uint64 sequence = 9;
+  // prev_event_hash: exactly 32 bytes, all-zero for sequence = 1,
+  // otherwise the previous event's event_id (ADR-039 §2's hash chain).
+  bytes prev_event_hash = 10;
+  // chain_anchor: absent only for a subject's very first event, before
+  // any lease exists to anchor against -- ADR-039 §5's honestly-named
+  // pre-lease gap, not an omission elsewhere.
+  ChainAnchor chain_anchor = 11;
+  // payload_hash: exactly 32 bytes, sha256 over the same canonical bytes
+  // event_id is computed from (internal/eventlog.CoreBytes) -- present so
+  // a witness can verify payload integrity without recomputing event_id
+  // first.
+  bytes payload_hash = 12;
+  // signer_public_key: raw 32-byte Ed25519 public key -- either a
+  // registered provider's identity key or the Control Plane's own
+  // bridge-account key (ADR-039 §3), never a new key type.
+  bytes signer_public_key = 13;
+  // signature_bytes: raw 64-byte Ed25519 signature over
+  // internal/eventlog.SignedBytes(entry). Distinct from the pre-existing
+  // `signature` string field above (field 6) -- that field is never
+  // populated for an ADR-039 event, and this one is never populated for
+  // whatever this message's original, pre-ADR-039 purpose was, so the two
+  // cannot collide in practice; kept separate rather than repurposing
+  // field 6's type, which would be a breaking wire change for any future
+  // consumer of the original shape.
+  bytes signature_bytes = 14;
 }
 
 // --- Metering Summary (ADR-029 / issue #20) ---

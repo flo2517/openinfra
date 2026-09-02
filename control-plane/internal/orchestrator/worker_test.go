@@ -664,7 +664,7 @@ func (s *recordingStore) AssignLease(_ context.Context, item workloadapi.Workloa
 	s.record("assign-lease", item)
 	return 42, nil
 }
-func (s *recordingStore) MarkLeased(_ context.Context, item workloadapi.Workload, _ uint64) error {
+func (s *recordingStore) MarkLeased(_ context.Context, item workloadapi.Workload, _ uint64, _ [32]byte) error {
 	s.record("mark-leased", item)
 	return nil
 }

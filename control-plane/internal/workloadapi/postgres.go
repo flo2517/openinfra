@@ -4,17 +4,95 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/openinfra/network/internal/eventlog"
 )
 
-type PostgresRepository struct{ pool *pgxpool.Pool }
+type PostgresRepository struct {
+	pool *pgxpool.Pool
+	// eventLog/eventSigner are ADR-039's dual-write: nil by default, so
+	// every existing test/deployment that predates ADR-039 is completely
+	// unaffected -- see SetEventLog's doc comment. This is the governed
+	// toggle ADR-039 §11 calls for ("a governed toggle... disables
+	// event-log export to witnesses without affecting workloads-table
+	// operation at all"): a Go-level, off-chain switch, not a new
+	// on-chain governed boolean -- ADR-039 Decision §10 is explicit that
+	// this design proposes no new pallet, no new runtime storage, and no
+	// new extrinsic, so a chain-side toggle (the shape EscrowPaused/the
+	// still-unimplemented OnChainSchedulingEnabled use for their own
+	// pallets) is not an available option here without contradicting the
+	// ADR's own stated scope. Flagged explicitly: this is a narrower,
+	// simpler mechanism (a constructor-time value, not a live-toggleable
+	// runtime flag) than "governed" might imply -- rotating it today means
+	// a restart with SetEventLog called or not, not a live operator
+	// command. A live-toggle admin surface is real, separable follow-up
+	// work, not invented here.
+	eventLog    *eventlog.PostgresRepository
+	eventSigner eventlog.Signer
+}
 
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
+}
+
+// SetEventLog enables ADR-039's dual-write: every BeginScheduling/
+// AssignLease/MarkLeased/MarkDeploying/MarkRunning/MarkStopped/
+// MarkFailed/RetryLater call below additionally appends one signed
+// event_log row, in the same Postgres transaction as its own workloads
+// UPDATE, once this is called with non-nil arguments. Left unset (the
+// zero *PostgresRepository's default, and every existing test/deployment
+// that predates ADR-039), every method below takes its original,
+// single-statement, non-transactional path -- byte-for-byte the same SQL
+// this file issued before ADR-039, so disabling this dependency at
+// startup is a real, exercisable rollback (ADR-039 §11 Test 6), not just
+// a claim.
+func (r *PostgresRepository) SetEventLog(eventLog *eventlog.PostgresRepository, signer eventlog.Signer) {
+	r.eventLog, r.eventSigner = eventLog, signer
+}
+
+// chainAnchorFromItem builds ADR-039 §5's ChainAnchor from whatever this
+// workload's row already carries: LeaseBlockHash is set once, by
+// MarkLeased, the moment EnsureLeaseActive first confirms the lease
+// Active in finalized storage, and every later Mark* call for the same
+// workload_id reads it back from the already-loaded Workload rather than
+// re-deriving it -- see LeaseBlockHash's own doc comment (service.go) and
+// migration 000024's identical reasoning on workloads.lease_block_hash.
+// Returns nil before a lease exists (LeaseID == "") -- ADR-039 §5's
+// honestly-named pre-lease gap: there is no chain fact to anchor against
+// yet.
+func chainAnchorFromItem(item Workload) *eventlog.ChainAnchor {
+	if item.LeaseID == "" || item.LeaseBlockHash == ([32]byte{}) {
+		return nil
+	}
+	leaseID, err := strconv.ParseUint(item.LeaseID, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &eventlog.ChainAnchor{LeaseID: leaseID, BlockHash: item.LeaseBlockHash}
+}
+
+// appendEvent is the shared tail of every dual-writing Mark*/BeginScheduling
+// method below: called only after that method's own guarded UPDATE has
+// already succeeded (RowsAffected == 1) inside tx -- see
+// eventlog.PostgresRepository.head's doc comment for why that ordering is
+// what makes the append itself race-free without any extra locking here.
+// eventlog.ErrConflict is translated to this package's own ErrConflict so
+// callers never need to know eventlog's error types.
+func (r *PostgresRepository) appendEvent(ctx context.Context, tx pgx.Tx, item Workload, eventType string, payload []byte) error {
+	if r.eventLog == nil {
+		return nil
+	}
+	_, err := r.eventLog.AppendControlPlaneSigned(ctx, tx, r.eventSigner, eventlog.SubjectWorkloadLifecycle, []byte(item.WorkloadID), eventType, payload, chainAnchorFromItem(item))
+	if errors.Is(err, eventlog.ErrConflict) {
+		return ErrConflict
+	}
+	return err
 }
 
 func (r *PostgresRepository) CreateOrGet(ctx context.Context, candidate Workload) (Workload, error) {
@@ -230,38 +308,100 @@ func (r *PostgresRepository) ClaimNext(ctx context.Context, workerID string, lea
 	return scanWorkload(r.pool.QueryRow(ctx, query, workerID, lease.String()))
 }
 
+const markDeployingSQL = `UPDATE workloads SET state='DEPLOYING',version=version+1,updated_at=now(),worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='LEASED' AND lease_id=$2 AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`
+
 func (r *PostgresRepository) MarkDeploying(ctx context.Context, item Workload, leaseID uint64) error {
-	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='DEPLOYING',version=version+1,updated_at=now(),worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='LEASED' AND lease_id=$2 AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`, item.WorkloadID, leaseID, item.Version, item.WorkerID)
+	if r.eventLog == nil {
+		command, err := r.pool.Exec(ctx, markDeployingSQL, item.WorkloadID, leaseID, item.Version, item.WorkerID)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, markDeployingSQL, item.WorkloadID, leaseID, item.Version, item.WorkerID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
-	return nil
+	if err := r.appendEvent(ctx, tx, item, "DEPLOYING", nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
+
+const markRunningSQL = `UPDATE workloads SET state='RUNNING',container_id=$2,version=version+1,updated_at=now(),next_attempt_at=NULL,error_code=NULL,last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='DEPLOYING' AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`
+
 func (r *PostgresRepository) MarkRunning(ctx context.Context, item Workload, containerID string) error {
 	if containerID == "" {
 		return errors.New("container id is required")
 	}
-	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='RUNNING',container_id=$2,version=version+1,updated_at=now(),next_attempt_at=NULL,error_code=NULL,last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='DEPLOYING' AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`, item.WorkloadID, containerID, item.Version, item.WorkerID)
+	if r.eventLog == nil {
+		command, err := r.pool.Exec(ctx, markRunningSQL, item.WorkloadID, containerID, item.Version, item.WorkerID)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, markRunningSQL, item.WorkloadID, containerID, item.Version, item.WorkerID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
-	return nil
+	if err := r.appendEvent(ctx, tx, item, "RUNNING", []byte(containerID)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
+
+const markStoppedSQL = `UPDATE workloads SET state='STOPPED',version=version+1,updated_at=now(),next_attempt_at=NULL,error_code=NULL,last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='STOPPING' AND lease_id=$2 AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`
+
 func (r *PostgresRepository) MarkStopped(ctx context.Context, item Workload, leaseID uint64) error {
-	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='STOPPED',version=version+1,updated_at=now(),next_attempt_at=NULL,error_code=NULL,last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='STOPPING' AND lease_id=$2 AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`, item.WorkloadID, leaseID, item.Version, item.WorkerID)
+	if r.eventLog == nil {
+		command, err := r.pool.Exec(ctx, markStoppedSQL, item.WorkloadID, leaseID, item.Version, item.WorkerID)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, markStoppedSQL, item.WorkloadID, leaseID, item.Version, item.WorkerID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
-	return nil
+	if err := r.appendEvent(ctx, tx, item, "STOPPED", nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // ReconcileFromAgent implements Repository.ReconcileFromAgent (ADR-028
@@ -295,15 +435,43 @@ func (r *PostgresRepository) ReconcileFromAgent(ctx context.Context, workloadID,
 	return command.RowsAffected() == 1, nil
 }
 
+const beginSchedulingSQL = `UPDATE workloads SET state='SCHEDULING', version=version+1, updated_at=now(), error_code=NULL, last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='REQUESTED' AND version=$2 AND worker_id=$3 AND worker_lease_until>now()`
+
 func (r *PostgresRepository) BeginScheduling(ctx context.Context, item Workload) error {
-	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='SCHEDULING', version=version+1, updated_at=now(), error_code=NULL, last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='REQUESTED' AND version=$2 AND worker_id=$3 AND worker_lease_until>now()`, item.WorkloadID, item.Version, item.WorkerID)
+	if r.eventLog == nil {
+		command, err := r.pool.Exec(ctx, beginSchedulingSQL, item.WorkloadID, item.Version, item.WorkerID)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, beginSchedulingSQL, item.WorkloadID, item.Version, item.WorkerID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
-	return nil
+	// ADR-039 §11 Out of scope note reflected honestly: this is the
+	// workload's very first event_log entry (sequence=1), the
+	// "REQUESTED"-equivalent pre-lease event named in ADR-039 §5 as
+	// unanchorable by construction -- event_type here is "SCHEDULING"
+	// (the state this write actually transitions *to*, matching every
+	// other appendEvent call site's convention below), not "REQUESTED"
+	// (the state before this write, which never itself gets a row since
+	// CreateOrGet's initial insert predates any event-log involvement).
+	if err := r.appendEvent(ctx, tx, item, "SCHEDULING", nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // AssignLease commits this workload to providerID, but only if capacity
@@ -373,6 +541,20 @@ func (r *PostgresRepository) AssignLease(ctx context.Context, item Workload, pro
 	if err != nil {
 		return 0, err
 	}
+	// ADR-039 §5's honest pre-lease gap, precisely at its boundary: this
+	// event (LEASE_PENDING) is emitted the instant an off-chain lease_id
+	// is assigned, before the corresponding chain extrinsic exists --
+	// worker.go's LEASE_PENDING case is what actually submits
+	// create_lease/update_lease_state and confirms Active in finalized
+	// storage. So this event's chain_anchor is nil (item.LeaseID is still
+	// "" at this point, see chainAnchorFromItem); MarkLeased below is the
+	// first WorkloadLifecycle event with a real anchor.
+	if err := r.appendEvent(ctx, tx, item, "LEASE_PENDING", []byte(providerID)); err != nil {
+		if errors.Is(err, ErrConflict) {
+			return 0, ErrConflict
+		}
+		return 0, err
+	}
 	if err = tx.Commit(ctx); err != nil {
 		if isSerializationFailure(err) {
 			return 0, ErrConflict
@@ -393,29 +575,78 @@ func isSerializationFailure(err error) bool {
 	return errors.As(err, &postgresError) && postgresError.Code == "40001"
 }
 
-func (r *PostgresRepository) MarkLeased(ctx context.Context, item Workload, leaseID uint64) error {
-	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='LEASED', version=version+1, updated_at=now(), next_attempt_at=NULL, error_code=NULL, last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='LEASE_PENDING' AND lease_id=$2 AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`, item.WorkloadID, leaseID, item.Version, item.WorkerID)
+// MarkLeased additionally persists blockHash into workloads.lease_block_hash
+// -- the finalized block at which worker.go's LEASE_PENDING case observed
+// this lease's on-chain Active state (blockchainbridge.FinalizedLease.
+// FinalizedBlockHash from EnsureLeaseActive). Every later Mark* call for
+// this workload_id reads this column back (via chainAnchorFromItem) to
+// build its own event_log entry's chain_anchor, so this is the one call
+// site that actually establishes ADR-039 §5's anchor for a workload's
+// downstream lifecycle -- see LeaseBlockHash's doc comment (service.go).
+func (r *PostgresRepository) MarkLeased(ctx context.Context, item Workload, leaseID uint64, blockHash [32]byte) error {
+	const sql = `UPDATE workloads SET state='LEASED', lease_block_hash=$5, version=version+1, updated_at=now(), next_attempt_at=NULL, error_code=NULL, last_error=NULL,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state='LEASE_PENDING' AND lease_id=$2 AND version=$3 AND worker_id=$4 AND worker_lease_until>now()`
+	if r.eventLog == nil {
+		command, err := r.pool.Exec(ctx, sql, item.WorkloadID, leaseID, item.Version, item.WorkerID, blockHash[:])
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, sql, item.WorkloadID, leaseID, item.Version, item.WorkerID, blockHash[:])
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
-	return nil
+	item.LeaseID = strconv.FormatUint(leaseID, 10)
+	item.LeaseBlockHash = blockHash
+	if err := r.appendEvent(ctx, tx, item, "LEASED", nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
+
+const retryLaterSQL = `UPDATE workloads SET attempt_count=attempt_count+1, next_attempt_at=now()+$2::interval, error_code=$3, last_error=$4, updated_at=now(),version=version+1,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state IN ('REQUESTED','SCHEDULING','LEASE_PENDING','LEASED','DEPLOYING','STOPPING') AND version=$5 AND worker_id=$6 AND worker_lease_until>now()`
 
 func (r *PostgresRepository) RetryLater(ctx context.Context, item Workload, code, message string, delay time.Duration) error {
 	if len(message) > 512 {
 		message = message[:512]
 	}
-	command, err := r.pool.Exec(ctx, `UPDATE workloads SET attempt_count=attempt_count+1, next_attempt_at=now()+$2::interval, error_code=$3, last_error=$4, updated_at=now(),version=version+1,worker_id=NULL,worker_lease_until=NULL WHERE workload_id=$1 AND state IN ('REQUESTED','SCHEDULING','LEASE_PENDING','LEASED','DEPLOYING','STOPPING') AND version=$5 AND worker_id=$6 AND worker_lease_until>now()`, item.WorkloadID, delay.String(), code, message, item.Version, item.WorkerID)
+	if r.eventLog == nil {
+		command, err := r.pool.Exec(ctx, retryLaterSQL, item.WorkloadID, delay.String(), code, message, item.Version, item.WorkerID)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, retryLaterSQL, item.WorkloadID, delay.String(), code, message, item.Version, item.WorkerID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
-	return nil
+	if err := r.appendEvent(ctx, tx, item, "RETRY:"+code, []byte(message)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // MarkFailed is RetryLater's terminal counterpart: it moves a workload out
@@ -429,31 +660,51 @@ func (r *PostgresRepository) RetryLater(ctx context.Context, item Workload, code
 // same optimistic-concurrency WHERE clause (version/worker_id/lease) as
 // every other Mark* method so a worker that lost its claim never
 // terminates a workload another worker has since picked back up.
+const markFailedSQL = `UPDATE workloads SET state='FAILED', attempt_count=attempt_count+1, next_attempt_at=NULL, error_code=$2, last_error=$3, updated_at=now(), version=version+1, worker_id=NULL, worker_lease_until=NULL WHERE workload_id=$1 AND state IN ('REQUESTED','SCHEDULING','LEASE_PENDING','LEASED','DEPLOYING','STOPPING') AND version=$4 AND worker_id=$5 AND worker_lease_until>now()`
+
 func (r *PostgresRepository) MarkFailed(ctx context.Context, item Workload, code, message string) error {
 	if len(message) > 512 {
 		message = message[:512]
 	}
-	command, err := r.pool.Exec(ctx, `UPDATE workloads SET state='FAILED', attempt_count=attempt_count+1, next_attempt_at=NULL, error_code=$2, last_error=$3, updated_at=now(), version=version+1, worker_id=NULL, worker_lease_until=NULL WHERE workload_id=$1 AND state IN ('REQUESTED','SCHEDULING','LEASE_PENDING','LEASED','DEPLOYING','STOPPING') AND version=$4 AND worker_id=$5 AND worker_lease_until>now()`, item.WorkloadID, code, message, item.Version, item.WorkerID)
+	if r.eventLog == nil {
+		command, err := r.pool.Exec(ctx, markFailedSQL, item.WorkloadID, code, message, item.Version, item.WorkerID)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	command, err := tx.Exec(ctx, markFailedSQL, item.WorkloadID, code, message, item.Version, item.WorkerID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrConflict
 	}
-	return nil
+	if err := r.appendEvent(ctx, tx, item, "FAILED", []byte(code+": "+message)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, COALESCE(vm_image_sha256,''), state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps, COALESCE(project_id::text,'')`
+const workloadColumns = `workload_id::text, request_id::text, request_hash, definition, COALESCE(resource_hash,'\x'::bytea), image, COALESCE(vm_image_sha256,''), state, COALESCE(provider_id,''), COALESCE(lease_id::text,''), COALESCE(container_id,''), COALESCE(error_code,''), COALESCE(stop_request_id::text,''), created_at, updated_at, COALESCE(worker_id,''), worker_lease_until, version, attempt_count, reserved_cpu_millicores, reserved_ram_mb, reserved_storage_gb, COALESCE(owner_id::text,''), reserved_ingress_mbps, reserved_egress_mbps, COALESCE(project_id::text,''), COALESCE(lease_block_hash,'\x'::bytea)`
 const selectWorkload = `SELECT ` + workloadColumns + ` FROM workloads`
-const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, COALESCE(w.vm_image_sha256,''), w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps, COALESCE(w.project_id::text,'')`
+const returningWorkload = `w.workload_id::text, w.request_id::text, w.request_hash, w.definition, COALESCE(w.resource_hash,'\x'::bytea), w.image, COALESCE(w.vm_image_sha256,''), w.state, COALESCE(w.provider_id,''), COALESCE(w.lease_id::text,''), COALESCE(w.container_id,''), COALESCE(w.error_code,''), COALESCE(w.stop_request_id::text,''), w.created_at, w.updated_at, COALESCE(w.worker_id,''), w.worker_lease_until, w.version, w.attempt_count, w.reserved_cpu_millicores, w.reserved_ram_mb, w.reserved_storage_gb, COALESCE(w.owner_id::text,''), w.reserved_ingress_mbps, w.reserved_egress_mbps, COALESCE(w.project_id::text,''), COALESCE(w.lease_block_hash,'\x'::bytea)`
 
 type scanner interface{ Scan(...any) error }
 
 func scanWorkload(row scanner) (Workload, error) {
 	var w Workload
-	var hash, resourceHash []byte
+	var hash, resourceHash, leaseBlockHash []byte
 	var workerLeaseUntil *time.Time
-	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.VmImageSha256, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID, &w.ReservedIngressMbps, &w.ReservedEgressMbps, &w.ProjectID)
+	err := row.Scan(&w.WorkloadID, &w.RequestID, &hash, &w.Definition, &resourceHash, &w.Image, &w.VmImageSha256, &w.State, &w.ProviderID, &w.LeaseID, &w.ContainerID, &w.ErrorCode, &w.StopRequestID, &w.CreatedAt, &w.UpdatedAt, &w.WorkerID, &workerLeaseUntil, &w.Version, &w.AttemptCount, &w.ReservedCPUMillicores, &w.ReservedRAMMB, &w.ReservedStorageGB, &w.OwnerID, &w.ReservedIngressMbps, &w.ReservedEgressMbps, &w.ProjectID, &leaseBlockHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Workload{}, ErrNotFound
 	}
@@ -469,6 +720,12 @@ func scanWorkload(row scanner) (Workload, error) {
 			return Workload{}, errors.New("invalid stored resource hash")
 		}
 		copy(w.ResourceHash[:], resourceHash)
+	}
+	if len(leaseBlockHash) != 0 {
+		if len(leaseBlockHash) != 32 {
+			return Workload{}, errors.New("invalid stored lease block hash")
+		}
+		copy(w.LeaseBlockHash[:], leaseBlockHash)
 	}
 	if workerLeaseUntil != nil {
 		w.WorkerLeaseUntil = *workerLeaseUntil
